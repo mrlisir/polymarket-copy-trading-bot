@@ -45,11 +45,11 @@ const readTempTrades = async (): Promise<TradeWithUser[]> => {
     const allTrades: TradeWithUser[] = [];
 
     for (const { address, model } of userActivityModels) {
-        // Only get trades that haven't been processed yet (bot: false AND botExcutedTime: 0)
-        // This prevents processing the same trade multiple times
+        // Only get trades that have been claimed by the monitor (bot: true AND botExcutedTime: 0)
+        // The monitor sets bot: true when it first sees a new trade, preventing duplicate detection
         const trades = await model
             .find({
-                $and: [{ type: 'TRADE' }, { bot: false }, { botExcutedTime: 0 }],
+                $and: [{ type: 'TRADE' }, { bot: true }, { botExcutedTime: 0 }],
             })
             .exec();
 

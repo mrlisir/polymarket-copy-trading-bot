@@ -132,7 +132,8 @@ const fetchTradeData = async () => {
                     continue; // Already processed this trade
                 }
 
-                // Save new trade to database
+                // Save new trade to database and immediately mark as "claimed" by bot
+                // This prevents tradeExecutor from missing it and tradeMonitor from re-detecting it
                 const newActivity = new UserActivity({
                     proxyWallet: activity.proxyWallet,
                     timestamp: activity.timestamp,
@@ -155,7 +156,7 @@ const fetchTradeData = async () => {
                     bio: activity.bio,
                     profileImage: activity.profileImage,
                     profileImageOptimized: activity.profileImageOptimized,
-                    bot: false,
+                    bot: true,
                     botExcutedTime: 0,
                 });
 
@@ -225,7 +226,12 @@ export const stopTradeMonitor = () => {
 };
 
 const tradeMonitor = async () => {
-    await init();
+    try {
+        await init();
+    } catch (initErr) {
+        Logger.error(`tradeMonitor init 失败: ${initErr}`);
+        return;
+    }
     Logger.success(`正在监控 ${USER_ADDRESSES.length} 位交易员，每 ${FETCH_INTERVAL} 秒检查一次`);
     Logger.separator();
 
@@ -248,7 +254,11 @@ const tradeMonitor = async () => {
     }
 
     while (isRunning) {
-        await fetchTradeData();
+        try {
+            await fetchTradeData();
+        } catch (e) {
+            Logger.error(`fetchTradeData 出错: ${e}`);
+        }
         if (!isRunning) break;
         await new Promise((resolve) => setTimeout(resolve, FETCH_INTERVAL * 1000));
     }

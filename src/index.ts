@@ -5,12 +5,21 @@ import tradeExecutor, { stopTradeExecutor } from './services/tradeExecutor';
 import tradeMonitor, { stopTradeMonitor } from './services/tradeMonitor';
 import Logger from './utils/logger';
 import { performHealthCheck, logHealthCheck } from './utils/healthCheck';
+import { closeStalePositionsIfAny } from './scripts/closeStalePositions';
 
 const USER_ADDRESSES = ENV.USER_ADDRESSES;
 const PROXY_WALLET = ENV.PROXY_WALLET;
 
 // Graceful shutdown handler
 let isShuttingDown = false;
+
+// Parse CLI flags
+const parseCliFlags = () => {
+    const args = process.argv.slice(2);
+    return {
+        dryRun: args.includes('--dry-run') || args.includes('-n'),
+    };
+};
 
 const gracefulShutdown = async (signal: string) => {
     if (isShuttingDown) {
@@ -91,12 +100,18 @@ export const main = async () => {
         const clobClient = await createClobClient();
         Logger.success('CLOB 客户端就绪');
 
-        Logger.separator();
-        Logger.info('正在启动交易监控...');
-        tradeMonitor();
+        const { dryRun } = parseCliFlags();
 
-        Logger.info('正在启动交易执行器...');
-        tradeExecutor(clobClient);
+        Logger.separator();
+        Logger.info('正在检查陈旧仓位...');
+        await closeStalePositionsIfAny(clobClient, dryRun);
+
+        Logger.separator();
+        Logger.info('正在启动交易监控和交易执行器...');
+        await Promise.all([
+            tradeMonitor(),
+            tradeExecutor(clobClient),
+        ]);
 
     } catch (error) {
         Logger.error(`启动时发生致命错误: ${error}`);
