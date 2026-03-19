@@ -1,0 +1,66 @@
+{
+  "config": {
+    "historyDays": 30,
+    "multiplier": 1,
+    "minOrderSize": 1,
+    "startingCapital": 1000,
+    "minTraderTrades": 100
+  },
+  "timestamp": 1773936334497,
+  "results": [
+    {
+      "address": "0x7c3db723f1d4d8cb9c550095203b686cb11e5c6b",
+      "startingCapital": 1000,
+      "currentCapital": 483.3019594864998,
+      "totalTrades": 2000,
+      "copiedTrades": 97,
+      "skippedTrades": 1903,
+      "totalPnl": -516.6980405135002,
+      "roi": -51.66980405135002,
+      "realizedPnl": -42.824808428023665,
+      "unrealizedPnl": -1323.9165375431503,
+      "winRate": 0,
+      "avgTradeSize": 13.041669848798477,
+      "openPositions": 26,
+      "closedPositions": 5,
+      "simulationTime": 4390,
+      "profileUrl": "https://polymarket.com/profile/0x7c3db723f1d4d8cb9c550095203b686cb11e5c6b"
+    },
+    {
+      "address": "0x6bab41a0dc40d6dd4c1a915b8c01969479fd1292",
+      "startingCapital": 1000,
+      "currentCapital": 460.64140130804594,
+      "totalTrades": 1150,
+      "copiedTrades": 84,
+      "skippedTrades": 1066,
+      "totalPnl": -539.3585986919541,
+      "roi": -53.935859869195404,
+      "realizedPnl": -71.4313798835988,
+      "unrealizedPnl": -937.8099797892945,
+      "winRate": 0,
+      "avgTradeSize": 12.148588830679484,
+      "openPositions": 20,
+      "closedPositions": 3,
+      "simulationTime": 3063,
+      "profileUrl": "https://polymarket.com/profile/0x6bab41a0dc40d6dd4c1a915b8c01969479fd1292"
+    },
+    {
+      "address": "0xa4b366ad22fc0d06f1e934ff468e8922431a87b8",
+      "startingCapital": 1000,
+      "currentCapital": 414.137827200777,
+      "totalTrades": 2000,
+      "copiedTrades": 48,
+      "skippedTrades": 1952,
+      "totalPnl": -585.862172799223,
+      "roi": -58.5862172799223,
+      "realizedPnl": -2.7935545903041303,
+      "unrealizedPnl": -1003.5924824095842,
+      "winRate": 0,
+      "avgTradeSize": 20.920078940024556,
+      "openPositions": 18,
+      "closedPositions": 2,
+      "simulationTime": 4575,
+      "profileUrl": "https://polymarket.com/profile/0xa4b366ad22fc0d06f1e934ff468e8922431a87b8"
+    }
+  ]
+}

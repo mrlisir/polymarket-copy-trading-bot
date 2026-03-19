@@ -1,0 +1,203 @@
+# Polymarket Copy Trading Bot - 命令清单
+
+本文档整理了机器人的所有可用命令，方便新用户参考。
+
+---
+
+## 📖 新手必读 - 首次使用顺序
+
+```bash
+# 1. 安装依赖
+npm install
+
+# 2. 配置环境（交互式向导）
+npm run setup
+
+# 3. 检查系统状态
+npm run health-check
+
+# 4. 验证授权
+npm run verify-allowance
+
+# 5. 启动机器人
+npm run dev
+```
+
+---
+
+## 🔰 基础命令
+
+| 命令 | 说明 |
+|------|------|
+| `npm run help` | 显示所有命令帮助 |
+| `npm run setup` | 交互式配置向导 |
+| `npm run health-check` | 检查系统状态 |
+| `npm run build` | 编译 TypeScript |
+| `npm run dev` | 开发模式运行（直接运行源码） |
+| `npm start` | 生产模式运行（运行编译后的代码） |
+
+### 开发 vs 生产
+
+```bash
+npm run dev    # 开发模式 - ts-node 直接运行源码，修改代码后可直接重启
+npm start      # 生产模式 - 需要先 npm run build，然后用 node 运行编译后的代码
+```
+
+---
+
+## 💰 钱包与余额
+
+| 命令 | 说明 |
+|------|------|
+| `npm run check-proxy` | 检查机器人钱包余额和持仓 |
+| `npm run check-both` | 同时检查钱包和 EOA 地址 |
+| `npm run check-allowance` | 检查 USDC 授权状态 |
+| `npm run set-token-allowance` | 设置 USDC 授权额度 |
+
+### 钱包相关流程
+
+```bash
+# 首次使用前必须执行
+npm run set-token-allowance    # 设置 USDC 授权
+
+# 验证授权是否成功
+npm run verify-allowance        # 查看授权状态
+```
+
+---
+
+## 📊 监控与统计
+
+| 命令 | 说明 |
+|------|------|
+| `npm run check-stats` | 查看交易统计 |
+| `npm run check-activity` | 查看最近交易活动 |
+| `npm run check-pnl` | 检查盈亏差异 |
+| `npm run check-both` | 检查两个钱包状态 |
+
+---
+
+## 🎯 持仓管理
+
+| 命令 | 说明 |
+|------|------|
+| `npm run manual-sell` | 手动出售指定持仓 |
+| `npm run sell-large` | 批量出售大额持仓 |
+| `npm run close-stale` | 关闭过期持仓 |
+| `npm run close-resolved` | 关闭已结算市场的持仓 |
+| `npm run redeem-resolved` | 赎回已结算的持仓获得 USDC |
+
+---
+
+## 🔍 交易员研究
+
+| 命令 | 说明 |
+|------|------|
+| `npm run find-traders` | 寻找最佳表现交易员 |
+| `npm run find-low-risk` | 寻找低风险交易员 |
+| `npm run scan-traders` | 扫描并分析顶级交易员 |
+| `npm run scan-markets` | 从热门市场扫描交易员 |
+
+---
+
+## 🧪 模拟与测试
+
+| 命令 | 说明 |
+|------|------|
+| `npm run simulate` | 使用当前逻辑模拟盈利能力 |
+| `npm run simulate-old` | 使用旧算法模拟 |
+| `npm run sim` | 运行综合模拟 |
+| `npm run compare` | 比较模拟结果 |
+
+---
+
+## 🔧 高级工具
+
+| 命令 | 说明 |
+|------|------|
+| `npm run audit` | 审计跟单算法 |
+| `npm run audit-old` | 审计旧版算法 |
+| `npm run fetch-history` | 获取历史交易数据 |
+| `npm run aggregate` | 聚合交易结果 |
+| `npm run transfer-to-gnosis` | 转移持仓到 Gnosis Safe |
+
+---
+
+## 🧹 代码质量
+
+| 命令 | 说明 |
+|------|------|
+| `npm run lint` | 检查代码问题 |
+| `npm run lint:fix` | 自动修复代码问题 |
+| `npm run format` | 格式化代码（Prettier） |
+
+---
+
+## 📚 文档资源
+
+| 文件 | 说明 |
+|------|------|
+| `GETTING_STARTED.md` | 新手入门完整指南 |
+| `README.md` | 完整项目文档 |
+| `docs/QUICK_START.md` | 5分钟快速入门 |
+| `docs/MULTI_TRADER_GUIDE.md` | 多交易员策略指南 |
+| `docs/SIMULATION_GUIDE.md` | 模拟测试指南 |
+| `docs/TRADER_SELECTION_GUIDE.md` | 交易员选择指南 |
+
+---
+
+## 🔄 常用流程
+
+### 流程1：首次设置
+
+```bash
+npm install              # 安装依赖
+npm run setup            # 交互式配置
+npm run health-check     # 检查系统
+npm run set-token-allowance   # 设置授权
+npm run verify-allowance  # 验证授权
+npm run dev              # 启动机器人
+```
+
+### 流程2：日常使用
+
+```bash
+npm run health-check     # 启动前检查
+npm run check-proxy      # 检查余额
+npm run verify-allowance # 验证授权
+npm run dev              # 启动机器人
+```
+
+### 流程3：查看状态
+
+```bash
+npm run check-stats      # 查看统计
+npm run check-activity   # 查看活动
+npm run check-pnl        # 查看盈亏
+```
+
+### 流程4：关闭持仓
+
+```bash
+npm run close-stale      # 关闭过期持仓
+npm run close-resolved   # 关闭已结算持仓
+npm run redeem-resolved  # 赎回资金
+```
+
+---
+
+## ⚠️ 重要提醒
+
+1. **首次使用前**：必须先运行 `npm run set-token-allowance`
+2. **启动前检查**：建议先运行 `npm run health-check`
+3. **开发模式**：`npm run dev` 适合开发调试
+4. **生产模式**：使用 `npm start` 前需先 `npm run build`
+
+---
+
+## 💡 提示
+
+- 使用 `npm run help` 可以随时查看所有命令
+- 查看 `GETTING_STARTED.md` 了解详细设置步骤
+- 使用 `npm run simulate` 测试策略后再开始实盘
+- 建议先用小额资金测试，熟悉后再增加投入
