@@ -4,8 +4,10 @@ import fetchData from '../utils/fetchData';
 import Logger from '../utils/logger';
 
 const USER_ADDRESSES = ENV.USER_ADDRESSES;
-const TOO_OLD_TIMESTAMP = ENV.TOO_OLD_TIMESTAMP;
 const FETCH_INTERVAL = ENV.FETCH_INTERVAL;
+
+// Only track trades AFTER bot starts (not historical trades)
+const BOT_START_TIME = Math.floor(Date.now() / 1000);
 
 if (!USER_ADDRESSES || USER_ADDRESSES.length === 0) {
     throw new Error('USER_ADDRESSES is not defined or empty');
@@ -118,8 +120,8 @@ const fetchTradeData = async () => {
 
             // Process each activity
             for (const activity of activities) {
-                // Skip if too old
-                if (activity.timestamp < TOO_OLD_TIMESTAMP) {
+                // Only track trades AFTER bot started (ignore historical trades)
+                if (activity.timestamp < BOT_START_TIME) {
                     continue;
                 }
 
@@ -212,8 +214,6 @@ const fetchTradeData = async () => {
     }
 };
 
-// Track if this is the first run
-let isFirstRun = true;
 // Track if monitor should continue running
 let isRunning = true;
 
@@ -234,24 +234,8 @@ const tradeMonitor = async () => {
     }
     Logger.success(`正在监控 ${USER_ADDRESSES.length} 位交易员，每 ${FETCH_INTERVAL} 秒检查一次`);
     Logger.separator();
-
-    if (isFirstRun) {
-        Logger.info('首次运行：正在将所有历史交易标记为已处理...');
-        for (const { address, UserActivity } of userModels) {
-            const count = await UserActivity.updateMany(
-                { bot: false },
-                { $set: { bot: true, botExcutedTime: 999 } }
-            );
-            if (count.modifiedCount > 0) {
-                Logger.info(
-                    `已将 ${count.modifiedCount} 条历史交易标记为已处理: ${address.slice(0, 6)}...${address.slice(-4)}`
-                );
-            }
-        }
-        isFirstRun = false;
-        Logger.success('\n历史交易已处理完毕，现在仅监控新交易。');
-        Logger.separator();
-    }
+    Logger.info(`⏱ 仅跟踪 bot 启动后的新交易 (启动时间: ${new Date(BOT_START_TIME * 1000).toLocaleString()})`);
+    Logger.separator();
 
     while (isRunning) {
         try {

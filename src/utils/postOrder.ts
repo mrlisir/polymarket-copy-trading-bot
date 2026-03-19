@@ -96,7 +96,22 @@ const postOrder = async (
         let retry = 0;
         let abortDueToFunds = false;
         while (remaining > 0 && retry < RETRY_LIMIT) {
-            const orderBook = await clobClient.getOrderBook(trade.asset);
+            let orderBook;
+            try {
+                orderBook = await clobClient.getOrderBook(trade.asset);
+            } catch (orderBookError: unknown) {
+                const axiosError = orderBookError as any;
+                const status = axiosError?.response?.status;
+                if (status === 404) {
+                    Logger.warning(`⚠️  订单簿不存在 (404): 该市场不可交易`);
+                    await UserActivity.updateOne({ _id: trade._id }, { bot: true });
+                    break;
+                }
+                retry += 1;
+                Logger.warning(`订单簿查询失败 (${retry}/${RETRY_LIMIT}): ${orderBookError}`);
+                continue;
+            }
+
             if (!orderBook.bids || orderBook.bids.length === 0) {
                 Logger.warning('订单簿中无买方报价');
                 await UserActivity.updateOne({ _id: trade._id }, { bot: true });
@@ -229,7 +244,27 @@ const postOrder = async (
         let totalSpentUsdc = 0; // Track total USDC spent for this trade
 
         while (remaining > 0 && retry < RETRY_LIMIT) {
-            const orderBook = await clobClient.getOrderBook(trade.asset);
+            let orderBook;
+            try {
+                orderBook = await clobClient.getOrderBook(trade.asset);
+            } catch (orderBookError: unknown) {
+                const axiosError = orderBookError as any;
+                const status = axiosError?.response?.status;
+                if (status === 404) {
+                    Logger.warning(
+                        `⚠️  订单簿不存在 (404): 该市场可能在 Polymarket 上不可交易或已被移除`
+                    );
+                    Logger.info(`   跳过此交易 — 建议: 确认该市场是否仍在活跃交易`);
+                    await UserActivity.updateOne({ _id: trade._id }, { bot: true });
+                    break;
+                }
+                retry += 1;
+                Logger.warning(
+                    `订单簿查询失败 (第 ${retry}/${RETRY_LIMIT} 次): ${orderBookError}`
+                );
+                continue;
+            }
+
             if (!orderBook.asks || orderBook.asks.length === 0) {
                 Logger.warning('No asks available in order book');
                 await UserActivity.updateOne({ _id: trade._id }, { bot: true });
@@ -428,7 +463,22 @@ const postOrder = async (
         let totalSoldUsdc = 0; // Track total USDC proceeds
 
         while (remaining > 0 && retry < RETRY_LIMIT) {
-            const orderBook = await clobClient.getOrderBook(trade.asset);
+            let orderBook;
+            try {
+                orderBook = await clobClient.getOrderBook(trade.asset);
+            } catch (orderBookError: unknown) {
+                const axiosError = orderBookError as any;
+                const status = axiosError?.response?.status;
+                if (status === 404) {
+                    Logger.warning(`⚠️  订单簿不存在 (404): 该市场不可交易`);
+                    await UserActivity.updateOne({ _id: trade._id }, { bot: true });
+                    break;
+                }
+                retry += 1;
+                Logger.warning(`订单簿查询失败 (${retry}/${RETRY_LIMIT}): ${orderBookError}`);
+                continue;
+            }
+
             if (!orderBook.bids || orderBook.bids.length === 0) {
                 await UserActivity.updateOne({ _id: trade._id }, { bot: true });
                 Logger.warning('订单簿中无买方报价');

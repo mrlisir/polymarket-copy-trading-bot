@@ -1,5 +1,5 @@
 import * as dotenv from 'dotenv';
-import { CopyStrategy, CopyStrategyConfig, parseTieredMultipliers } from './copyStrategy';
+import { CopyStrategy, CopyStrategyConfig, CopyMode, parseTieredMultipliers } from './copyStrategy';
 dotenv.config();
 
 /**
@@ -246,6 +246,7 @@ const parseCopyStrategy = (): CopyStrategyConfig => {
 
         const config: CopyStrategyConfig = {
             strategy: CopyStrategy.PERCENTAGE,
+            copyMode: CopyMode.FOLLOW,
             copySize: effectivePercentage,
             maxOrderSizeUSD: parseFloat(process.env.MAX_ORDER_SIZE_USD || '100.0'),
             minOrderSizeUSD: parseFloat(process.env.MIN_ORDER_SIZE_USD || '1.0'),
@@ -280,6 +281,7 @@ const parseCopyStrategy = (): CopyStrategyConfig => {
 
     const config: CopyStrategyConfig = {
         strategy,
+        copyMode: CopyMode[(process.env.COPY_MODE || 'FOLLOW').toUpperCase() as keyof typeof CopyMode] || CopyMode.FOLLOW,
         copySize: parseFloat(process.env.COPY_SIZE || '10.0'),
         maxOrderSizeUSD: parseFloat(process.env.MAX_ORDER_SIZE_USD || '100.0'),
         minOrderSizeUSD: parseFloat(process.env.MIN_ORDER_SIZE_USD || '1.0'),
@@ -301,6 +303,8 @@ const parseCopyStrategy = (): CopyStrategyConfig => {
         );
         config.adaptiveThreshold = parseFloat(process.env.ADAPTIVE_THRESHOLD_USD || '500.0');
     }
+
+    console.log(`✓ 跟单模式: ${config.copyMode === CopyMode.REVERSE ? '反买 (REVERSE)' : '跟方向 (FOLLOW)'}`);
 
     // Parse tiered multipliers if configured
     if (process.env.TIERED_MULTIPLIERS) {

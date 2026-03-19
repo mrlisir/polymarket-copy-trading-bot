@@ -6,12 +6,21 @@
  * - PERCENTAGE: Copy a fixed percentage of trader's order size
  * - FIXED: Copy a fixed dollar amount per trade
  * - ADAPTIVE: Dynamically adjust percentage based on trader's order size
+ *
+ * Two copy modes are supported:
+ * - FOLLOW: Copy the same direction as trader (trader BUY → you BUY, trader SELL → you SELL)
+ * - REVERSE: Copy the opposite direction as trader (trader BUY → you SELL, trader SELL → you BUY)
  */
 
 export enum CopyStrategy {
     PERCENTAGE = 'PERCENTAGE',
     FIXED = 'FIXED',
     ADAPTIVE = 'ADAPTIVE',
+}
+
+export enum CopyMode {
+    FOLLOW = 'FOLLOW',
+    REVERSE = 'REVERSE',
 }
 
 /**
@@ -28,6 +37,9 @@ export interface MultiplierTier {
 export interface CopyStrategyConfig {
     // Core strategy
     strategy: CopyStrategy;
+
+    // Copy mode: FOLLOW (same direction) or REVERSE (opposite direction)
+    copyMode: CopyMode;
 
     // Main parameter (meaning depends on strategy)
     // PERCENTAGE: Percentage of trader's order (e.g., 10.0 = 10%)
@@ -287,6 +299,7 @@ export function getRecommendedConfig(balanceUSD: number): CopyStrategyConfig {
         // Small balance: Conservative
         return {
             strategy: CopyStrategy.PERCENTAGE,
+            copyMode: CopyMode.FOLLOW,
             copySize: 5.0,
             maxOrderSizeUSD: 20.0,
             minOrderSizeUSD: 1.0,
@@ -297,6 +310,7 @@ export function getRecommendedConfig(balanceUSD: number): CopyStrategyConfig {
         // Medium balance: Balanced
         return {
             strategy: CopyStrategy.PERCENTAGE,
+            copyMode: CopyMode.FOLLOW,
             copySize: 10.0,
             maxOrderSizeUSD: 50.0,
             minOrderSizeUSD: 1.0,
@@ -307,6 +321,7 @@ export function getRecommendedConfig(balanceUSD: number): CopyStrategyConfig {
         // Large balance: Adaptive
         return {
             strategy: CopyStrategy.ADAPTIVE,
+            copyMode: CopyMode.FOLLOW,
             copySize: 10.0,
             adaptiveMinPercent: 5.0,
             adaptiveMaxPercent: 15.0,
@@ -424,4 +439,18 @@ export function getTradeMultiplier(config: CopyStrategyConfig, traderOrderSize: 
 
     // Default: no multiplier
     return 1.0;
+}
+
+/**
+ * Determine the actual trading side based on copy mode
+ *
+ * @param traderSide - The trader's side ('BUY' or 'SELL')
+ * @param copyMode - FOLLOW (same direction) or REVERSE (opposite direction)
+ * @returns The actual side to trade ('BUY' or 'SELL')
+ */
+export function getActualSide(traderSide: string, copyMode: CopyMode): 'BUY' | 'SELL' {
+    if (copyMode === CopyMode.REVERSE) {
+        return traderSide === 'BUY' ? 'SELL' : 'BUY';
+    }
+    return traderSide as 'BUY' | 'SELL';
 }

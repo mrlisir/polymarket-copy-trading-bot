@@ -1,6 +1,7 @@
 import { ClobClient } from '@polymarket/clob-client';
 import { UserActivityInterface, UserPositionInterface } from '../interfaces/User';
 import { ENV } from '../config/env';
+import { getTradeMultiplier, getActualSide, CopyMode } from '../config/copyStrategy';
 import { getUserActivityModel } from '../models/userHistory';
 import fetchData from '../utils/fetchData';
 import getMyBalance from '../utils/getMyBalance';
@@ -150,7 +151,13 @@ const doTrading = async (clobClient: ClobClient, trades: TradeWithUser[]) => {
         const UserActivity = getUserActivityModel(trade.userAddress);
         await UserActivity.updateOne({ _id: trade._id }, { $set: { botExcutedTime: 1 } });
 
-        Logger.trade(trade.userAddress, trade.side || 'UNKNOWN', {
+        const actualSide = getActualSide(trade.side || 'BUY', ENV.COPY_STRATEGY_CONFIG.copyMode);
+
+        if (ENV.COPY_STRATEGY_CONFIG.copyMode === CopyMode.REVERSE) {
+            Logger.info(`🔄 反买模式: 交易员 ${trade.side} → 跟单 ${actualSide}`);
+        }
+
+        Logger.trade(trade.userAddress, actualSide, {
             asset: trade.asset,
             side: trade.side,
             amount: trade.usdcSize,
@@ -192,10 +199,10 @@ const doTrading = async (clobClient: ClobClient, trades: TradeWithUser[]) => {
             );
         }
 
-        // Execute the trade
+        // Execute the trade (use actualSide to determine buy/sell direction)
         const executedUsdc = await postOrder(
             clobClient,
-            trade.side === 'BUY' ? 'buy' : 'sell',
+            actualSide === 'BUY' ? 'buy' : 'sell',
             my_position,
             user_position,
             trade,
@@ -265,17 +272,22 @@ const doAggregatedTrading = async (clobClient: ClobClient, aggregatedTrades: Agg
         }
 
         // Create a synthetic trade object for postOrder using aggregated values
+        const actualSide = getActualSide(agg.side as string, ENV.COPY_STRATEGY_CONFIG.copyMode);
         const syntheticTrade: UserActivityInterface = {
             ...agg.trades[0], // Use first trade as template
             usdcSize: agg.totalUsdcSize,
             price: agg.averagePrice,
-            side: agg.side as 'BUY' | 'SELL',
+            side: agg.side as 'BUY' | 'SELL', // Market-side direction for history queries
         };
+
+        if (ENV.COPY_STRATEGY_CONFIG.copyMode === CopyMode.REVERSE) {
+            Logger.info(`🔄 反买模式: 交易员 ${agg.side} → 跟单 ${actualSide}`);
+        }
 
         // Execute the aggregated trade
         const executedUsdc = await postOrder(
             clobClient,
-            agg.side === 'BUY' ? 'buy' : 'sell',
+            actualSide === 'BUY' ? 'buy' : 'sell',
             my_position,
             user_position,
             syntheticTrade,
