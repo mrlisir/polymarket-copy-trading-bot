@@ -71,26 +71,26 @@ const postOrder = async (
     trade: UserActivityInterface,
     my_balance: number,
     user_balance: number,
-    userAddress: string
-) => {
+    userAddress: string,
+    currentDailyVolume: number = 0
+): Promise<number> => {
     const UserActivity = getUserActivityModel(userAddress);
     //Merge strategy
     if (condition === 'merge') {
-        Logger.info('Executing MERGE strategy...');
+        Logger.info('正在执行合并策略...');
         if (!my_position) {
-            Logger.warning('No position to merge');
+            Logger.warning('无可合并的持仓');
             await UserActivity.updateOne({ _id: trade._id }, { bot: true });
-            return;
+            return 0;
         }
         let remaining = my_position.size;
+        let totalMergedUsdc = 0;
 
         // Check minimum order size
         if (remaining < MIN_ORDER_SIZE_TOKENS) {
-            Logger.warning(
-                `Position size (${remaining.toFixed(2)} tokens) too small to merge - skipping`
-            );
+            Logger.warning(`合并失败: 持仓数量过小 (${remaining.toFixed(2)} 个代币)`);
             await UserActivity.updateOne({ _id: trade._id }, { bot: true });
-            return;
+            return 0;
         }
 
         let retry = 0;
@@ -98,7 +98,7 @@ const postOrder = async (
         while (remaining > 0 && retry < RETRY_LIMIT) {
             const orderBook = await clobClient.getOrderBook(trade.asset);
             if (!orderBook.bids || orderBook.bids.length === 0) {
-                Logger.warning('No bids available in order book');
+                Logger.warning('订单簿中无买方报价');
                 await UserActivity.updateOne({ _id: trade._id }, { bot: true });
                 break;
             }
@@ -107,7 +107,7 @@ const postOrder = async (
                 return parseFloat(bid.price) > parseFloat(max.price) ? bid : max;
             }, orderBook.bids[0]);
 
-            Logger.info(`Best bid: ${maxPriceBid.size} @ $${maxPriceBid.price}`);
+            Logger.info(`最优买价: ${maxPriceBid.size} @ $${maxPriceBid.price}`);
             let order_arges;
             if (remaining <= parseFloat(maxPriceBid.size)) {
                 order_arges = {
@@ -129,6 +129,8 @@ const postOrder = async (
             const resp = await clobClient.postOrder(signedOrder, OrderType.FOK);
             if (resp.success === true) {
                 retry = 0;
+                const proceeds = order_arges.amount * order_arges.price;
+                totalMergedUsdc += proceeds;
                 Logger.orderResult(
                     true,
                     `Sold ${order_arges.amount} tokens at $${order_arges.price}`
@@ -139,16 +141,16 @@ const postOrder = async (
                 if (isInsufficientBalanceOrAllowanceError(errorMessage)) {
                     abortDueToFunds = true;
                     Logger.warning(
-                        `Order rejected: ${errorMessage || 'Insufficient balance or allowance'}`
+                        `订单被拒绝: ${errorMessage || '余额或授权不足'}`
                     );
                     Logger.warning(
-                        'Skipping remaining attempts. Top up funds or run `npm run check-allowance` before retrying.'
+                        '跳过剩余尝试。请充值或运行 `npm run check-allowance` 后重试。'
                     );
                     break;
                 }
                 retry += 1;
                 Logger.warning(
-                    `Order failed (attempt ${retry}/${RETRY_LIMIT})${errorMessage ? ` - ${errorMessage}` : ''}`
+                    `订单失败 (第 ${retry}/${RETRY_LIMIT} 次尝试)${errorMessage ? ` - ${errorMessage}` : ''}`
                 );
             }
         }
@@ -157,42 +159,66 @@ const postOrder = async (
                 { _id: trade._id },
                 { bot: true, botExcutedTime: RETRY_LIMIT }
             );
-            return;
+            return 0;
         }
         if (retry >= RETRY_LIMIT) {
             await UserActivity.updateOne({ _id: trade._id }, { bot: true, botExcutedTime: retry });
         } else {
             await UserActivity.updateOne({ _id: trade._id }, { bot: true });
         }
+        return totalMergedUsdc;
     } else if (condition === 'buy') {
         //Buy strategy
-        Logger.info('Executing BUY strategy...');
+        Logger.info('正在执行买入策略...');
 
-        Logger.info(`Your balance: $${my_balance.toFixed(2)}`);
-        Logger.info(`Trader bought: $${trade.usdcSize.toFixed(2)}`);
+        Logger.info(`您的余额: $${my_balance.toFixed(2)}`);
+        Logger.info(`交易员买入: $${trade.usdcSize.toFixed(2)}`);
 
         // Get current position size for position limit checks
         const currentPositionValue = my_position ? my_position.size * my_position.avgPrice : 0;
+
+        // Show daily volume status if limit is configured
+        const dailyLimit = COPY_STRATEGY_CONFIG.maxDailyVolumeUSD;
+        if (dailyLimit) {
+            const dailyUsed = currentDailyVolume;
+            const dailyRemaining = Math.max(0, dailyLimit - dailyUsed);
+            Logger.info(
+                `📅 今日限额: $${dailyLimit.toFixed(2)} | 已用: $${dailyUsed.toFixed(2)} | 剩余: $${dailyRemaining.toFixed(2)}`
+            );
+        }
 
         // Use new copy strategy system
         const orderCalc = calculateOrderSize(
             COPY_STRATEGY_CONFIG,
             trade.usdcSize,
             my_balance,
-            currentPositionValue
+            currentPositionValue,
+            currentDailyVolume
         );
 
-        // Log the calculation reasoning
-        Logger.info(`📊 ${orderCalc.reasoning}`);
+        // Log the calculation reason with daily volume detail
+        if (orderCalc.dailyVolumeStatus) {
+            const dvs = orderCalc.dailyVolumeStatus;
+            if (dvs.blocked) {
+                Logger.warning(
+                    `⛔ 每日限额已用完: $${dvs.used.toFixed(2)} / $${dvs.limit.toFixed(2)} — 跳过交易`
+                );
+            } else if (orderCalc.finalAmount === 0) {
+                Logger.warning(
+                    `⛔ 每日限额即将耗尽: $${dvs.remaining.toFixed(2)} 剩余金额不足最小交易额 — 跳过`
+                );
+            }
+        }
+        Logger.info(`📊 ${orderCalc.reason}`);
 
         // Check if order should be executed
         if (orderCalc.finalAmount === 0) {
-            Logger.warning(`❌ Cannot execute: ${orderCalc.reasoning}`);
+            Logger.warning(`❌ 无法执行: ${orderCalc.reason}`);
             if (orderCalc.belowMinimum) {
-                Logger.warning(`💡 Increase COPY_SIZE or wait for larger trades`);
+                Logger.warning(`💡 请增大 COPY_SIZE 或等待更大交易`);
             }
             await UserActivity.updateOne({ _id: trade._id }, { bot: true });
-            return;
+            return 0;
         }
 
         let remaining = orderCalc.finalAmount;
@@ -200,6 +226,7 @@ const postOrder = async (
         let retry = 0;
         let abortDueToFunds = false;
         let totalBoughtTokens = 0; // Track total tokens bought for this trade
+        let totalSpentUsdc = 0; // Track total USDC spent for this trade
 
         while (remaining > 0 && retry < RETRY_LIMIT) {
             const orderBook = await clobClient.getOrderBook(trade.asset);
@@ -213,9 +240,9 @@ const postOrder = async (
                 return parseFloat(ask.price) < parseFloat(min.price) ? ask : min;
             }, orderBook.asks[0]);
 
-            Logger.info(`Best ask: ${minPriceAsk.size} @ $${minPriceAsk.price}`);
+            Logger.info(`最优卖价: ${minPriceAsk.size} @ $${minPriceAsk.price}`);
             if (parseFloat(minPriceAsk.price) - 0.05 > trade.price) {
-                Logger.warning('Price slippage too high - skipping trade');
+                Logger.warning('价格滑点过大 — 跳过此次交易');
                 await UserActivity.updateOne({ _id: trade._id }, { bot: true });
                 break;
             }
@@ -223,7 +250,7 @@ const postOrder = async (
             // Check if remaining amount is below minimum before creating order
             if (remaining < MIN_ORDER_SIZE_USD) {
                 Logger.info(
-                    `Remaining amount ($${remaining.toFixed(2)}) below minimum - completing trade`
+                    `剩余金额 ($${remaining.toFixed(2)}) 低于最小值 — 完成此次交易`
                 );
                 await UserActivity.updateOne(
                     { _id: trade._id },
@@ -243,7 +270,7 @@ const postOrder = async (
             };
 
             Logger.info(
-                `Creating order: $${orderSize.toFixed(2)} @ $${minPriceAsk.price} (Balance: $${my_balance.toFixed(2)})`
+                `正在下单: $${orderSize.toFixed(2)} @ $${minPriceAsk.price} (余额: $${my_balance.toFixed(2)})`
             );
             // Order args logged internally
             const signedOrder = await clobClient.createMarketOrder(order_arges);
@@ -252,9 +279,11 @@ const postOrder = async (
                 retry = 0;
                 const tokensBought = order_arges.amount / order_arges.price;
                 totalBoughtTokens += tokensBought;
+                const usdcSpent = order_arges.amount;
+                totalSpentUsdc += usdcSpent;
                 Logger.orderResult(
                     true,
-                    `Bought $${order_arges.amount.toFixed(2)} at $${order_arges.price} (${tokensBought.toFixed(2)} tokens)`
+                    `买入成功: $${order_arges.amount.toFixed(2)} @ $${order_arges.price} (${tokensBought.toFixed(2)} 个代币)`
                 );
                 remaining -= order_arges.amount;
             } else {
@@ -262,16 +291,16 @@ const postOrder = async (
                 if (isInsufficientBalanceOrAllowanceError(errorMessage)) {
                     abortDueToFunds = true;
                     Logger.warning(
-                        `Order rejected: ${errorMessage || 'Insufficient balance or allowance'}`
+                        `订单被拒绝: ${errorMessage || '余额或授权不足'}`
                     );
                     Logger.warning(
-                        'Skipping remaining attempts. Top up funds or run `npm run check-allowance` before retrying.'
+                        '跳过剩余尝试。请充值或运行 `npm run check-allowance` 后重试。'
                     );
                     break;
                 }
                 retry += 1;
                 Logger.warning(
-                    `Order failed (attempt ${retry}/${RETRY_LIMIT})${errorMessage ? ` - ${errorMessage}` : ''}`
+                    `订单失败 (第 ${retry}/${RETRY_LIMIT} 次尝试)${errorMessage ? ` - ${errorMessage}` : ''}`
                 );
             }
         }
@@ -280,7 +309,7 @@ const postOrder = async (
                 { _id: trade._id },
                 { bot: true, botExcutedTime: RETRY_LIMIT, myBoughtSize: totalBoughtTokens }
             );
-            return;
+            return 0;
         }
         if (retry >= RETRY_LIMIT) {
             await UserActivity.updateOne(
@@ -297,17 +326,18 @@ const postOrder = async (
         // Log the tracked purchase for later sell reference
         if (totalBoughtTokens > 0) {
             Logger.info(
-                `📝 Tracked purchase: ${totalBoughtTokens.toFixed(2)} tokens for future sell calculations`
+                `📝 已记录购买: ${totalBoughtTokens.toFixed(2)} 个代币，用于后续卖出计算`
             );
         }
+        return totalSpentUsdc;
     } else if (condition === 'sell') {
         //Sell strategy
-        Logger.info('Executing SELL strategy...');
+        Logger.info('正在执行卖出策略...');
         let remaining = 0;
         if (!my_position) {
-            Logger.warning('No position to sell');
+            Logger.warning('无可卖出的持仓');
             await UserActivity.updateOne({ _id: trade._id }, { bot: true });
-            return;
+            return 0;
         }
 
         // Get all previous BUY trades for this asset to calculate total bought
@@ -326,7 +356,7 @@ const postOrder = async (
 
         if (totalBoughtTokens > 0) {
             Logger.info(
-                `📊 Found ${previousBuys.length} previous purchases: ${totalBoughtTokens.toFixed(2)} tokens bought`
+                `📊 发现 ${previousBuys.length} 笔历史买入记录: ${totalBoughtTokens.toFixed(2)} 个代币`
             );
         }
 
@@ -342,10 +372,10 @@ const postOrder = async (
             const trader_position_before = user_position.size + trade.size;
 
             Logger.info(
-                `Position comparison: Trader has ${trader_position_before.toFixed(2)} tokens, You have ${my_position.size.toFixed(2)} tokens`
+                `持仓对比: 交易员有 ${trader_position_before.toFixed(2)} 个代币，您有 ${my_position.size.toFixed(2)} 个代币`
             );
             Logger.info(
-                `Trader selling: ${trade.size.toFixed(2)} tokens (${(trader_sell_percent * 100).toFixed(2)}% of their position)`
+                `交易员卖出: ${trade.size.toFixed(2)} 个代币 (占其仓位的 ${(trader_sell_percent * 100).toFixed(2)}%)`
             );
 
             // Use tracked bought tokens if available, otherwise fallback to current position
@@ -358,7 +388,7 @@ const postOrder = async (
             } else {
                 baseSellSize = my_position.size * trader_sell_percent;
                 Logger.warning(
-                    `No tracked purchases found, using current position: ${my_position.size.toFixed(2)} × ${(trader_sell_percent * 100).toFixed(2)}% = ${baseSellSize.toFixed(2)} tokens`
+                    `未找到追踪购买记录，使用当前持仓: ${my_position.size.toFixed(2)} × ${(trader_sell_percent * 100).toFixed(2)}% = ${baseSellSize.toFixed(2)} 个代币`
                 );
             }
 
@@ -368,7 +398,7 @@ const postOrder = async (
 
             if (multiplier !== 1.0) {
                 Logger.info(
-                    `Applying ${multiplier}x multiplier (based on trader's $${trade.usdcSize.toFixed(2)} order): ${baseSellSize.toFixed(2)} → ${remaining.toFixed(2)} tokens`
+                    `应用 ${multiplier}x 乘数 (基于交易员 $${trade.usdcSize.toFixed(2)} 订单): ${baseSellSize.toFixed(2)} → ${remaining.toFixed(2)} 个代币`
                 );
             }
         }
@@ -376,31 +406,32 @@ const postOrder = async (
         // Check minimum order size
         if (remaining < MIN_ORDER_SIZE_TOKENS) {
             Logger.warning(
-                `❌ Cannot execute: Sell amount ${remaining.toFixed(2)} tokens below minimum (${MIN_ORDER_SIZE_TOKENS} token)`
+                `❌ 无法执行: 卖出数量 ${remaining.toFixed(2)} 个代币低于最低限制 (${MIN_ORDER_SIZE_TOKENS} 个代币)`
             );
-            Logger.warning(`💡 This happens when position sizes are too small or mismatched`);
+            Logger.warning(`💡 这通常发生在持仓数量过小或不对称时`);
             await UserActivity.updateOne({ _id: trade._id }, { bot: true });
-            return;
+            return 0;
         }
 
         // Cap sell amount to available position size
         if (remaining > my_position.size) {
             Logger.warning(
-                `⚠️  Calculated sell ${remaining.toFixed(2)} tokens > Your position ${my_position.size.toFixed(2)} tokens`
+                `⚠️  计算卖出数量 ${remaining.toFixed(2)} 个代币 > 您的持仓 ${my_position.size.toFixed(2)} 个代币`
             );
-            Logger.warning(`Capping to maximum available: ${my_position.size.toFixed(2)} tokens`);
+            Logger.warning(`已限制为最大可用数量: ${my_position.size.toFixed(2)} 个代币`);
             remaining = my_position.size;
         }
 
         let retry = 0;
         let abortDueToFunds = false;
         let totalSoldTokens = 0; // Track total tokens sold
+        let totalSoldUsdc = 0; // Track total USDC proceeds
 
         while (remaining > 0 && retry < RETRY_LIMIT) {
             const orderBook = await clobClient.getOrderBook(trade.asset);
             if (!orderBook.bids || orderBook.bids.length === 0) {
                 await UserActivity.updateOne({ _id: trade._id }, { bot: true });
-                Logger.warning('No bids available in order book');
+                Logger.warning('订单簿中无买方报价');
                 break;
             }
 
@@ -408,12 +439,11 @@ const postOrder = async (
                 return parseFloat(bid.price) > parseFloat(max.price) ? bid : max;
             }, orderBook.bids[0]);
 
-            Logger.info(`Best bid: ${maxPriceBid.size} @ $${maxPriceBid.price}`);
+            Logger.info(`最优买价: ${maxPriceBid.size} @ $${maxPriceBid.price}`);
 
-            // Check if remaining amount is below minimum before creating order
             if (remaining < MIN_ORDER_SIZE_TOKENS) {
                 Logger.info(
-                    `Remaining amount (${remaining.toFixed(2)} tokens) below minimum - completing trade`
+                    `剩余数量 (${remaining.toFixed(2)} 个代币) 低于最小值 — 完成此次交易`
                 );
                 await UserActivity.updateOne({ _id: trade._id }, { bot: true });
                 break;
@@ -421,10 +451,9 @@ const postOrder = async (
 
             const sellAmount = Math.min(remaining, parseFloat(maxPriceBid.size));
 
-            // Final check: don't create orders below minimum
             if (sellAmount < MIN_ORDER_SIZE_TOKENS) {
                 Logger.info(
-                    `Order amount (${sellAmount.toFixed(2)} tokens) below minimum - completing trade`
+                    `订单数量 (${sellAmount.toFixed(2)} 个代币) 低于最小值 — 完成此次交易`
                 );
                 await UserActivity.updateOne({ _id: trade._id }, { bot: true });
                 break;
@@ -442,9 +471,10 @@ const postOrder = async (
             if (resp.success === true) {
                 retry = 0;
                 totalSoldTokens += order_arges.amount;
+                totalSoldUsdc += order_arges.amount * order_arges.price;
                 Logger.orderResult(
                     true,
-                    `Sold ${order_arges.amount} tokens at $${order_arges.price}`
+                    `卖出成功: ${order_arges.amount} 个代币 @ $${order_arges.price}`
                 );
                 remaining -= order_arges.amount;
             } else {
@@ -452,16 +482,16 @@ const postOrder = async (
                 if (isInsufficientBalanceOrAllowanceError(errorMessage)) {
                     abortDueToFunds = true;
                     Logger.warning(
-                        `Order rejected: ${errorMessage || 'Insufficient balance or allowance'}`
+                        `订单被拒绝: ${errorMessage || '余额或授权不足'}`
                     );
                     Logger.warning(
-                        'Skipping remaining attempts. Top up funds or run `npm run check-allowance` before retrying.'
+                        '跳过剩余尝试。请充值或运行 `npm run check-allowance` 后重试。'
                     );
                     break;
                 }
                 retry += 1;
                 Logger.warning(
-                    `Order failed (attempt ${retry}/${RETRY_LIMIT})${errorMessage ? ` - ${errorMessage}` : ''}`
+                    `订单失败 (第 ${retry}/${RETRY_LIMIT} 次尝试)${errorMessage ? ` - ${errorMessage}` : ''}`
                 );
             }
         }
@@ -483,7 +513,7 @@ const postOrder = async (
                     { $set: { myBoughtSize: 0 } }
                 );
                 Logger.info(
-                    `🧹 Cleared purchase tracking (sold ${(sellPercentage * 100).toFixed(1)}% of position)`
+                    `🧹 已清除购买追踪记录 (卖出持仓的 ${(sellPercentage * 100).toFixed(1)}%)`
                 );
             } else {
                 // Partial sell - reduce tracked purchases proportionally
@@ -495,7 +525,7 @@ const postOrder = async (
                     );
                 }
                 Logger.info(
-                    `📝 Updated purchase tracking (sold ${(sellPercentage * 100).toFixed(1)}% of tracked position)`
+                    `📝 已更新购买追踪记录 (卖出追踪持仓的 ${(sellPercentage * 100).toFixed(1)}%)`
                 );
             }
         }
@@ -505,16 +535,19 @@ const postOrder = async (
                 { _id: trade._id },
                 { bot: true, botExcutedTime: RETRY_LIMIT }
             );
-            return;
+            return 0;
         }
         if (retry >= RETRY_LIMIT) {
             await UserActivity.updateOne({ _id: trade._id }, { bot: true, botExcutedTime: retry });
         } else {
             await UserActivity.updateOne({ _id: trade._id }, { bot: true });
         }
+        return totalSoldUsdc;
     } else {
-        Logger.error(`Unknown condition: ${condition}`);
+        Logger.error(`未知条件: ${condition}`);
     }
+
+    return 0;
 };
 
 export default postOrder;

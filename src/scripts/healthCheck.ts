@@ -26,73 +26,73 @@ function printRecommendations(result: any) {
     const issues: string[] = [];
 
     if (result.checks.database.status === 'error') {
-        issues.push('❌ Database Connection Failed');
-        console.log(`${colors.red}${colors.bright}\n📋 Database Issue:${colors.reset}`);
-        console.log('   • Check your MONGO_URI in .env file');
-        console.log('   • Verify MongoDB Atlas IP whitelist (allow 0.0.0.0/0)');
-        console.log('   • Ensure database user has correct permissions');
-        console.log('   • Test connection: https://www.mongodb.com/docs/atlas/troubleshoot-connection\n');
+        issues.push('❌ 数据库连接失败');
+        console.log(`${colors.red}${colors.bright}\n📋 数据库问题:${colors.reset}`);
+        console.log('   • 检查 .env 文件中的 MONGO_URI');
+        console.log('   • 确认 MongoDB Atlas IP 白名单 (允许 0.0.0.0/0)');
+        console.log('   • 确认数据库用户权限正确');
+        console.log('   • 测试连接: https://www.mongodb.com/docs/atlas/troubleshoot-connection\n');
     }
 
     if (result.checks.rpc.status === 'error') {
-        issues.push('❌ RPC Endpoint Failed');
-        console.log(`${colors.red}${colors.bright}\n📋 RPC Issue:${colors.reset}`);
-        console.log('   • Check your RPC_URL in .env file');
-        console.log('   • Verify your API key is valid');
-        console.log('   • Try alternative providers:');
+        issues.push('❌ RPC 节点连接失败');
+        console.log(`${colors.red}${colors.bright}\n📋 RPC 问题:${colors.reset}`);
+        console.log('   • 检查 .env 文件中的 RPC_URL');
+        console.log('   • 确认您的 API 密钥有效');
+        console.log('   • 尝试其他提供商:');
         console.log('     - Infura: https://infura.io');
         console.log('     - Alchemy: https://www.alchemy.com\n');
     }
 
     if (result.checks.balance.status === 'error') {
-        issues.push('❌ Zero USDC Balance');
-        console.log(`${colors.red}${colors.bright}\n📋 Balance Issue:${colors.reset}`);
-        console.log('   • Your wallet has no USDC to trade with');
-        console.log('   • Bridge USDC to Polygon: https://wallet.polygon.technology/polygon/bridge/deposit');
-        console.log('   • Or buy USDC on an exchange and withdraw to Polygon network');
-        console.log('   • Also get POL (MATIC) for gas fees (~$5-10 worth)\n');
+        issues.push('❌ USDC 余额为零');
+        console.log(`${colors.red}${colors.bright}\n📋 余额问题:${colors.reset}`);
+        console.log('   • 您的钱包中没有 USDC');
+        console.log('   • 将 USDC 跨链到 Polygon: https://wallet.polygon.technology/polygon/bridge/deposit');
+        console.log('   • 或在交易所购买 USDC 并提现到 Polygon 网络');
+        console.log('   • 同时准备 POL (MATIC) 作为 Gas 费 (约 $5-10)\n');
     } else if (result.checks.balance.status === 'warning') {
-        console.log(`${colors.yellow}${colors.bright}\n⚠️  Low Balance Warning:${colors.reset}`);
-        console.log(`   • Balance: $${result.checks.balance.balance?.toFixed(2) || '0.00'}`);
-        console.log('   • Consider adding more USDC to avoid missing trades');
-        console.log('   • Recommended minimum: $50-100 for active trading\n');
+        console.log(`${colors.yellow}${colors.bright}\n⚠️  余额不足警告:${colors.reset}`);
+        console.log(`   • 当前余额: $${result.checks.balance.balance?.toFixed(2) || '0.00'}`);
+        console.log('   • 建议增加 USDC 以避免错过交易');
+        console.log('   • 活跃交易建议最低: $50-100\n');
     }
 
     if (result.checks.polymarketApi.status === 'error') {
-        issues.push('❌ Polymarket API Failed');
-        console.log(`${colors.red}${colors.bright}\n📋 API Issue:${colors.reset}`);
-        console.log('   • Polymarket API is not responding');
-        console.log('   • Check your internet connection');
-        console.log('   • Polymarket may be experiencing downtime');
-        console.log('   • Check status: https://polymarket.com\n');
+        issues.push('❌ Polymarket API 连接失败');
+        console.log(`${colors.red}${colors.bright}\n📋 API 问题:${colors.reset}`);
+        console.log('   • Polymarket API 无响应');
+        console.log('   • 请检查网络连接');
+        console.log('   • Polymarket 可能正在维护');
+        console.log('   • 查看状态: https://polymarket.com\n');
     }
 
     if (issues.length === 0) {
-        console.log(`${colors.green}${colors.bright}\n🎉 All Systems Operational!${colors.reset}\n`);
-        console.log(`${colors.cyan}You're ready to start trading:${colors.reset}`);
+        console.log(`${colors.green}${colors.bright}\n🎉 所有系统运行正常！${colors.reset}\n`);
+        console.log(`${colors.cyan}您可以开始交易了:${colors.reset}`);
         console.log(`   ${colors.green}npm start${colors.reset}\n`);
     } else {
-        console.log(`${colors.red}${colors.bright}\n⚠️  ${issues.length} Issue(s) Found${colors.reset}`);
-        console.log(`\n${colors.yellow}Fix the issues above before starting the bot.${colors.reset}\n`);
+        console.log(`${colors.red}${colors.bright}\n⚠️  发现 ${issues.length} 个问题${colors.reset}`);
+        console.log(`\n${colors.yellow}请先修复上述问题后再启动机器人。${colors.reset}\n`);
     }
 }
 
 function printConfiguration() {
-    console.log(`${colors.cyan}📊 Configuration Summary:${colors.reset}\n`);
-    console.log(`   Trading Wallet: ${ENV.PROXY_WALLET.slice(0, 6)}...${ENV.PROXY_WALLET.slice(-4)}`);
-    console.log(`   Tracking ${ENV.USER_ADDRESSES.length} trader(s):`);
+    console.log(`${colors.cyan}📊 配置摘要:${colors.reset}\n`);
+    console.log(`   交易钱包: ${ENV.PROXY_WALLET.slice(0, 6)}...${ENV.PROXY_WALLET.slice(-4)}`);
+    console.log(`   正在跟踪 ${ENV.USER_ADDRESSES.length} 位交易员:`);
     ENV.USER_ADDRESSES.forEach((addr, idx) => {
         console.log(`      ${idx + 1}. ${addr.slice(0, 6)}...${addr.slice(-4)}`);
     });
-    console.log(`   Check Interval: ${ENV.FETCH_INTERVAL}s`);
-    console.log(`   Trade Multiplier: ${ENV.TRADE_MULTIPLIER}x`);
+    console.log(`   检查间隔: ${ENV.FETCH_INTERVAL}秒`);
+    console.log(`   交易乘数: ${ENV.TRADE_MULTIPLIER}x`);
     console.log('');
 }
 
 const main = async () => {
     try {
         printHeader();
-        console.log(`${colors.yellow}⏳ Running diagnostic checks...${colors.reset}\n`);
+        console.log(`${colors.yellow}⏳ 正在运行诊断检查...${colors.reset}\n`);
 
         await connectDB();
         const result = await performHealthCheck();
@@ -107,10 +107,10 @@ const main = async () => {
             process.exit(1);
         }
     } catch (error) {
-        console.error(`\n${colors.red}${colors.bright}❌ Health Check Error${colors.reset}\n`);
+        console.error(`\n${colors.red}${colors.bright}❌ 健康检查错误${colors.reset}\n`);
         if (error instanceof Error) {
             console.error(`${error.message}\n`);
-            console.error(`${colors.yellow}💡 Tip: Run the setup wizard to reconfigure:${colors.reset}`);
+            console.error(`${colors.yellow}💡 提示: 运行设置向导重新配置:${colors.reset}`);
             console.error(`   ${colors.cyan}npm run setup${colors.reset}\n`);
         } else {
             console.error(error);

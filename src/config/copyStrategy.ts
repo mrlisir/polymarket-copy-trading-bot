@@ -63,7 +63,13 @@ export interface OrderSizeCalculation {
     cappedByMax: boolean; // Whether capped by MAX_ORDER_SIZE
     reducedByBalance: boolean; // Whether reduced due to balance
     belowMinimum: boolean; // Whether below minimum threshold
-    reasoning: string; // Human-readable explanation
+    reason: string; // Human-readable explanation
+    dailyVolumeStatus?: {
+        limit: number;
+        used: number;
+        remaining: number;
+        blocked: boolean;
+    };
 }
 
 /**
@@ -73,27 +79,28 @@ export function calculateOrderSize(
     config: CopyStrategyConfig,
     traderOrderSize: number,
     availableBalance: number,
-    currentPositionSize: number = 0
+    currentPositionSize: number = 0,
+    currentDailyVolume: number = 0
 ): OrderSizeCalculation {
     let baseAmount: number;
-    let reasoning: string;
+    let reason: string;
 
     // Step 1: Calculate base amount based on strategy
     switch (config.strategy) {
         case CopyStrategy.PERCENTAGE:
             baseAmount = traderOrderSize * (config.copySize / 100);
-            reasoning = `${config.copySize}% of trader's $${traderOrderSize.toFixed(2)} = $${baseAmount.toFixed(2)}`;
+            reason = `${config.copySize}% of trader's $${traderOrderSize.toFixed(2)} = $${baseAmount.toFixed(2)}`;
             break;
 
         case CopyStrategy.FIXED:
             baseAmount = config.copySize;
-            reasoning = `Fixed amount: $${baseAmount.toFixed(2)}`;
+            reason = `Fixed amount: $${baseAmount.toFixed(2)}`;
             break;
 
         case CopyStrategy.ADAPTIVE:
             const adaptivePercent = calculateAdaptivePercent(config, traderOrderSize);
             baseAmount = traderOrderSize * (adaptivePercent / 100);
-            reasoning = `Adaptive ${adaptivePercent.toFixed(1)}% of trader's $${traderOrderSize.toFixed(2)} = $${baseAmount.toFixed(2)}`;
+            reason = `Adaptive ${adaptivePercent.toFixed(1)}% of trader's $${traderOrderSize.toFixed(2)} = $${baseAmount.toFixed(2)}`;
             break;
 
         default:
@@ -105,7 +112,7 @@ export function calculateOrderSize(
     let finalAmount = baseAmount * multiplier;
 
     if (multiplier !== 1.0) {
-        reasoning += ` → ${multiplier}x multiplier: $${baseAmount.toFixed(2)} → $${finalAmount.toFixed(2)}`;
+        reason += ` → ${multiplier}x multiplier: $${baseAmount.toFixed(2)} → $${finalAmount.toFixed(2)}`;
     }
     let cappedByMax = false;
     let reducedByBalance = false;
@@ -115,7 +122,7 @@ export function calculateOrderSize(
     if (finalAmount > config.maxOrderSizeUSD) {
         finalAmount = config.maxOrderSizeUSD;
         cappedByMax = true;
-        reasoning += ` → Capped at max $${config.maxOrderSizeUSD}`;
+        reason += ` → Capped at max $${config.maxOrderSizeUSD}`;
     }
 
     // Step 3: Apply maximum position size limit (if configured)
@@ -125,26 +132,60 @@ export function calculateOrderSize(
             const allowedAmount = Math.max(0, config.maxPositionSizeUSD - currentPositionSize);
             if (allowedAmount < config.minOrderSizeUSD) {
                 finalAmount = 0;
-                reasoning += ` → Position limit reached`;
+                reason += ` → Position limit reached`;
             } else {
                 finalAmount = allowedAmount;
-                reasoning += ` → Reduced to fit position limit`;
+                reason += ` → Reduced to fit position limit`;
             }
         }
     }
 
-    // Step 4: Check available balance (with 1% safety buffer)
+    // Step 4: Check daily volume limit (if configured)
+    let dailyVolumeStatus: OrderSizeCalculation['dailyVolumeStatus'] | undefined;
+    if (config.maxDailyVolumeUSD) {
+        const dailyLimit = config.maxDailyVolumeUSD;
+        const dailyRemaining = dailyLimit - currentDailyVolume;
+
+        if (currentDailyVolume >= dailyLimit) {
+            // Daily limit already reached — block this trade
+            finalAmount = 0;
+            belowMinimum = true;
+            dailyVolumeStatus = { limit: dailyLimit, used: currentDailyVolume, remaining: 0, blocked: true };
+            reason += ` → DAILY LIMIT REACHED ($${currentDailyVolume.toFixed(2)} / $${dailyLimit.toFixed(2)})`;
+        } else if (finalAmount > dailyRemaining) {
+            // Reduce to fit remaining daily budget
+            const previousFinalAmount = finalAmount;
+            finalAmount = dailyRemaining;
+            reducedByBalance = true;
+            dailyVolumeStatus = {
+                limit: dailyLimit,
+                used: currentDailyVolume,
+                remaining: dailyRemaining,
+                blocked: false,
+            };
+            reason += ` → Reduced by daily limit: $${previousFinalAmount.toFixed(2)} → $${finalAmount.toFixed(2)} (daily ${dailyLimit.toFixed(2)} left: $${dailyRemaining.toFixed(2)})`;
+        } else {
+            dailyVolumeStatus = {
+                limit: dailyLimit,
+                used: currentDailyVolume,
+                remaining: dailyRemaining,
+                blocked: false,
+            };
+        }
+    }
+
+    // Step 5: Check available balance (with 1% safety buffer)
     const maxAffordable = availableBalance * 0.99;
     if (finalAmount > maxAffordable) {
         finalAmount = maxAffordable;
         reducedByBalance = true;
-        reasoning += ` → Reduced to fit balance ($${maxAffordable.toFixed(2)})`;
+        reason += ` → Reduced to fit balance ($${maxAffordable.toFixed(2)})`;
     }
 
-    // Step 5: Check minimum order size
+    // Step 6: Check minimum order size
     if (finalAmount < config.minOrderSizeUSD) {
         belowMinimum = true;
-        reasoning += ` → Below minimum $${config.minOrderSizeUSD}`;
+        reason += ` → Below minimum $${config.minOrderSizeUSD}`;
         finalAmount = 0; // Don't execute
     }
 
@@ -156,7 +197,8 @@ export function calculateOrderSize(
         cappedByMax,
         reducedByBalance,
         belowMinimum,
-        reasoning,
+        reason,
+        dailyVolumeStatus,
     };
 }
 

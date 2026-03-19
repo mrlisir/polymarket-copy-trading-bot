@@ -32,6 +32,7 @@ console.log(`${colors.yellow}${colors.bright}💰 WALLET & BALANCE${colors.reset
 console.log(`  ${colors.green}npm run check-proxy${colors.reset}       Check your wallet balance and positions`);
 console.log(`  ${colors.green}npm run check-both${colors.reset}        Check both your wallet and EOA`);
 console.log(`  ${colors.green}npm run check-allowance${colors.reset}   Verify USDC token allowance`);
+console.log(`  ${colors.green}npm run verify-allowance${colors.reset}   Detailed USDC allowance check`);
 console.log(`  ${colors.green}npm run set-token-allowance${colors.reset}  Set USDC spending approval`);
 console.log('');
 

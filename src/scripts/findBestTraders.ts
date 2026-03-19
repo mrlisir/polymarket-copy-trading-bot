@@ -90,7 +90,7 @@ const KNOWN_TRADERS = [
 
 async function fetchTraderLeaderboard(): Promise<string[]> {
     try {
-        console.log(colors.cyan('📊 Fetching trader leaderboard from Polymarket...'));
+        console.log(colors.cyan('📊 正在从 Polymarket 获取交易员排行榜...'));
 
         // Try to get top traders from events/markets
         const response = await axios.get('https://data-api.polymarket.com/markets', {
@@ -127,7 +127,7 @@ async function fetchTraderLeaderboard(): Promise<string[]> {
 
         return traderList.slice(0, 20); // Top 20 most active
     } catch (error) {
-        console.log(colors.yellow('⚠️  Could not fetch leaderboard, using known traders list'));
+        console.log(colors.yellow('⚠️  无法获取排行榜，使用已知交易员列表'));
         return KNOWN_TRADERS;
     }
 }
@@ -217,7 +217,7 @@ async function fetchTraderActivity(traderAddress: string): Promise<Trade[]> {
 
         return allTrades.sort((a, b) => a.timestamp - b.timestamp);
     } catch (error) {
-        console.error(colors.red(`Error fetching trader ${traderAddress}:`), error);
+        console.error(colors.red(`获取交易员 ${traderAddress} 数据时出错:`), error);
         return [];
     }
 }
@@ -467,20 +467,19 @@ async function simulateTrader(traderAddress: string): Promise<TraderResult> {
 
 function printResults(results: TraderResult[]) {
     console.log('\n' + colors.cyan('═'.repeat(100)));
-    console.log(colors.cyan('  🏆 TRADER ANALYSIS RESULTS'));
+    console.log(colors.cyan('  🏆 交易员分析报告'));
     console.log(colors.cyan('═'.repeat(100)) + '\n');
 
-    console.log(colors.bold('Configuration:'));
+    console.log(colors.bold('配置参数:'));
     console.log(
-        `  History: ${HISTORY_DAYS} days | Multiplier: ${MULTIPLIER}x | Min Order: $${MIN_ORDER_SIZE} | Starting Capital: $${STARTING_CAPITAL}\n`
+        `  历史天数: ${HISTORY_DAYS} 天 | 乘数: ${MULTIPLIER}x | 最小订单: $${MIN_ORDER_SIZE} | 起始资金: $${STARTING_CAPITAL}\n`
     );
 
-    // Sort by ROI
     const sortedByROI = [...results]
         .filter((r) => !r.error && r.copiedTrades > 0)
         .sort((a, b) => b.roi - a.roi);
 
-    console.log(colors.bold(colors.green('📈 TOP 10 BY ROI:\n')));
+    console.log(colors.bold(colors.green('📈 按收益率排名前 10:\n')));
     sortedByROI.slice(0, 10).forEach((result, idx) => {
         const roiColor = result.roi >= 0 ? colors.green : colors.red;
         const roiSign = result.roi >= 0 ? '+' : '';
@@ -488,17 +487,16 @@ function printResults(results: TraderResult[]) {
             `${idx + 1}. ${colors.blue(result.address.slice(0, 10) + '...' + result.address.slice(-8))}`
         );
         console.log(
-            `   ROI: ${roiColor(roiSign + result.roi.toFixed(2) + '%')} | P&L: ${roiSign}$${result.totalPnl.toFixed(2)} | Trades: ${result.copiedTrades} | Win Rate: ${result.winRate.toFixed(1)}%`
+            `   收益率: ${roiColor(roiSign + result.roi.toFixed(2) + '%')} | 盈亏: ${roiSign}$${result.totalPnl.toFixed(2)} | 跟单次数: ${result.copiedTrades} | 胜率: ${result.winRate.toFixed(1)}%`
         );
     });
 
-    // Sort by win rate
     const sortedByWinRate = [...results]
         .filter((r) => !r.error && r.copiedTrades > 0 && r.closedPositions >= 5)
         .sort((a, b) => b.winRate - a.winRate);
 
     console.log(
-        '\n' + colors.bold(colors.yellow('🎯 TOP 10 BY WIN RATE (min 5 closed positions):\n'))
+        '\n' + colors.bold(colors.yellow('🎯 按胜率排名前 10 (至少 5 个平仓):\n'))
     );
     sortedByWinRate.slice(0, 10).forEach((result, idx) => {
         const roiColor = result.roi >= 0 ? colors.green : colors.red;
@@ -507,16 +505,15 @@ function printResults(results: TraderResult[]) {
             `${idx + 1}. ${colors.blue(result.address.slice(0, 10) + '...' + result.address.slice(-8))}`
         );
         console.log(
-            `   Win Rate: ${colors.green(result.winRate.toFixed(1) + '%')} | ROI: ${roiColor(roiSign + result.roi.toFixed(2) + '%')} | Closed: ${result.closedPositions} | Trades: ${result.copiedTrades}`
+            `   胜率: ${colors.green(result.winRate.toFixed(1) + '%')} | 收益率: ${roiColor(roiSign + result.roi.toFixed(2) + '%')} | 已平仓: ${result.closedPositions} | 跟单次数: ${result.copiedTrades}`
         );
     });
 
-    // Sort by total profit
     const sortedByProfit = [...results]
         .filter((r) => !r.error && r.copiedTrades > 0)
         .sort((a, b) => b.totalPnl - a.totalPnl);
 
-    console.log('\n' + colors.bold(colors.magenta('💰 TOP 10 BY TOTAL PROFIT:\n')));
+    console.log('\n' + colors.bold(colors.magenta('💰 按总利润排名前 10:\n')));
     sortedByProfit.slice(0, 10).forEach((result, idx) => {
         const pnlColor = result.totalPnl >= 0 ? colors.green : colors.red;
         const pnlSign = result.totalPnl >= 0 ? '+' : '';
@@ -524,13 +521,12 @@ function printResults(results: TraderResult[]) {
             `${idx + 1}. ${colors.blue(result.address.slice(0, 10) + '...' + result.address.slice(-8))}`
         );
         console.log(
-            `   Profit: ${pnlColor(pnlSign + '$' + result.totalPnl.toFixed(2))} | ROI: ${pnlSign}${result.roi.toFixed(2)}% | Final Capital: $${result.currentCapital.toFixed(2)}`
+            `   利润: ${pnlColor(pnlSign + '$' + result.totalPnl.toFixed(2))} | 收益率: ${pnlSign}${result.roi.toFixed(2)}% | 最终资金: $${result.currentCapital.toFixed(2)}`
         );
     });
 
-    // Summary stats
     console.log('\n' + colors.cyan('═'.repeat(100)));
-    console.log(colors.bold('📊 SUMMARY STATISTICS:\n'));
+    console.log(colors.bold('📊 统计摘要:\n'));
 
     const validResults = results.filter((r) => !r.error && r.copiedTrades > 0);
     const profitableTraders = validResults.filter((r) => r.roi > 0);
@@ -538,34 +534,33 @@ function printResults(results: TraderResult[]) {
     const avgWinRate = validResults.reduce((sum, r) => sum + r.winRate, 0) / validResults.length;
     const totalSimulationTime = results.reduce((sum, r) => sum + r.simulationTime, 0);
 
-    console.log(`  Total Traders Analyzed: ${colors.cyan(String(results.length))}`);
-    console.log(`  Valid Simulations: ${colors.cyan(String(validResults.length))}`);
+    console.log(`  总分析交易员数: ${colors.cyan(String(results.length))}`);
+    console.log(`  有效模拟数: ${colors.cyan(String(validResults.length))}`);
     console.log(
-        `  Profitable Traders: ${colors.green(String(profitableTraders.length))} (${((profitableTraders.length / validResults.length) * 100).toFixed(1)}%)`
+        `  盈利交易员数: ${colors.green(String(profitableTraders.length))} (${((profitableTraders.length / validResults.length) * 100).toFixed(1)}%)`
     );
     console.log(
-        `  Average ROI: ${avgROI >= 0 ? colors.green('+') : colors.red('')}${avgROI.toFixed(2)}%`
+        `  平均收益率: ${avgROI >= 0 ? colors.green('+') : colors.red('')}${avgROI.toFixed(2)}%`
     );
-    console.log(`  Average Win Rate: ${colors.yellow(avgWinRate.toFixed(1) + '%')}`);
+    console.log(`  平均胜率: ${colors.yellow(avgWinRate.toFixed(1) + '%')}`);
     console.log(
-        `  Total Simulation Time: ${colors.gray((totalSimulationTime / 1000).toFixed(1) + 's')}`
+        `  总模拟耗时: ${colors.gray((totalSimulationTime / 1000).toFixed(1) + '秒')}`
     );
 
     console.log('\n' + colors.cyan('═'.repeat(100)) + '\n');
 
-    // Show errors if any
     const errors = results.filter((r) => r.error);
     if (errors.length > 0) {
         console.log(
-            colors.yellow(`⚠️  ${errors.length} traders had errors or insufficient data:\n`)
+            colors.yellow(`⚠️  ${errors.length} 位交易员出现错误或数据不足:\n`)
         );
         errors.slice(0, 5).forEach((r) => {
             console.log(
-                `  • ${r.address.slice(0, 10)}... - ${colors.gray(r.error || 'Unknown error')}`
+                `  • ${r.address.slice(0, 10)}... - ${colors.gray(r.error || '未知错误')}`
             );
         });
         if (errors.length > 5) {
-            console.log(colors.gray(`  ... and ${errors.length - 5} more\n`));
+            console.log(colors.gray(`  ... 还有 ${errors.length - 5} 个\n`));
         }
     }
 }
@@ -596,63 +591,58 @@ function saveResults(results: TraderResult[]) {
     };
 
     fs.writeFileSync(filepath, JSON.stringify(data, null, 2), 'utf8');
-    console.log(colors.green(`✓ Results saved to: ${filepath}\n`));
+    console.log(colors.green(`✓ 结果已保存到: ${filepath}\n`));
 }
 
 async function main() {
-    console.log(colors.cyan('\n🔍 POLYMARKET TRADER FINDER\n'));
-    console.log(colors.gray(`Finding and analyzing the most profitable traders...\n`));
+    console.log(colors.cyan('\n🔍 Polymarket 交易员查找器\n'));
+    console.log(colors.gray(`正在查找并分析最盈利的交易员...\n`));
 
     try {
-        // Get trader list
         let traders: string[] = [];
 
-        // Check if custom list provided via env
         if (process.env.TRADER_LIST) {
             traders = process.env.TRADER_LIST.split(',').map((t) => t.trim().toLowerCase());
-            console.log(colors.cyan(`Using custom trader list (${traders.length} traders)\n`));
+            console.log(colors.cyan(`使用自定义交易员列表 (${traders.length} 位)\n`));
         } else {
             traders = await fetchTraderLeaderboard();
         }
 
         if (traders.length === 0) {
-            console.log(colors.red('❌ No traders found to analyze'));
+            console.log(colors.red('❌ 未找到可分析的交易员'));
             return;
         }
 
-        console.log(colors.cyan(`\n🚀 Starting analysis of ${traders.length} traders...\n`));
+        console.log(colors.cyan(`\n🚀 开始分析 ${traders.length} 位交易员...\n`));
 
         const results: TraderResult[] = [];
         for (let i = 0; i < traders.length; i++) {
             const trader = traders[i];
             console.log(
-                colors.gray(`[${i + 1}/${traders.length}] Analyzing ${trader.slice(0, 10)}...`)
+                colors.gray(`[${i + 1}/${traders.length}] 正在分析 ${trader.slice(0, 10)}...`)
             );
 
             const result = await simulateTrader(trader);
             results.push(result);
 
-            // Show quick status
             if (!result.error && result.copiedTrades > 0) {
                 const roiColor = result.roi >= 0 ? colors.green : colors.red;
                 console.log(
-                    `   ${roiColor(result.roi >= 0 ? '✓' : '✗')} ROI: ${result.roi.toFixed(2)}% | Trades: ${result.copiedTrades} | Time: ${(result.simulationTime / 1000).toFixed(1)}s`
+                    `   ${roiColor(result.roi >= 0 ? '✓' : '✗')} 收益率: ${result.roi.toFixed(2)}% | 跟单次数: ${result.copiedTrades} | 耗时: ${(result.simulationTime / 1000).toFixed(1)}秒`
                 );
             } else {
-                console.log(`   ${colors.yellow('⚠')} ${result.error || 'No trades copied'}`);
+                console.log(`   ${colors.yellow('⚠')} ${result.error || '无跟单'}`);
             }
 
-            // Small delay to avoid rate limiting
             await new Promise((resolve) => setTimeout(resolve, 500));
         }
 
-        // Print and save results
         printResults(results);
         saveResults(results);
 
-        console.log(colors.green('✅ Analysis complete!\n'));
+        console.log(colors.green('✅ 分析完成！\n'));
     } catch (error) {
-        console.error(colors.red('\n✗ Analysis failed:'), error);
+        console.error(colors.red('\n✗ 分析失败:'), error);
         process.exit(1);
     }
 }

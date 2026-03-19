@@ -19,7 +19,7 @@ const isGnosisSafe = async (address: string): Promise<boolean> => {
         // If code is not "0x", then it's a contract (likely Gnosis Safe)
         return code !== '0x';
     } catch (error) {
-        Logger.error(`Error checking wallet type: ${error}`);
+        Logger.error(`检查钱包类型时出错: ${error}`);
         return false;
     }
 };
@@ -33,7 +33,7 @@ const createClobClient = async (): Promise<ClobClient> => {
     // This is required for proper signature validation
     const signatureType = SignatureType.POLY_PROXY;
 
-    Logger.info(`Creating CLOB client with signature type: POLY_PROXY`);
+    Logger.info(`正在创建 CLOB 客户端，签名类型: POLY_PROXY`);
 
     let clobClient = new ClobClient(
         host,
@@ -52,7 +52,7 @@ const createClobClient = async (): Promise<ClobClient> => {
 
     let creds = await clobClient.createApiKey();
     if (!creds.key) {
-        Logger.warning('Failed to create API key, trying to derive...');
+        Logger.warning('创建 API 密钥失败，正在尝试派生...');
         creds = await clobClient.deriveApiKey();
     }
 
@@ -60,7 +60,7 @@ const createClobClient = async (): Promise<ClobClient> => {
         throw new Error('Failed to obtain Polymarket API credentials. Please check your private key and try again.');
     }
 
-    Logger.info('API credentials obtained successfully');
+    Logger.info('API 凭证获取成功');
 
     clobClient = new ClobClient(
         host,

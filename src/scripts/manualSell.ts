@@ -32,7 +32,7 @@ const isGnosisSafe = async (
         const code = await provider.getCode(address);
         return code !== '0x';
     } catch (error) {
-        console.error(`Error checking wallet type: ${error}`);
+        console.error(`检查钱包类型时出错: ${error}`);
         return false;
     }
 };
@@ -44,7 +44,7 @@ const createClobClient = async (
     const isProxySafe = await isGnosisSafe(PROXY_WALLET, provider);
     const signatureType = isProxySafe ? SignatureType.POLY_GNOSIS_SAFE : SignatureType.EOA;
 
-    console.log(`Wallet type: ${isProxySafe ? 'Gnosis Safe' : 'EOA'}`);
+    console.log(`钱包类型: ${isProxySafe ? 'Gnosis Safe 多签钱包' : 'EOA 普通钱包'}`);
 
     const originalConsoleLog = console.log;
     const originalConsoleError = console.error;
@@ -84,7 +84,7 @@ const fetchPositions = async (): Promise<Position[]> => {
     const url = `https://data-api.polymarket.com/positions?user=${PROXY_WALLET}`;
     const response = await fetch(url);
     if (!response.ok) {
-        throw new Error(`Failed to fetch positions: ${response.statusText}`);
+        throw new Error(`获取持仓失败: ${response.statusText}`);
     }
     return response.json();
 };
@@ -95,16 +95,16 @@ const findMatchingPosition = (positions: Position[], searchQuery: string): Posit
 
 const updatePolymarketCache = async (clobClient: ClobClient, tokenId: string) => {
     try {
-        console.log('🔄 Updating Polymarket balance cache for token...');
+        console.log('🔄 正在更新 Polymarket 余额缓存...');
         const updateParams = {
             asset_type: AssetType.CONDITIONAL,
             token_id: tokenId,
         };
 
         await clobClient.updateBalanceAllowance(updateParams);
-        console.log('✅ Cache updated successfully\n');
+        console.log('✅ 缓存更新成功\n');
     } catch (error) {
-        console.log('⚠️  Warning: Could not update cache:', error);
+        console.log('⚠️  警告: 无法更新缓存:', error);
     }
 };
 
@@ -113,10 +113,10 @@ const sellPosition = async (clobClient: ClobClient, position: Position, sellSize
     let retry = 0;
 
     console.log(
-        `\n🔄 Starting to sell ${sellSize.toFixed(2)} tokens (${(SELL_PERCENTAGE * 100).toFixed(0)}% of position)`
+        `\n🔄 开始出售 ${sellSize.toFixed(2)} 个代币 (占仓位的 ${(SELL_PERCENTAGE * 100).toFixed(0)}%)`
     );
-    console.log(`Token ID: ${position.asset}`);
-    console.log(`Market: ${position.title} - ${position.outcome}\n`);
+    console.log(`代币 ID: ${position.asset}`);
+    console.log(`市场: ${position.title} - ${position.outcome}\n`);
 
     // Update Polymarket cache before selling
     await updatePolymarketCache(clobClient, position.asset);
@@ -127,7 +127,7 @@ const sellPosition = async (clobClient: ClobClient, position: Position, sellSize
             const orderBook = await clobClient.getOrderBook(position.asset);
 
             if (!orderBook.bids || orderBook.bids.length === 0) {
-                console.log('❌ No bids available in order book');
+                console.log('❌ 订单簿中无买方报价');
                 break;
             }
 
@@ -136,7 +136,7 @@ const sellPosition = async (clobClient: ClobClient, position: Position, sellSize
                 return parseFloat(bid.price) > parseFloat(max.price) ? bid : max;
             }, orderBook.bids[0]);
 
-            console.log(`📊 Best bid: ${maxPriceBid.size} tokens @ $${maxPriceBid.price}`);
+            console.log(`📊 最优买价: ${maxPriceBid.size} 个代币 @ $${maxPriceBid.price}`);
 
             // Determine order size
             let orderAmount: number;
@@ -154,7 +154,7 @@ const sellPosition = async (clobClient: ClobClient, position: Position, sellSize
                 price: parseFloat(maxPriceBid.price),
             };
 
-            console.log(`📤 Selling ${orderAmount.toFixed(2)} tokens at $${orderArgs.price}...`);
+            console.log(`📤 正在出售 ${orderAmount.toFixed(2)} 个代币 @ $${orderArgs.price}...`);
 
             const signedOrder = await clobClient.createMarketOrder(orderArgs);
             const resp = await clobClient.postOrder(signedOrder, OrderType.FOK);
@@ -163,40 +163,40 @@ const sellPosition = async (clobClient: ClobClient, position: Position, sellSize
                 retry = 0;
                 const soldValue = (orderAmount * orderArgs.price).toFixed(2);
                 console.log(
-                    `✅ SUCCESS: Sold ${orderAmount.toFixed(2)} tokens at $${orderArgs.price} (Total: $${soldValue})`
+                    `✅ 成功: 以 $${orderArgs.price} 出售 ${orderAmount.toFixed(2)} 个代币 (总计: $${soldValue})`
                 );
                 remaining -= orderAmount;
 
                 if (remaining > 0) {
-                    console.log(`⏳ Remaining to sell: ${remaining.toFixed(2)} tokens\n`);
+                    console.log(`⏳ 剩余待出售: ${remaining.toFixed(2)} 个代币\n`);
                 }
             } else {
                 retry += 1;
                 const errorMsg = extractOrderError(resp);
                 console.log(
-                    `⚠️  Order failed (attempt ${retry}/${RETRY_LIMIT})${errorMsg ? `: ${errorMsg}` : ''}`
+                    `⚠️  订单失败 (第 ${retry}/${RETRY_LIMIT} 次)${errorMsg ? `: ${errorMsg}` : ''}`
                 );
 
                 if (retry < RETRY_LIMIT) {
-                    console.log('🔄 Retrying...\n');
+                    console.log('🔄 重试中...\n');
                     await new Promise((resolve) => setTimeout(resolve, 1000));
                 }
             }
         } catch (error) {
             retry += 1;
-            console.error(`❌ Error during sell attempt ${retry}/${RETRY_LIMIT}:`, error);
+            console.error(`❌ 出售第 ${retry}/${RETRY_LIMIT} 次时出错:`, error);
 
             if (retry < RETRY_LIMIT) {
-                console.log('🔄 Retrying...\n');
+                console.log('🔄 重试中...\n');
                 await new Promise((resolve) => setTimeout(resolve, 1000));
             }
         }
     }
 
     if (remaining > 0) {
-        console.log(`\n⚠️  Could not sell all tokens. Remaining: ${remaining.toFixed(2)} tokens`);
+        console.log(`\n⚠️  无法出售全部代币。剩余: ${remaining.toFixed(2)} 个代币`);
     } else {
-        console.log(`\n🎉 Successfully sold ${sellSize.toFixed(2)} tokens!`);
+        console.log(`\n🎉 成功出售 ${sellSize.toFixed(2)} 个代币！`);
     }
 };
 
@@ -240,62 +240,62 @@ const extractOrderError = (response: unknown): string | undefined => {
 };
 
 async function main() {
-    console.log('🚀 Manual Sell Script');
+    console.log('🚀 手动出售脚本');
     console.log('═══════════════════════════════════════════════\n');
-    console.log(`📍 Wallet: ${PROXY_WALLET}`);
-    console.log(`🔍 Searching for: "${MARKET_SEARCH_QUERY}"`);
-    console.log(`📊 Sell percentage: ${(SELL_PERCENTAGE * 100).toFixed(0)}%\n`);
+    console.log(`📍 钱包: ${PROXY_WALLET}`);
+    console.log(`🔍 搜索市场: "${MARKET_SEARCH_QUERY}"`);
+    console.log(`📊 出售比例: ${(SELL_PERCENTAGE * 100).toFixed(0)}%\n`);
 
     try {
         // Create provider and client
         const provider = new ethers.providers.JsonRpcProvider(RPC_URL);
         const clobClient = await createClobClient(provider);
 
-        console.log('✅ Connected to Polymarket\n');
+        console.log('✅ 已连接到 Polymarket\n');
 
         // Get all positions
-        console.log('📥 Fetching positions...');
+        console.log('📥 正在获取持仓...');
         const positions = await fetchPositions();
-        console.log(`Found ${positions.length} position(s)\n`);
+        console.log(`找到 ${positions.length} 个持仓\n`);
 
         // Find matching position
         const position = findMatchingPosition(positions, MARKET_SEARCH_QUERY);
 
         if (!position) {
-            console.log(`❌ Position "${MARKET_SEARCH_QUERY}" not found!`);
-            console.log('\nAvailable positions:');
+            console.log(`❌ 未找到仓位 "${MARKET_SEARCH_QUERY}"！`);
+            console.log('\n可用的持仓:');
             positions.forEach((pos, idx) => {
                 console.log(
-                    `${idx + 1}. ${pos.title} - ${pos.outcome} (${pos.size.toFixed(2)} tokens)`
+                    `${idx + 1}. ${pos.title} - ${pos.outcome} (${pos.size.toFixed(2)} 个代币)`
                 );
             });
             process.exit(1);
         }
 
-        console.log('✅ Position found!');
-        console.log(`📌 Market: ${position.title}`);
-        console.log(`📌 Outcome: ${position.outcome}`);
-        console.log(`📌 Position size: ${position.size.toFixed(2)} tokens`);
-        console.log(`📌 Average price: $${position.avgPrice.toFixed(4)}`);
-        console.log(`📌 Current value: $${position.currentValue.toFixed(2)}`);
+        console.log('✅ 已找到仓位！');
+        console.log(`📌 市场: ${position.title}`);
+        console.log(`📌 结果: ${position.outcome}`);
+        console.log(`📌 持仓数量: ${position.size.toFixed(2)} 个代币`);
+        console.log(`📌 平均价格: $${position.avgPrice.toFixed(4)}`);
+        console.log(`📌 当前价值: $${position.currentValue.toFixed(2)}`);
 
         // Calculate sell size
         const sellSize = position.size * SELL_PERCENTAGE;
 
         if (sellSize < 1.0) {
             console.log(
-                `\n❌ Sell size (${sellSize.toFixed(2)} tokens) is below minimum (1.0 token)`
+                `\n❌ 出售数量 (${sellSize.toFixed(2)} 个代币) 低于最低限制 (1.0 个代币)`
             );
-            console.log('Please increase your position or adjust SELL_PERCENTAGE');
+            console.log('请增加持仓或调整 SELL_PERCENTAGE');
             process.exit(1);
         }
 
         // Sell position
         await sellPosition(clobClient, position, sellSize);
 
-        console.log('\n✅ Script completed!');
+        console.log('\n✅ 脚本执行完成！');
     } catch (error) {
-        console.error('\n❌ Fatal error:', error);
+        console.error('\n❌ 致命错误:', error);
         process.exit(1);
     }
 }
@@ -303,6 +303,6 @@ async function main() {
 main()
     .then(() => process.exit(0))
     .catch((error) => {
-        console.error('❌ Unhandled error:', error);
+        console.error('\n❌ 未处理的错误:', error);
         process.exit(1);
     });

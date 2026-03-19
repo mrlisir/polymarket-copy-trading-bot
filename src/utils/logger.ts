@@ -7,7 +7,7 @@ class Logger {
     private static currentLogFile = '';
 
     private static getLogFileName(): string {
-        const date = new Date().toISOString().split('T')[0]; // YYYY-MM-DD
+        const date = new Date().toISOString().split('T')[0];
         return path.join(this.logsDir, `bot-${date}.log`);
     }
 
@@ -24,13 +24,12 @@ class Logger {
             const timestamp = new Date().toISOString();
             const logEntry = `[${timestamp}] ${message}\n`;
             fs.appendFileSync(logFile, logEntry, 'utf8');
-        } catch (error) {
+        } catch {
             // Silently fail to avoid infinite loops
         }
     }
 
     private static stripAnsi(str: string): string {
-        // Remove ANSI color codes for file logging
         return str.replace(/\u001b\[\d+m/g, '');
     }
 
@@ -39,7 +38,6 @@ class Logger {
     }
 
     private static maskAddress(address: string): string {
-        // Show 0x and first 4 chars, mask middle, show last 4 chars
         return `${address.slice(0, 6)}${'*'.repeat(34)}${address.slice(-4)}`;
     }
 
@@ -72,35 +70,34 @@ class Logger {
 
     static trade(traderAddress: string, action: string, details: any) {
         console.log('\n' + chalk.magenta('─'.repeat(70)));
-        console.log(chalk.magenta.bold('📊 NEW TRADE DETECTED'));
-        console.log(chalk.gray(`Trader: ${this.formatAddress(traderAddress)}`));
-        console.log(chalk.gray(`Action: ${chalk.white.bold(action)}`));
+        console.log(chalk.magenta.bold('📊 检测到新交易'));
+        console.log(chalk.gray(`交易员: ${this.formatAddress(traderAddress)}`));
+        console.log(chalk.gray(`操作: ${chalk.white.bold(action)}`));
         if (details.asset) {
-            console.log(chalk.gray(`Asset:  ${this.formatAddress(details.asset)}`));
+            console.log(chalk.gray(`资产:  ${this.formatAddress(details.asset)}`));
         }
         if (details.side) {
             const sideColor = details.side === 'BUY' ? chalk.green : chalk.red;
-            console.log(chalk.gray(`Side:   ${sideColor.bold(details.side)}`));
+            const sideText = details.side === 'BUY' ? '买入 (BUY)' : '卖出 (SELL)';
+            console.log(chalk.gray(`方向:   ${sideColor.bold(sideText)}`));
         }
         if (details.amount) {
-            console.log(chalk.gray(`Amount: ${chalk.yellow(`$${details.amount}`)}`));
+            console.log(chalk.gray(`金额: ${chalk.yellow(`$${details.amount}`)}`));
         }
         if (details.price) {
-            console.log(chalk.gray(`Price:  ${chalk.cyan(details.price)}`));
+            console.log(chalk.gray(`价格:  ${chalk.cyan(details.price)}`));
         }
         if (details.eventSlug || details.slug) {
-            // Use eventSlug for the correct market URL format
             const slug = details.eventSlug || details.slug;
             const marketUrl = `https://polymarket.com/event/${slug}`;
-            console.log(chalk.gray(`Market: ${chalk.blue.underline(marketUrl)}`));
+            console.log(chalk.gray(`市场: ${chalk.blue.underline(marketUrl)}`));
         }
         if (details.transactionHash) {
             const txUrl = `https://polygonscan.com/tx/${details.transactionHash}`;
-            console.log(chalk.gray(`TX:     ${chalk.blue.underline(txUrl)}`));
+            console.log(chalk.gray(`交易: ${chalk.blue.underline(txUrl)}`));
         }
         console.log(chalk.magenta('─'.repeat(70)) + '\n');
 
-        // Log to file
         let tradeLog = `TRADE: ${this.formatAddress(traderAddress)} - ${action}`;
         if (details.side) tradeLog += ` | Side: ${details.side}`;
         if (details.amount) tradeLog += ` | Amount: $${details.amount}`;
@@ -111,23 +108,23 @@ class Logger {
     }
 
     static balance(myBalance: number, traderBalance: number, traderAddress: string) {
-        console.log(chalk.gray('Capital (USDC + Positions):'));
+        console.log(chalk.gray('💰 资金状况 (USDC + 仓位):'));
         console.log(
-            chalk.gray(`  Your total capital:   ${chalk.green.bold(`$${myBalance.toFixed(2)}`)}`)
+            chalk.gray(`  您的总资金:     ${chalk.green.bold(`$${myBalance.toFixed(2)}`)}`)
         );
         console.log(
             chalk.gray(
-                `  Trader total capital: ${chalk.blue.bold(`$${traderBalance.toFixed(2)}`)} (${this.formatAddress(traderAddress)})`
+                `  交易员总资金: ${chalk.blue.bold(`$${traderBalance.toFixed(2)}`)} (${this.formatAddress(traderAddress)})`
             )
         );
     }
 
     static orderResult(success: boolean, message: string) {
         if (success) {
-            console.log(chalk.green('✓'), chalk.green.bold('Order executed:'), message);
+            console.log(chalk.green('✓'), chalk.green.bold('订单执行成功:'), message);
             this.writeToFile(`ORDER SUCCESS: ${message}`);
         } else {
-            console.log(chalk.red('✗'), chalk.red.bold('Order failed:'), message);
+            console.log(chalk.red('✗'), chalk.red.bold('订单执行失败:'), message);
             this.writeToFile(`ORDER FAILED: ${message}`);
         }
     }
@@ -136,35 +133,34 @@ class Logger {
         const timestamp = new Date().toLocaleTimeString();
         console.log(
             chalk.dim(`[${timestamp}]`),
-            chalk.cyan('👁️  Monitoring'),
-            chalk.yellow(`${traderCount} trader(s)`)
+            chalk.cyan('👁️  监控中'),
+            chalk.yellow(`${traderCount} 个交易员`)
         );
     }
 
     static startup(traders: string[], myWallet: string) {
         console.log('\n');
-        // ASCII Art Logo with gradient colors
         console.log(chalk.cyan('  ____       _        ____                 '));
         console.log(chalk.cyan(' |  _ \\ ___ | |_   _ / ___|___  _ __  _   _ '));
         console.log(chalk.cyan.bold(" | |_) / _ \\| | | | | |   / _ \\| '_ \\| | | |"));
         console.log(chalk.magenta.bold(' |  __/ (_) | | |_| | |__| (_) | |_) | |_| |'));
-        console.log(chalk.magenta(' |_|   \\___/|_|\\__, |\\____\\___/| .__/ \\__, |'));
+        console.log(chalk.magenta(' |_|   \\___/|_|\\__, |\\____\\___/| .__/  \\__, |'));
         console.log(chalk.magenta('               |___/            |_|    |___/ '));
-        console.log(chalk.gray('               Copy the best, automate success\n'));
+        console.log(chalk.gray('               复制高手，自动化交易，躺赢成功\n'));
 
         console.log(chalk.cyan('━'.repeat(70)));
-        console.log(chalk.cyan('📊 Tracking Traders:'));
+        console.log(chalk.cyan('📊 正在跟踪的交易员:'));
         traders.forEach((address, index) => {
             console.log(chalk.gray(`   ${index + 1}. ${address}`));
         });
-        console.log(chalk.cyan(`\n💼 Your Wallet:`));
+        console.log(chalk.cyan(`\n💼 您的钱包:`));
         console.log(chalk.gray(`   ${this.maskAddress(myWallet)}\n`));
     }
 
     static dbConnection(traders: string[], counts: number[]) {
-        console.log('\n' + chalk.cyan('📦 Database Status:'));
+        console.log('\n' + chalk.cyan('📦 数据库状态:'));
         traders.forEach((address, index) => {
-            const countStr = chalk.yellow(`${counts[index]} trades`);
+            const countStr = chalk.yellow(`${counts[index]} 条交易记录`);
             console.log(chalk.gray(`   ${this.formatAddress(address)}: ${countStr}`));
         });
         console.log('');
@@ -183,8 +179,8 @@ class Logger {
         this.spinnerIndex++;
 
         const message = extraInfo
-            ? `${spinner} Waiting for trades from ${traderCount} trader(s)... (${extraInfo})`
-            : `${spinner} Waiting for trades from ${traderCount} trader(s)...`;
+            ? `${spinner} 等待交易员(${traderCount}位)的新交易... (${extraInfo})`
+            : `${spinner} 等待交易员(${traderCount}位)的新交易...`;
 
         process.stdout.write(chalk.dim(`\r[${timestamp}] `) + chalk.cyan(message) + '  ');
     }
@@ -202,22 +198,21 @@ class Logger {
         initialValue: number,
         currentBalance: number
     ) {
-        console.log('\n' + chalk.magenta.bold('💼 YOUR POSITIONS'));
-        console.log(chalk.gray(`   Wallet: ${this.formatAddress(wallet)}`));
+        console.log('\n' + chalk.magenta.bold('💼 您的仓位'));
+        console.log(chalk.gray(`   钱包: ${this.formatAddress(wallet)}`));
         console.log('');
 
-        // Show balance and portfolio overview
         const balanceStr = chalk.yellow.bold(`$${currentBalance.toFixed(2)}`);
         const totalPortfolio = currentBalance + totalValue;
         const portfolioStr = chalk.cyan.bold(`$${totalPortfolio.toFixed(2)}`);
 
-        console.log(chalk.gray(`   💰 Available Cash:    ${balanceStr}`));
-        console.log(chalk.gray(`   📊 Total Portfolio:   ${portfolioStr}`));
+        console.log(chalk.gray(`   💰 可用现金:      ${balanceStr}`));
+        console.log(chalk.gray(`   📊 总资产:        ${portfolioStr}`));
 
         if (count === 0) {
-            console.log(chalk.gray(`\n   No open positions`));
+            console.log(chalk.gray(`\n   暂无持仓`));
         } else {
-            const countStr = chalk.green(`${count} position${count > 1 ? 's' : ''}`);
+            const countStr = chalk.green(`${count} 个仓位`);
             const pnlColor = overallPnl >= 0 ? chalk.green : chalk.red;
             const pnlSign = overallPnl >= 0 ? '+' : '';
             const profitStr = pnlColor.bold(`${pnlSign}${overallPnl.toFixed(1)}%`);
@@ -225,14 +220,13 @@ class Logger {
             const initialStr = chalk.gray(`$${initialValue.toFixed(2)}`);
 
             console.log('');
-            console.log(chalk.gray(`   📈 Open Positions:    ${countStr}`));
-            console.log(chalk.gray(`      Invested:          ${initialStr}`));
-            console.log(chalk.gray(`      Current Value:     ${valueStr}`));
-            console.log(chalk.gray(`      Profit/Loss:       ${profitStr}`));
+            console.log(chalk.gray(`   📈 持仓中仓位:   ${countStr}`));
+            console.log(chalk.gray(`      投入金额:       ${initialStr}`));
+            console.log(chalk.gray(`      当前价值:       ${valueStr}`));
+            console.log(chalk.gray(`      盈亏:           ${profitStr}`));
 
-            // Show top positions
             if (topPositions.length > 0) {
-                console.log(chalk.gray(`\n   🔝 Top Positions:`));
+                console.log(chalk.gray(`\n   🔝 重点仓位:`));
                 topPositions.forEach((pos: any) => {
                     const pnlColor = pos.percentPnl >= 0 ? chalk.green : chalk.red;
                     const pnlSign = pos.percentPnl >= 0 ? '+' : '';
@@ -245,12 +239,12 @@ class Logger {
                     );
                     console.log(
                         chalk.gray(
-                            `        Value: ${chalk.cyan(`$${pos.currentValue.toFixed(2)}`)} | PnL: ${pnlColor(`${pnlSign}${pos.percentPnl.toFixed(1)}%`)}`
+                            `        价值: ${chalk.cyan(`$${pos.currentValue.toFixed(2)}`)} | 盈亏: ${pnlColor(`${pnlSign}${pos.percentPnl.toFixed(1)}%`)}`
                         )
                     );
                     console.log(
                         chalk.gray(
-                            `        Bought @ ${chalk.yellow(`${(avgPrice * 100).toFixed(1)}¢`)} | Current @ ${chalk.yellow(`${(curPrice * 100).toFixed(1)}¢`)}`
+                            `        买入价: ${chalk.yellow(`${(avgPrice * 100).toFixed(1)}¢`)} | 当前价: ${chalk.yellow(`${(curPrice * 100).toFixed(1)}¢`)}`
                         )
                     );
                 });
@@ -265,15 +259,14 @@ class Logger {
         positionDetails?: any[][],
         profitabilities?: number[]
     ) {
-        console.log('\n' + chalk.cyan("📈 TRADERS YOU'RE COPYING"));
+        console.log('\n' + chalk.cyan('📈 正在跟单的交易员'));
         traders.forEach((address, index) => {
             const count = positionCounts[index];
             const countStr =
                 count > 0
-                    ? chalk.green(`${count} position${count > 1 ? 's' : ''}`)
-                    : chalk.gray('0 positions');
+                    ? chalk.green(`${count} 个仓位`)
+                    : chalk.gray('0 个仓位');
 
-            // Add profitability if available
             let profitStr = '';
             if (profitabilities && profitabilities[index] !== undefined && count > 0) {
                 const pnl = profitabilities[index];
@@ -284,7 +277,6 @@ class Logger {
 
             console.log(chalk.gray(`   ${this.formatAddress(address)}: ${countStr}${profitStr}`));
 
-            // Show position details if available
             if (positionDetails && positionDetails[index] && positionDetails[index].length > 0) {
                 positionDetails[index].forEach((pos: any) => {
                     const pnlColor = pos.percentPnl >= 0 ? chalk.green : chalk.red;
@@ -298,12 +290,12 @@ class Logger {
                     );
                     console.log(
                         chalk.gray(
-                            `        Value: ${chalk.cyan(`$${pos.currentValue.toFixed(2)}`)} | PnL: ${pnlColor(`${pnlSign}${pos.percentPnl.toFixed(1)}%`)}`
+                            `        价值: ${chalk.cyan(`$${pos.currentValue.toFixed(2)}`)} | 盈亏: ${pnlColor(`${pnlSign}${pos.percentPnl.toFixed(1)}%`)}`
                         )
                     );
                     console.log(
                         chalk.gray(
-                            `        Bought @ ${chalk.yellow(`${(avgPrice * 100).toFixed(1)}¢`)} | Current @ ${chalk.yellow(`${(curPrice * 100).toFixed(1)}¢`)}`
+                            `        买入价: ${chalk.yellow(`${(avgPrice * 100).toFixed(1)}¢`)} | 当前价: ${chalk.yellow(`${(curPrice * 100).toFixed(1)}¢`)}`
                         )
                     );
                 });

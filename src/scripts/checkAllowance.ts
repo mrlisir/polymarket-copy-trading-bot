@@ -113,18 +113,18 @@ const syncPolymarketAllowanceCache = async (
 
         const updateResult: any = await clobClient.updateBalanceAllowance(updateParams);
         if (updateResult && typeof updateResult === 'object' && 'error' in updateResult) {
-            console.log(`⚠️  Polymarket cache update failed: ${updateResult.error}`);
+            console.log('⚠️  Polymarket 缓存更新失败: ' + updateResult.error);
             return;
         }
         if (updateResult === '' || updateResult === null || updateResult === undefined) {
-            console.log('ℹ  Polymarket cache update acknowledged (empty response).');
+            console.log('ℹ  Polymarket 缓存更新已确认 (空响应)');
         } else if (typeof updateResult !== 'object') {
             console.log(
                 '⚠️  Polymarket cache update returned an unexpected response:',
                 JSON.stringify(updateResult)
             );
         } else {
-            console.log('ℹ  Polymarket cache update response:', JSON.stringify(updateResult));
+            console.log('ℹ  Polymarket 缓存更新响应:', JSON.stringify(updateResult));
         }
 
         const balanceResponse: any = await clobClient.getBalanceAllowance(updateParams);
@@ -171,15 +171,15 @@ const syncPolymarketAllowanceCache = async (
 
         const syncedBalance = formatClobAmount(balance, decimals);
         const syncedAllowance = formatClobAmount(allowanceValue, decimals);
-        console.log(`💾 Polymarket Recorded Balance: ${syncedBalance} USDC`);
-        console.log(`💾 Polymarket Recorded Allowance: ${syncedAllowance} USDC\n`);
+        console.log(`💾 Polymarket 记录余额: ${syncedBalance} USDC`);
+        console.log(`💾 Polymarket 记录授权额度: ${syncedAllowance} USDC\n`);
     } catch (syncError: any) {
-        console.log(`⚠️  Unable to sync Polymarket cache: ${syncError?.message || syncError}`);
+        console.log(`⚠️  无法同步 Polymarket 缓存: ${syncError?.message || syncError}`);
     }
 };
 
 async function checkAndSetAllowance() {
-    console.log('🔍 Checking USDC balance and allowance...\n');
+    console.log('🔍 正在检查 USDC 余额和授权额度...\n');
 
     // Connect to Polygon
     const provider = new ethers.providers.JsonRpcProvider(RPC_URL);
@@ -191,7 +191,7 @@ async function checkAndSetAllowance() {
     try {
         // Get USDC decimals
         const decimals = await usdcContract.decimals();
-        console.log(`💵 USDC Decimals: ${decimals}`);
+        console.log(`💵 USDC 精度位数: ${decimals}`);
 
         const usesPolymarketCollateral =
             USDC_CONTRACT_ADDRESS.toLowerCase() === POLYMARKET_COLLATERAL_LOWER;
@@ -208,7 +208,7 @@ async function checkAndSetAllowance() {
         console.log(
             `✅ Current Allowance (${USDC_CONTRACT_ADDRESS}): ${localAllowanceFormatted} USDC`
         );
-        console.log(`📍 Polymarket Exchange: ${POLYMARKET_EXCHANGE}\n`);
+        console.log(`📍 Polymarket 交易所: ${POLYMARKET_EXCHANGE}\n`);
 
         if (USDC_CONTRACT_ADDRESS.toLowerCase() !== NATIVE_USDC_LOWER) {
             try {
@@ -217,14 +217,14 @@ async function checkAndSetAllowance() {
                 const nativeBalance = await nativeContract.balanceOf(PROXY_WALLET);
                 if (!nativeBalance.isZero()) {
                     const nativeFormatted = ethers.utils.formatUnits(nativeBalance, nativeDecimals);
-                    console.log('ℹ️  Detected native USDC (Polygon PoS) balance:');
+                    console.log('ℹ️  检测到原生 USDC (Polygon PoS) 余额:');
                     console.log(`    ${nativeFormatted} tokens at ${NATIVE_USDC_ADDRESS}`);
-                    console.log(
-                        '    Polymarket does not recognize this token. Swap to USDC.e (0x2791...) to trade.\n'
-                    );
+                console.log(
+                    '    Polymarket 不识别此代币，请兑换为 USDC.e (0x2791...) 后交易。\n'
+                );
                 }
             } catch (nativeError) {
-                console.log(`⚠️  Unable to check native USDC balance: ${nativeError}`);
+                console.log(`⚠️  无法检查原生 USDC 余额: ${nativeError}`);
             }
         }
 
@@ -251,45 +251,42 @@ async function checkAndSetAllowance() {
                 polymarketAllowance,
                 polymarketDecimals
             );
-            console.log('⚠️  Polymarket collateral token is USDC.e (bridged) at address');
+            console.log('⚠️  Polymarket 抵押品代币是 USDC.e (跨链桥接的)，地址如下');
             console.log(`    ${POLYMARKET_COLLATERAL}`);
-            console.log(`⚠️  Polymarket-tracked USDC balance: ${polymarketBalanceFormatted} USDC`);
-            console.log(`⚠️  Polymarket-tracked allowance: ${polymarketAllowanceFormatted} USDC\n`);
+            console.log(`⚠️  Polymarket 记录的 USDC 余额: ${polymarketBalanceFormatted} USDC`);
+            console.log(`⚠️  Polymarket 记录的授权额度: ${polymarketAllowanceFormatted} USDC\n`);
             console.log(
-                '👉  Swap native USDC to USDC.e or update your .env to point at the collateral token before trading.\n'
+                '👉  请将原生 USDC 兑换为 USDC.e 或更新 .env 文件指向抵押品代币后再交易。\n'
             );
         }
 
         if (polymarketAllowance.lt(polymarketBalance) || polymarketAllowance.isZero()) {
-            console.log('⚠️  Allowance is insufficient or zero!');
-            console.log('📝 Setting unlimited allowance for Polymarket...\n');
+            console.log('⚠️  授权额度不足或为零！');
+            console.log('📝 正在为 Polymarket 设置无限授权额度...\n');
 
-            // Approve unlimited amount (max uint256)
             const maxAllowance = ethers.constants.MaxUint256;
 
-            // Get current gas price and add 50% buffer
             const feeData = await provider.getFeeData();
             const gasPrice = feeData.gasPrice
                 ? feeData.gasPrice.mul(150).div(100)
                 : ethers.utils.parseUnits('50', 'gwei');
 
-            console.log(`⛽ Gas Price: ${ethers.utils.formatUnits(gasPrice, 'gwei')} Gwei`);
+            console.log(`⛽ Gas 价格: ${ethers.utils.formatUnits(gasPrice, 'gwei')} Gwei`);
 
             const approveTx = await polymarketContract.approve(POLYMARKET_EXCHANGE, maxAllowance, {
                 gasPrice: gasPrice,
                 gasLimit: 100000,
             });
 
-            console.log(`⏳ Transaction sent: ${approveTx.hash}`);
-            console.log('⏳ Waiting for confirmation...\n');
+            console.log(`⏳ 交易已发送: ${approveTx.hash}`);
+            console.log('⏳ 等待确认...\n');
 
             const receipt = await approveTx.wait();
 
             if (receipt.status === 1) {
-                console.log('✅ Allowance set successfully!');
-                console.log(`🔗 Transaction: https://polygonscan.com/tx/${approveTx.hash}\n`);
+                console.log('✅ 授权额度设置成功！');
+                console.log(`🔗 交易链接: https://polygonscan.com/tx/${approveTx.hash}\n`);
 
-                // Verify new allowance
                 const newAllowance = await polymarketContract.allowance(
                     PROXY_WALLET,
                     POLYMARKET_EXCHANGE
@@ -298,29 +295,29 @@ async function checkAndSetAllowance() {
                     newAllowance,
                     polymarketDecimals
                 );
-                console.log(`✅ New Allowance: ${newAllowanceFormatted} USDC`);
+                console.log(`✅ 新授权额度: ${newAllowanceFormatted} USDC`);
             } else {
-                console.log('❌ Transaction failed!');
+                console.log('❌ 交易失败！');
             }
         } else {
-            console.log('✅ Allowance is already sufficient! No action needed.');
+            console.log('✅ 授权额度已充足！无需操作。');
         }
 
         await syncPolymarketAllowanceCache(polymarketDecimals, provider);
     } catch (error: any) {
-        console.error('❌ Error:', error.message);
+        console.error('❌ 错误:', error.message);
         if (error.code === 'INSUFFICIENT_FUNDS') {
-            console.log('\n⚠️  You need MATIC for gas fees on Polygon!');
+            console.log('\n⚠️  您需要 MATIC 来支付 Polygon 上的 Gas 费！');
         }
     }
 }
 
 checkAndSetAllowance()
     .then(() => {
-        console.log('\n✅ Done!');
+        console.log('\n✅ 完成！');
         process.exit(0);
     })
     .catch((error) => {
-        console.error('❌ Fatal error:', error);
+        console.error('❌ 致命错误:', error);
         process.exit(1);
     });

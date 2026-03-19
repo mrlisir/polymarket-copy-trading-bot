@@ -144,7 +144,7 @@ async function fetchTraderActivity(traderAddress: string): Promise<Trade[]> {
             }))
             .sort((a, b) => a.timestamp - b.timestamp);
     } catch (error) {
-        console.error(`Error fetching activity for ${traderAddress}:`, error);
+        console.error(`获取 ${traderAddress} 的活动数据时出错:`, error);
         return [];
     }
 }
@@ -580,13 +580,12 @@ function printResults(results: TraderAnalysis[]) {
         '\n' +
             colors.bold(colors.cyan('═══════════════════════════════════════════════════════════'))
     );
-    console.log(colors.bold(colors.cyan('  🎯 LOW-RISK HIGH-PERFORMANCE TRADERS ANALYSIS')));
+    console.log(colors.bold(colors.cyan('  🎯 低风险高收益交易员分析')));
     console.log(
         colors.bold(colors.cyan('═══════════════════════════════════════════════════════════\n'))
     );
 
-    // Show all results first (for debugging)
-    console.log(colors.cyan('\n📊 All Analyzed Traders:\n'));
+    console.log(colors.cyan('\n📊 所有已分析的交易员:\n'));
     for (const trader of results) {
         if (trader.error) {
             console.log(
@@ -597,13 +596,12 @@ function printResults(results: TraderAnalysis[]) {
         } else {
             console.log(
                 colors.gray(
-                    `${trader.address.slice(0, 10)}...${trader.address.slice(-8)}: ROI=${trader.roi.toFixed(2)}%, Sharpe=${trader.sharpeRatio.toFixed(2)}, MDD=${trader.maxDrawdown.toFixed(2)}%, Risk=${trader.riskScore.toFixed(1)}`
+                    `${trader.address.slice(0, 10)}...${trader.address.slice(-8)}: 收益率=${trader.roi.toFixed(2)}%, 夏普比率=${trader.sharpeRatio.toFixed(2)}, 最大回撤=${trader.maxDrawdown.toFixed(2)}%, 风险=${trader.riskScore.toFixed(1)}`
                 )
             );
         }
     }
 
-    // Filter and sort by risk score
     const filtered = results
         .filter((r) => r.status !== 'bad' && !r.error)
         .filter((r) => r.roi >= MIN_ROI_THRESHOLD)
@@ -612,21 +610,21 @@ function printResults(results: TraderAnalysis[]) {
         .sort((a, b) => a.riskScore - b.riskScore);
 
     if (filtered.length === 0) {
-        console.log(colors.yellow('\n⚠️  No traders found matching the criteria.'));
+        console.log(colors.yellow('\n⚠️  没有找到符合条件的交易员。'));
         console.log(
             colors.gray(
-                `   Criteria: ROI >= ${MIN_ROI_THRESHOLD}%, Sharpe >= ${MIN_SHARPE_THRESHOLD}, MDD <= ${MAX_MDD_THRESHOLD}%`
+                `   筛选条件: 收益率 >= ${MIN_ROI_THRESHOLD}%, 夏普比率 >= ${MIN_SHARPE_THRESHOLD}, 最大回撤 <= ${MAX_MDD_THRESHOLD}%`
             )
         );
         console.log(
             colors.gray(
-                `   Try relaxing thresholds or check if traders have enough trading history.\n`
+                `   请尝试放宽筛选条件或检查交易员是否有足够的交易历史。\n`
             )
         );
         return;
     }
 
-    console.log(colors.green(`✅ Found ${filtered.length} low-risk profitable traders:\n`));
+    console.log(colors.green(`✅ 找到 ${filtered.length} 位低风险盈利交易员:\n`));
 
     for (const trader of filtered.slice(0, 20)) {
         const statusColor =
@@ -639,27 +637,26 @@ function printResults(results: TraderAnalysis[]) {
                     : colors.red;
 
         console.log(colors.bold(`📍 ${trader.address.slice(0, 10)}...${trader.address.slice(-8)}`));
-        console.log(`   Profile: ${trader.profileUrl}`);
-        console.log(`   Status: ${statusColor(trader.status.toUpperCase())}`);
-        console.log(`   Risk Score: ${colors.bold(trader.riskScore.toFixed(1))} (lower is better)`);
+        console.log(`   个人主页: ${trader.profileUrl}`);
+        console.log(`   状态: ${statusColor(trader.status.toUpperCase())}`);
+        console.log(`   风险评分: ${colors.bold(trader.riskScore.toFixed(1))} (越低越好)`);
         console.log(
-            `   ROI: ${trader.roi >= 0 ? colors.green : colors.red}${trader.roi.toFixed(2)}%`
+            `   收益率: ${trader.roi >= 0 ? colors.green : colors.red}${trader.roi.toFixed(2)}%`
         );
         console.log(
-            `   Sharpe Ratio: ${colors.cyan(trader.sharpeRatio.toFixed(2))} ${trader.sharpeRatio >= 2 ? '⭐' : ''}`
+            `   夏普比率: ${colors.cyan(trader.sharpeRatio.toFixed(2))} ${trader.sharpeRatio >= 2 ? '⭐' : ''}`
         );
-        console.log(`   Max Drawdown: ${colors.yellow(trader.maxDrawdown.toFixed(2))}%`);
-        console.log(`   Calmar Ratio: ${colors.blue(trader.calmarRatio.toFixed(2))}`);
-        console.log(`   Win Rate: ${trader.winRate.toFixed(1)}%`);
-        console.log(`   Profit Factor: ${trader.profitFactor.toFixed(2)}`);
-        console.log(`   Volatility: ${trader.volatility.toFixed(2)}%`);
-        console.log(`   Trading Days: ${trader.tradingDays}`);
-        console.log(`   Total Trades: ${trader.totalTrades}`);
-        console.log(`   Last Activity: ${trader.lastActivityDate}`);
+        console.log(`   最大回撤: ${colors.yellow(trader.maxDrawdown.toFixed(2))}%`);
+        console.log(`   卡玛比率: ${colors.blue(trader.calmarRatio.toFixed(2))}`);
+        console.log(`   胜率: ${trader.winRate.toFixed(1)}%`);
+        console.log(`   利润因子: ${trader.profitFactor.toFixed(2)}`);
+        console.log(`   波动率: ${trader.volatility.toFixed(2)}%`);
+        console.log(`   交易天数: ${trader.tradingDays}`);
+        console.log(`   总交易次数: ${trader.totalTrades}`);
+        console.log(`   最近活动: ${trader.lastActivityDate}`);
         console.log('');
     }
 
-    // Save to file
     const outputDir = path.join(process.cwd(), 'trader_analysis');
     if (!fs.existsSync(outputDir)) {
         fs.mkdirSync(outputDir, { recursive: true });
@@ -668,37 +665,35 @@ function printResults(results: TraderAnalysis[]) {
     const filename = `low-risk-traders-${moment().format('YYYY-MM-DD-HHmmss')}.json`;
     const filepath = path.join(outputDir, filename);
     fs.writeFileSync(filepath, JSON.stringify(filtered, null, 2));
-    console.log(colors.green(`\n💾 Results saved to: ${filepath}\n`));
+    console.log(colors.green(`\n💾 结果已保存到: ${filepath}\n`));
 }
 
 /**
  * Main function
  */
 async function main() {
-    console.log(colors.bold(colors.cyan('\n🔍 Finding Low-Risk High-Performance Traders...\n')));
+    console.log(colors.bold(colors.cyan('\n🔍 查找低风险高收益交易员...\n')));
 
-    // Get trader addresses from command line or use default list
     const traderAddresses = process.argv.slice(2);
 
     if (traderAddresses.length === 0) {
-        console.log(colors.yellow('⚠️  No trader addresses provided.'));
-        console.log(colors.gray('   Usage: npm run find-low-risk <address1> <address2> ...'));
-        console.log(colors.gray('   Or set TRADER_ADDRESSES environment variable\n'));
+        console.log(colors.yellow('⚠️  未提供交易员地址。'));
+        console.log(colors.gray('   用法: npm run find-low-risk <地址1> <地址2> ...'));
+        console.log(colors.gray('   或设置 TRADER_ADDRESSES 环境变量\n'));
         process.exit(1);
     }
 
-    console.log(colors.cyan(`📊 Analyzing ${traderAddresses.length} trader(s)...\n`));
+    console.log(colors.cyan(`📊 正在分析 ${traderAddresses.length} 位交易员...\n`));
 
     const results: TraderAnalysis[] = [];
 
     for (let i = 0; i < traderAddresses.length; i++) {
         const address = traderAddresses[i];
-        console.log(colors.gray(`[${i + 1}/${traderAddresses.length}] Analyzing ${address}...`));
+        console.log(colors.gray(`[${i + 1}/${traderAddresses.length}] 正在分析 ${address}...`));
 
         const analysis = await analyzeTrader(address);
         results.push(analysis);
 
-        // Small delay to avoid rate limiting
         await new Promise((resolve) => setTimeout(resolve, 1000));
     }
 
@@ -706,6 +701,6 @@ async function main() {
 }
 
 main().catch((error) => {
-    console.error(colors.red('Fatal error:'), error);
+    console.error(colors.red('致命错误:'), error);
     process.exit(1);
 });

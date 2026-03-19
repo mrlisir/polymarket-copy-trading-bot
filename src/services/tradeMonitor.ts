@@ -71,7 +71,7 @@ const init = async () => {
             Logger.myPositions(ENV.PROXY_WALLET, 0, [], 0, 0, 0, currentBalance);
         }
     } catch (error) {
-        Logger.error(`Failed to fetch your positions: ${error}`);
+        Logger.error(`获取您的持仓失败: ${error}`);
     }
 
     // Show current positions count with details for traders you're copying
@@ -160,7 +160,7 @@ const fetchTradeData = async () => {
                 });
 
                 await newActivity.save();
-                Logger.info(`New trade detected for ${address.slice(0, 6)}...${address.slice(-4)}`);
+                Logger.info(`检测到 ${address.slice(0, 6)}...${address.slice(-4)} 的新交易`);
             }
 
             // Also fetch and update positions
@@ -205,7 +205,7 @@ const fetchTradeData = async () => {
             }
         } catch (error) {
             Logger.error(
-                `Error fetching data for ${address.slice(0, 6)}...${address.slice(-4)}: ${error}`
+                `获取 ${address.slice(0, 6)}...${address.slice(-4)} 的数据时出错: ${error}`
             );
         }
     }
@@ -221,17 +221,16 @@ let isRunning = true;
  */
 export const stopTradeMonitor = () => {
     isRunning = false;
-    Logger.info('Trade monitor shutdown requested...');
+    Logger.info('交易监控已请求关闭...');
 };
 
 const tradeMonitor = async () => {
     await init();
-    Logger.success(`Monitoring ${USER_ADDRESSES.length} trader(s) every ${FETCH_INTERVAL}s`);
+    Logger.success(`正在监控 ${USER_ADDRESSES.length} 位交易员，每 ${FETCH_INTERVAL} 秒检查一次`);
     Logger.separator();
 
-    // On first run, mark all existing historical trades as already processed
     if (isFirstRun) {
-        Logger.info('First run: marking all historical trades as processed...');
+        Logger.info('首次运行：正在将所有历史交易标记为已处理...');
         for (const { address, UserActivity } of userModels) {
             const count = await UserActivity.updateMany(
                 { bot: false },
@@ -239,12 +238,12 @@ const tradeMonitor = async () => {
             );
             if (count.modifiedCount > 0) {
                 Logger.info(
-                    `Marked ${count.modifiedCount} historical trades as processed for ${address.slice(0, 6)}...${address.slice(-4)}`
+                    `已将 ${count.modifiedCount} 条历史交易标记为已处理: ${address.slice(0, 6)}...${address.slice(-4)}`
                 );
             }
         }
         isFirstRun = false;
-        Logger.success('\nHistorical trades processed. Now monitoring for new trades only.');
+        Logger.success('\n历史交易已处理完毕，现在仅监控新交易。');
         Logger.separator();
     }
 
@@ -254,7 +253,7 @@ const tradeMonitor = async () => {
         await new Promise((resolve) => setTimeout(resolve, FETCH_INTERVAL * 1000));
     }
 
-    Logger.info('Trade monitor stopped');
+    Logger.info('交易监控已停止');
 };
 
 export default tradeMonitor;

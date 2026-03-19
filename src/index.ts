@@ -14,13 +14,13 @@ let isShuttingDown = false;
 
 const gracefulShutdown = async (signal: string) => {
     if (isShuttingDown) {
-        Logger.warning('Shutdown already in progress, forcing exit...');
+        Logger.warning('正在执行关闭中，强制退出...');
         process.exit(1);
     }
 
     isShuttingDown = true;
     Logger.separator();
-    Logger.info(`Received ${signal}, initiating graceful shutdown...`);
+    Logger.info(`收到关闭信号 ${signal}，正在执行优雅关闭...`);
 
     try {
         // Stop services
@@ -28,30 +28,32 @@ const gracefulShutdown = async (signal: string) => {
         stopTradeExecutor();
 
         // Give services time to finish current operations
-        Logger.info('Waiting for services to finish current operations...');
+        Logger.info('正在等待服务完成当前操作...');
         await new Promise((resolve) => setTimeout(resolve, 2000));
 
         // Close database connection
         await closeDB();
 
-        Logger.success('Graceful shutdown completed');
+        Logger.success('优雅关闭已完成');
         process.exit(0);
     } catch (error) {
-        Logger.error(`Error during shutdown: ${error}`);
+        Logger.error(`关闭时出错: ${error}`);
         process.exit(1);
     }
 };
 
 // Handle unhandled promise rejections
 process.on('unhandledRejection', (reason: unknown, promise: Promise<unknown>) => {
-    Logger.error(`Unhandled Rejection at: ${promise}, reason: ${reason}`);
-    // Don't exit immediately, let the application try to recover
+    const error = reason instanceof Error ? reason : new Error(String(reason));
+
+    // Log the error but don't crash the application
+    // Note: getMyBalance handles RPC errors internally with exponential backoff retry
+    Logger.error(`未处理的 Promise 拒绝: ${error.message}`);
 });
 
 // Handle uncaught exceptions
 process.on('uncaughtException', (error: Error) => {
-    Logger.error(`Uncaught Exception: ${error.message}`);
-    // Exit immediately for uncaught exceptions as the application is in an undefined state
+    Logger.error(`未捕获的异常: ${error.message}`);
     gracefulShutdown('uncaughtException').catch(() => {
         process.exit(1);
     });
@@ -70,36 +72,34 @@ export const main = async () => {
             cyan: '\x1b[36m',
         };
         
-        console.log(`\n${colors.yellow}💡 First time running the bot?${colors.reset}`);
-        console.log(`   Read the guide: ${colors.cyan}GETTING_STARTED.md${colors.reset}`);
-        console.log(`   Run health check: ${colors.cyan}npm run health-check${colors.reset}\n`);
-        
+        console.log(`\n${colors.yellow}💡 首次运行机器人？${colors.reset}`);
+        console.log(`   阅读指南: ${colors.cyan}GETTING_STARTED.md${colors.reset}`);
+        console.log(`   运行健康检查: ${colors.cyan}npm run health-check${colors.reset}\n`);
+
         await connectDB();
         Logger.startup(USER_ADDRESSES, PROXY_WALLET);
 
-        // Perform initial health check
-        Logger.info('Performing initial health check...');
+        Logger.info('正在执行初始健康检查...');
         const healthResult = await performHealthCheck();
         logHealthCheck(healthResult);
 
         if (!healthResult.healthy) {
-            Logger.warning('Health check failed, but continuing startup...');
+            Logger.warning('健康检查未完全通过，但将继续启动...');
         }
 
-        Logger.info('Initializing CLOB client...');
+        Logger.info('正在初始化 CLOB 客户端...');
         const clobClient = await createClobClient();
-        Logger.success('CLOB client ready');
+        Logger.success('CLOB 客户端就绪');
 
         Logger.separator();
-        Logger.info('Starting trade monitor...');
+        Logger.info('正在启动交易监控...');
         tradeMonitor();
 
-        Logger.info('Starting trade executor...');
+        Logger.info('正在启动交易执行器...');
         tradeExecutor(clobClient);
 
-        // test(clobClient);
     } catch (error) {
-        Logger.error(`Fatal error during startup: ${error}`);
+        Logger.error(`启动时发生致命错误: ${error}`);
         await gracefulShutdown('startup-error');
     }
 };

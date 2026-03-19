@@ -127,7 +127,7 @@ const getReadyAggregatedTrades = (): AggregatedTrade[] => {
             } else {
                 // Window passed but total too small - mark individual trades as skipped
                 Logger.info(
-                    `Trade aggregation for ${agg.userAddress} on ${agg.slug || agg.asset}: $${agg.totalUsdcSize.toFixed(2)} total from ${agg.trades.length} trades below minimum ($${TRADE_AGGREGATION_MIN_TOTAL_USD}) - skipping`
+                    `${agg.userAddress} 在 ${agg.slug || agg.asset} 上的聚合交易: $${agg.totalUsdcSize.toFixed(2)} (共 ${agg.trades.length} 笔)，总额低于最低限制 ($${TRADE_AGGREGATION_MIN_TOTAL_USD}) — 跳过`
                 );
 
                 // Mark all trades in this aggregation as processed (bot: true)
@@ -183,8 +183,17 @@ const doTrading = async (clobClient: ClobClient, trades: TradeWithUser[]) => {
 
         Logger.balance(my_balance, user_balance, trade.userAddress);
 
+        // Check daily volume status before trading
+        const dailyVol = getDailyVolume();
+        const dailyLimit = ENV.COPY_STRATEGY_CONFIG.maxDailyVolumeUSD;
+        if (dailyLimit) {
+            Logger.info(
+                `📊 今日交易量: $${dailyVol.toFixed(2)} / $${dailyLimit.toFixed(2)} (剩余: $${(dailyLimit - dailyVol).toFixed(2)})`
+            );
+        }
+
         // Execute the trade
-        await postOrder(
+        const executedUsdc = await postOrder(
             clobClient,
             trade.side === 'BUY' ? 'buy' : 'sell',
             my_position,
@@ -192,8 +201,15 @@ const doTrading = async (clobClient: ClobClient, trades: TradeWithUser[]) => {
             trade,
             my_balance,
             user_balance,
-            trade.userAddress
+            trade.userAddress,
+            dailyVol
         );
+
+        // Track daily volume after successful trade
+        if (executedUsdc > 0) {
+            addDailyVolume(executedUsdc);
+            Logger.info(`📈 今日累计交易量: $${getDailyVolume().toFixed(2)}`);
+        }
 
         Logger.separator();
     }
@@ -204,11 +220,11 @@ const doTrading = async (clobClient: ClobClient, trades: TradeWithUser[]) => {
  */
 const doAggregatedTrading = async (clobClient: ClobClient, aggregatedTrades: AggregatedTrade[]) => {
     for (const agg of aggregatedTrades) {
-        Logger.header(`📊 AGGREGATED TRADE (${agg.trades.length} trades combined)`);
-        Logger.info(`Market: ${agg.slug || agg.asset}`);
-        Logger.info(`Side: ${agg.side}`);
-        Logger.info(`Total volume: $${agg.totalUsdcSize.toFixed(2)}`);
-        Logger.info(`Average price: $${agg.averagePrice.toFixed(4)}`);
+        Logger.header(`📊 聚合交易 (合并 ${agg.trades.length} 笔)`);
+        Logger.info(`市场: ${agg.slug || agg.asset}`);
+        Logger.info(`方向: ${agg.side}`);
+        Logger.info(`总金额: $${agg.totalUsdcSize.toFixed(2)}`);
+        Logger.info(`平均价格: $${agg.averagePrice.toFixed(4)}`);
 
         // Mark all individual trades as being processed
         for (const trade of agg.trades) {
@@ -239,6 +255,15 @@ const doAggregatedTrading = async (clobClient: ClobClient, aggregatedTrades: Agg
 
         Logger.balance(my_balance, user_balance, agg.userAddress);
 
+        // Check daily volume status before trading
+        const dailyVol = getDailyVolume();
+        const dailyLimit = ENV.COPY_STRATEGY_CONFIG.maxDailyVolumeUSD;
+        if (dailyLimit) {
+            Logger.info(
+                `📊 今日交易量: $${dailyVol.toFixed(2)} / $${dailyLimit.toFixed(2)} (剩余: $${(dailyLimit - dailyVol).toFixed(2)})`
+            );
+        }
+
         // Create a synthetic trade object for postOrder using aggregated values
         const syntheticTrade: UserActivityInterface = {
             ...agg.trades[0], // Use first trade as template
@@ -248,7 +273,7 @@ const doAggregatedTrading = async (clobClient: ClobClient, aggregatedTrades: Agg
         };
 
         // Execute the aggregated trade
-        await postOrder(
+        const executedUsdc = await postOrder(
             clobClient,
             agg.side === 'BUY' ? 'buy' : 'sell',
             my_position,
@@ -256,11 +281,69 @@ const doAggregatedTrading = async (clobClient: ClobClient, aggregatedTrades: Agg
             syntheticTrade,
             my_balance,
             user_balance,
-            agg.userAddress
+            agg.userAddress,
+            dailyVol
         );
+
+        // Track daily volume after successful trade
+        if (executedUsdc > 0) {
+            addDailyVolume(executedUsdc);
+            Logger.info(`📈 今日累计交易量: $${getDailyVolume().toFixed(2)}`);
+        }
 
         Logger.separator();
     }
+};
+
+// Track executed volume in memory (resets at midnight UTC)
+// Key: "YYYY-MM-DD", Value: total USD volume executed today
+const dailyVolumeCache: Map<string, number> = new Map();
+
+/**
+ * Get today's UTC date string (YYYY-MM-DD)
+ */
+const getTodayKey = (): string => {
+    const now = new Date();
+    return `${now.getUTCFullYear()}-${String(now.getUTCMonth() + 1).padStart(2, '0')}-${String(now.getUTCDate()).padStart(2, '0')}`;
+};
+
+/**
+ * Get current daily volume
+ */
+export const getDailyVolume = (): number => {
+    const today = getTodayKey();
+    return dailyVolumeCache.get(today) || 0;
+};
+
+/**
+ * Add to daily volume and return updated total
+ */
+export const addDailyVolume = (amount: number): number => {
+    const today = getTodayKey();
+    const current = dailyVolumeCache.get(today) || 0;
+    const updated = current + amount;
+    dailyVolumeCache.set(today, updated);
+
+    // Prune old keys to avoid memory leak
+    if (dailyVolumeCache.size > 7) {
+        const sortedKeys = [...dailyVolumeCache.keys()].sort();
+        for (const key of sortedKeys.slice(0, -7)) {
+            dailyVolumeCache.delete(key);
+        }
+    }
+
+    return updated;
+};
+
+/**
+ * Check if we should reset daily volume (call at startup)
+ */
+const initDailyVolumeTracking = () => {
+    const today = getTodayKey();
+    if (!dailyVolumeCache.has(today)) {
+        dailyVolumeCache.set(today, 0);
+    }
+    Logger.info(`📅 每日交易量追踪已初始化，今日已用: $${getDailyVolume().toFixed(2)}`);
 };
 
 // Track if executor should continue running
@@ -271,14 +354,15 @@ let isRunning = true;
  */
 export const stopTradeExecutor = () => {
     isRunning = false;
-    Logger.info('Trade executor shutdown requested...');
+    Logger.info('交易执行器已请求关闭...');
 };
 
 const tradeExecutor = async (clobClient: ClobClient) => {
-    Logger.success(`Trade executor ready for ${USER_ADDRESSES.length} trader(s)`);
+    initDailyVolumeTracking();
+    Logger.success(`交易执行器就绪，正在监控 ${USER_ADDRESSES.length} 位交易员`);
     if (TRADE_AGGREGATION_ENABLED) {
         Logger.info(
-            `Trade aggregation enabled: ${TRADE_AGGREGATION_WINDOW_SECONDS}s window, $${TRADE_AGGREGATION_MIN_TOTAL_USD} minimum`
+            `交易聚合已启用: ${TRADE_AGGREGATION_WINDOW_SECONDS} 秒窗口，最低 $${TRADE_AGGREGATION_MIN_TOTAL_USD}`
         );
     }
 
@@ -291,21 +375,19 @@ const tradeExecutor = async (clobClient: ClobClient) => {
             if (trades.length > 0) {
                 Logger.clearLine();
                 Logger.info(
-                    `📥 ${trades.length} new trade${trades.length > 1 ? 's' : ''} detected`
+                    `📥 检测到 ${trades.length} 笔新交易`
                 );
 
                 // Add trades to aggregation buffer
                 for (const trade of trades) {
-                    // Only aggregate BUY trades below minimum threshold
                     if (trade.side === 'BUY' && trade.usdcSize < TRADE_AGGREGATION_MIN_TOTAL_USD) {
                         Logger.info(
-                            `Adding $${trade.usdcSize.toFixed(2)} ${trade.side} trade to aggregation buffer for ${trade.slug || trade.asset}`
+                            `正在将 $${trade.usdcSize.toFixed(2)} 的 ${trade.side} 交易加入聚合缓冲: ${trade.slug || trade.asset}`
                         );
                         addToAggregationBuffer(trade);
                     } else {
-                        // Execute large trades immediately (not aggregated)
                         Logger.clearLine();
-                        Logger.header(`⚡ IMMEDIATE TRADE (above threshold)`);
+                        Logger.header(`⚡ 立即执行 (超过阈值)`);
                         await doTrading(clobClient, [trade]);
                     }
                 }
@@ -317,7 +399,7 @@ const tradeExecutor = async (clobClient: ClobClient) => {
             if (readyAggregations.length > 0) {
                 Logger.clearLine();
                 Logger.header(
-                    `⚡ ${readyAggregations.length} AGGREGATED TRADE${readyAggregations.length > 1 ? 'S' : ''} READY`
+                    `⚡ ${readyAggregations.length} 笔聚合交易已就绪`
                 );
                 await doAggregatedTrading(clobClient, readyAggregations);
                 lastCheck = Date.now();
@@ -330,7 +412,7 @@ const tradeExecutor = async (clobClient: ClobClient) => {
                     if (bufferedCount > 0) {
                         Logger.waiting(
                             USER_ADDRESSES.length,
-                            `${bufferedCount} trade group(s) pending`
+                            `${bufferedCount} 个交易组待处理`
                         );
                     } else {
                         Logger.waiting(USER_ADDRESSES.length);
@@ -339,16 +421,14 @@ const tradeExecutor = async (clobClient: ClobClient) => {
                 }
             }
         } else {
-            // Original non-aggregation logic
             if (trades.length > 0) {
                 Logger.clearLine();
                 Logger.header(
-                    `⚡ ${trades.length} NEW TRADE${trades.length > 1 ? 'S' : ''} TO COPY`
+                    `⚡ 检测到 ${trades.length} 笔新交易待跟单`
                 );
                 await doTrading(clobClient, trades);
                 lastCheck = Date.now();
             } else {
-                // Update waiting message every 300ms for smooth animation
                 if (Date.now() - lastCheck > 300) {
                     Logger.waiting(USER_ADDRESSES.length);
                     lastCheck = Date.now();
@@ -360,7 +440,7 @@ const tradeExecutor = async (clobClient: ClobClient) => {
         await new Promise((resolve) => setTimeout(resolve, 300));
     }
 
-    Logger.info('Trade executor stopped');
+    Logger.info('交易执行器已停止');
 };
 
 export default tradeExecutor;

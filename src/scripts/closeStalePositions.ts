@@ -84,7 +84,7 @@ const updatePolymarketCache = async (clobClient: ClobClient, tokenId: string) =>
             token_id: tokenId,
         });
     } catch (error) {
-        console.log(`⚠️  Failed to refresh balance cache for ${tokenId}:`, error);
+        console.log(`⚠️  刷新 ${tokenId} 的余额缓存失败:`, error);
     }
 };
 
@@ -110,7 +110,7 @@ const sellEntirePosition = async (
         const orderBook = await clobClient.getOrderBook(position.asset);
 
         if (!orderBook.bids || orderBook.bids.length === 0) {
-            console.log('   ❌ Order book has no bids – liquidity unavailable');
+            console.log('   ❌ 订单簿无买方报价 — 流动性不足');
             break;
         }
 
@@ -123,7 +123,7 @@ const sellEntirePosition = async (
 
         if (bidSize < MIN_SELL_TOKENS) {
             console.log(
-                `   ❌ Best bid only for ${bidSize.toFixed(2)} tokens (< ${MIN_SELL_TOKENS})`
+                `   ❌ 最优买方报价仅 ${bidSize.toFixed(2)} 个代币 (< ${MIN_SELL_TOKENS})`
             );
             break;
         }
@@ -131,7 +131,7 @@ const sellEntirePosition = async (
         const sellAmount = Math.min(remaining, bidSize);
 
         if (sellAmount < MIN_SELL_TOKENS) {
-            console.log(`   ❌ Remaining amount ${sellAmount.toFixed(4)} below minimum sell size`);
+            console.log(`   ❌ 剩余数量 ${sellAmount.toFixed(4)} 低于最低出售数量`);
             break;
         }
 
@@ -153,7 +153,7 @@ const sellEntirePosition = async (
                 remaining -= sellAmount;
                 attempts = 0;
                 console.log(
-                    `   ✅ Sold ${sellAmount.toFixed(2)} tokens @ $${bidPrice.toFixed(3)} (≈ $${tradeValue.toFixed(2)})`
+                    `   ✅ 成功卖出 ${sellAmount.toFixed(2)} 个代币 @ $${bidPrice.toFixed(3)} (≈ $${tradeValue.toFixed(2)})`
                 );
             } else {
                 attempts += 1;
@@ -161,25 +161,25 @@ const sellEntirePosition = async (
 
                 if (isInsufficientBalanceOrAllowanceError(errorMessage)) {
                     console.log(
-                        `   ❌ Order rejected: ${errorMessage ?? 'balance/allowance issue'}`
+                        `   ❌ 订单被拒绝: ${errorMessage ?? '余额或授权问题'}`
                     );
                     break;
                 }
                 console.log(
-                    `   ⚠️  Sell attempt ${attempts}/${RETRY_LIMIT} failed${errorMessage ? ` – ${errorMessage}` : ''}`
+                    `   ⚠️  出售第 ${attempts}/${RETRY_LIMIT} 次失败${errorMessage ? ` - ${errorMessage}` : ''}`
                 );
             }
         } catch (error) {
             attempts += 1;
-            console.log(`   ⚠️  Sell attempt ${attempts}/${RETRY_LIMIT} threw error:`, error);
+            console.log(`   ⚠️  出售第 ${attempts}/${RETRY_LIMIT} 次出错:`, error);
         }
     }
 
     if (remaining >= MIN_SELL_TOKENS) {
-        console.log(`   ⚠️  Remaining unsold: ${remaining.toFixed(2)} tokens`);
+        console.log(`   ⚠️  剩余未出售: ${remaining.toFixed(2)} 个代币`);
     } else if (remaining > 0) {
         console.log(
-            `   ℹ️  Residual dust < ${MIN_SELL_TOKENS} token left (${remaining.toFixed(4)})`
+            `   ℹ️  残余粉尘 < ${MIN_SELL_TOKENS} 个代币 (${remaining.toFixed(4)})`
         );
     }
 
@@ -205,7 +205,7 @@ const buildTrackedSet = async (): Promise<Set<string>> => {
                 }
             });
         } catch (error) {
-            console.log(`⚠️  Failed to load positions for ${user}:`, error);
+            console.log(`⚠️  加载 ${user} 的持仓失败:`, error);
         }
     }
 
@@ -215,26 +215,26 @@ const buildTrackedSet = async (): Promise<Set<string>> => {
 const logPositionHeader = (position: Position, index: number, total: number) => {
     console.log(`\n${index + 1}/${total} ▶ ${position.title || position.slug || position.asset}`);
     if (position.outcome) {
-        console.log(`   Outcome: ${position.outcome}`);
+        console.log(`   结果: ${position.outcome}`);
     }
     console.log(
-        `   Size: ${position.size.toFixed(2)} tokens @ avg $${position.avgPrice.toFixed(3)}`
+        `   持仓: ${position.size.toFixed(2)} 个代币 @ 平均价格 $${position.avgPrice.toFixed(3)}`
     );
     console.log(
-        `   Est. value: $${position.currentValue.toFixed(2)} (cur price $${position.curPrice.toFixed(3)})`
+        `   估计价值: $${position.currentValue.toFixed(2)} (当前价格 $${position.curPrice.toFixed(3)})`
     );
     if (position.redeemable) {
-        console.log('   ℹ️  Market is redeemable — consider redeeming if value stays flat at $0.');
+        console.log('   ℹ️  市场可赎回 — 如果价值保持在 $0 可考虑赎回。');
     }
 };
 
 const main = async () => {
-    console.log('🚀 Closing stale positions (tracked traders already exited)');
+    console.log('🚀 正在平仓陈旧仓位 (跟踪的交易员已退出)');
     console.log('════════════════════════════════════════════════════');
-    console.log(`Wallet: ${PROXY_WALLET}`);
+    console.log(`钱包: ${PROXY_WALLET}`);
 
     const clobClient = await createClobClient();
-    console.log('✅ Connected to Polymarket CLOB');
+    console.log('✅ 已连接到 Polymarket CLOB');
 
     const [myPositions, trackedPositions] = await Promise.all([
         loadPositions(PROXY_WALLET),
@@ -242,7 +242,7 @@ const main = async () => {
     ]);
 
     if (myPositions.length === 0) {
-        console.log('\n🎉 No open positions detected for proxy wallet.');
+        console.log('\n🎉 代理钱包未检测到任何开仓。');
         return;
     }
 
@@ -251,11 +251,11 @@ const main = async () => {
     );
 
     if (stalePositions.length === 0) {
-        console.log('\n✅ All positions still held by tracked traders. Nothing to close.');
+        console.log('\n✅ 所有仓位仍由跟踪的交易员持有。无需平仓。');
         return;
     }
 
-    console.log(`\nFound ${stalePositions.length} stale position(s) to unwind.`);
+    console.log(`\n发现 ${stalePositions.length} 个陈旧仓位待平仓。`);
 
     let totalTokens = 0;
     let totalProceeds = 0;
@@ -269,21 +269,21 @@ const main = async () => {
             totalTokens += result.soldTokens;
             totalProceeds += result.proceedsUsd;
         } catch (error) {
-            console.log('   ❌ Failed to close position due to unexpected error:', error);
+            console.log('   ❌ 由于意外错误无法平仓:', error);
         }
     }
 
     console.log('\n════════════════════════════════════════════════════');
-    console.log('✅ Close-out summary');
-    console.log(`Markets touched: ${stalePositions.length}`);
-    console.log(`Tokens sold: ${totalTokens.toFixed(2)}`);
-    console.log(`USDC realized (approx.): $${totalProceeds.toFixed(2)}`);
+    console.log('✅ 平仓汇总');
+    console.log(`涉及市场: ${stalePositions.length}`);
+    console.log(`已出售代币: ${totalTokens.toFixed(2)}`);
+    console.log(`已实现 USDC (约): $${totalProceeds.toFixed(2)}`);
     console.log('════════════════════════════════════════════════════\n');
 };
 
 main()
     .then(() => process.exit(0))
     .catch((error) => {
-        console.error('❌ Script aborted due to error:', error);
+        console.error('❌ 脚本因错误中止:', error);
         process.exit(1);
     });

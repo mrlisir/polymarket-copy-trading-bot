@@ -32,14 +32,14 @@ const validateRequiredEnv = (): void => {
     }
 
     if (missing.length > 0) {
-        console.error('\n❌ Configuration Error: Missing required environment variables\n');
-        console.error(`Missing variables: ${missing.join(', ')}\n`);
-        console.error('🔧 Quick fix:');
-        console.error('   1. Run the setup wizard: npm run setup');
-        console.error('   2. Or manually create .env file with all required variables\n');
-        console.error('📖 See docs/QUICK_START.md for detailed instructions\n');
+        console.error('\n❌ 配置错误：缺少必需的环境变量\n');
+        console.error(`缺失的变量: ${missing.join(', ')}\n`);
+        console.error('🔧 快速修复:');
+        console.error('   1. 运行设置向导: npm run setup');
+        console.error('   2. 或手动创建 .env 文件并填写所有必需变量\n');
+        console.error('📖 详细说明请参阅: docs/QUICK_START.md\n');
         throw new Error(
-            `Missing required environment variables: ${missing.join(', ')}`
+            `缺少必需的环境变量: ${missing.join(', ')}`
         );
     }
 };
@@ -49,16 +49,16 @@ const validateRequiredEnv = (): void => {
  */
 const validateAddresses = (): void => {
     if (process.env.PROXY_WALLET && !isValidEthereumAddress(process.env.PROXY_WALLET)) {
-        console.error('\n❌ Invalid Wallet Address\n');
-        console.error(`Your PROXY_WALLET: ${process.env.PROXY_WALLET}`);
-        console.error('Expected format:    0x followed by 40 hexadecimal characters\n');
-        console.error('Example: 0x742d35Cc6634C0532925a3b844Bc9e7595f0bEb0\n');
-        console.error('💡 Tips:');
-        console.error('   • Copy your wallet address from MetaMask');
-        console.error('   • Make sure it starts with 0x');
-        console.error('   • Should be exactly 42 characters long\n');
+        console.error('\n❌ 无效的钱包地址\n');
+        console.error(`您的 PROXY_WALLET: ${process.env.PROXY_WALLET}`);
+        console.error('期望格式:    0x 开头，后跟 40 位十六进制字符\n');
+        console.error('示例: 0x742d35Cc6634C0532925a3b844Bc9e7595f0bEb0\n');
+        console.error('💡 小提示:');
+        console.error('   • 从 MetaMask 复制您的钱包地址');
+        console.error('   • 确保地址以 0x 开头');
+        console.error('   • 长度应恰好为 42 个字符\n');
         throw new Error(
-            `Invalid PROXY_WALLET address format: ${process.env.PROXY_WALLET}`
+            `无效的 PROXY_WALLET 地址格式: ${process.env.PROXY_WALLET}`
         );
     }
 
@@ -66,12 +66,12 @@ const validateAddresses = (): void => {
         process.env.USDC_CONTRACT_ADDRESS &&
         !isValidEthereumAddress(process.env.USDC_CONTRACT_ADDRESS)
     ) {
-        console.error('\n❌ Invalid USDC Contract Address\n');
-        console.error(`Current value: ${process.env.USDC_CONTRACT_ADDRESS}`);
-        console.error('Default value: 0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174\n');
-        console.error('⚠️  Unless you know what you\'re doing, use the default value!\n');
+        console.error('\n❌ 无效的 USDC 合约地址\n');
+        console.error(`当前值: ${process.env.USDC_CONTRACT_ADDRESS}`);
+        console.error('默认值: 0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174\n');
+        console.error('⚠️  除非您知道自己在做什么，否则请使用默认值！\n');
         throw new Error(
-            `Invalid USDC_CONTRACT_ADDRESS format: ${process.env.USDC_CONTRACT_ADDRESS}`
+            `无效的 USDC_CONTRACT_ADDRESS 格式: ${process.env.USDC_CONTRACT_ADDRESS}`
         );
     }
 };
@@ -121,50 +121,50 @@ const validateNumericConfig = (): void => {
  */
 const validateUrls = (): void => {
     if (process.env.CLOB_HTTP_URL && !process.env.CLOB_HTTP_URL.startsWith('http')) {
-        console.error('\n❌ Invalid CLOB_HTTP_URL\n');
-        console.error(`Current value: ${process.env.CLOB_HTTP_URL}`);
-        console.error('Default value: https://clob.polymarket.com/\n');
-        console.error('⚠️  Use the default value unless you have a specific reason to change it!\n');
+        console.error('\n❌ 无效的 CLOB_HTTP_URL\n');
+        console.error(`当前值: ${process.env.CLOB_HTTP_URL}`);
+        console.error('默认值: https://clob.polymarket.com/\n');
+        console.error('⚠️  除非有特殊原因，否则请使用默认值！\n');
         throw new Error(
-            `Invalid CLOB_HTTP_URL: ${process.env.CLOB_HTTP_URL}. Must be a valid HTTP/HTTPS URL.`
+            `无效的 CLOB_HTTP_URL: ${process.env.CLOB_HTTP_URL}. 必须是有效的 HTTP/HTTPS URL。`
         );
     }
 
     if (process.env.CLOB_WS_URL && !process.env.CLOB_WS_URL.startsWith('ws')) {
-        console.error('\n❌ Invalid CLOB_WS_URL\n');
-        console.error(`Current value: ${process.env.CLOB_WS_URL}`);
-        console.error('Default value: wss://ws-subscriptions-clob.polymarket.com/ws\n');
-        console.error('⚠️  Use the default value unless you have a specific reason to change it!\n');
+        console.error('\n❌ 无效的 CLOB_WS_URL\n');
+        console.error(`当前值: ${process.env.CLOB_WS_URL}`);
+        console.error('默认值: wss://ws-subscriptions-clob.polymarket.com/ws\n');
+        console.error('⚠️  除非有特殊原因，否则请使用默认值！\n');
         throw new Error(
-            `Invalid CLOB_WS_URL: ${process.env.CLOB_WS_URL}. Must be a valid WebSocket URL (ws:// or wss://).`
+            `无效的 CLOB_WS_URL: ${process.env.CLOB_WS_URL}. 必须是有效的 WebSocket URL (ws:// 或 wss://)。`
         );
     }
 
     if (process.env.RPC_URL && !process.env.RPC_URL.startsWith('http')) {
-        console.error('\n❌ Invalid RPC_URL\n');
-        console.error(`Current value: ${process.env.RPC_URL}`);
-        console.error('Must start with: http:// or https://\n');
-        console.error('💡 Get a free RPC endpoint from:');
+        console.error('\n❌ 无效的 RPC_URL\n');
+        console.error(`当前值: ${process.env.RPC_URL}`);
+        console.error('必须以: http:// 或 https:// 开头\n');
+        console.error('💡 获取免费的 RPC 节点:');
         console.error('   • Infura:  https://infura.io');
         console.error('   • Alchemy: https://www.alchemy.com');
         console.error('   • Ankr:    https://www.ankr.com\n');
-        console.error('Example: https://polygon-mainnet.infura.io/v3/YOUR_PROJECT_ID\n');
-        throw new Error(`Invalid RPC_URL: ${process.env.RPC_URL}. Must be a valid HTTP/HTTPS URL.`);
+        console.error('示例: https://polygon-mainnet.infura.io/v3/YOUR_PROJECT_ID\n');
+        throw new Error(`无效的 RPC_URL: ${process.env.RPC_URL}. 必须是有效的 HTTP/HTTPS URL。`);
     }
 
     if (process.env.MONGO_URI && !process.env.MONGO_URI.startsWith('mongodb')) {
-        console.error('\n❌ Invalid MONGO_URI\n');
-        console.error(`Current value: ${process.env.MONGO_URI}`);
-        console.error('Must start with: mongodb:// or mongodb+srv://\n');
-        console.error('💡 Setup MongoDB Atlas (free):');
-        console.error('   1. Visit https://www.mongodb.com/cloud/atlas/register');
-        console.error('   2. Create a free cluster');
-        console.error('   3. Create database user with password');
-        console.error('   4. Whitelist IP: 0.0.0.0/0 (or your IP)');
-        console.error('   5. Get connection string from "Connect" button\n');
-        console.error('Example: mongodb+srv://username:password@cluster.mongodb.net/database\n');
+        console.error('\n❌ 无效的 MONGO_URI\n');
+        console.error(`当前值: ${process.env.MONGO_URI}`);
+        console.error('必须以: mongodb:// 或 mongodb+srv:// 开头\n');
+        console.error('💡 设置 MongoDB Atlas (免费):');
+        console.error('   1. 访问 https://www.mongodb.com/cloud/atlas/register');
+        console.error('   2. 创建一个免费集群');
+        console.error('   3. 创建数据库用户并设置密码');
+        console.error('   4. 添加 IP 白名单: 0.0.0.0/0（或您的 IP）');
+        console.error('   5. 从 "Connect" 按钮获取连接字符串\n');
+        console.error('示例: mongodb+srv://username:password@cluster.mongodb.net/database\n');
         throw new Error(
-            `Invalid MONGO_URI: ${process.env.MONGO_URI}. Must be a valid MongoDB connection string.`
+            `无效的 MONGO_URI: ${process.env.MONGO_URI}. 必须是有效的 MongoDB 连接字符串。`
         );
     }
 };
@@ -189,14 +189,14 @@ const parseUserAddresses = (input: string): string[] => {
                 // Validate each address
                 for (const addr of addresses) {
                     if (!isValidEthereumAddress(addr)) {
-                        console.error('\n❌ Invalid Trader Address in USER_ADDRESSES\n');
-                        console.error(`Invalid address: ${addr}`);
-                        console.error('Expected format: 0x followed by 40 hexadecimal characters\n');
-                        console.error('💡 Where to find trader addresses:');
-                        console.error('   • Polymarket Leaderboard: https://polymarket.com/leaderboard');
+                        console.error('\n❌ USER_ADDRESSES 中存在无效的交易员地址\n');
+                        console.error(`无效地址: ${addr}`);
+                        console.error('期望格式: 0x 开头，后跟 40 位十六进制字符\n');
+                        console.error('💡 在哪里找到交易员地址:');
+                        console.error('   • Polymarket 排行榜: https://polymarket.com/leaderboard');
                         console.error('   • Predictfolio: https://predictfolio.com\n');
-                        console.error('Example: USER_ADDRESSES=\'0x7c3db723f1d4d8cb9c550095203b686cb11e5c6b\'\n');
-                        throw new Error(`Invalid Ethereum address in USER_ADDRESSES: ${addr}`);
+                        console.error('示例: USER_ADDRESSES=\'0x7c3db723f1d4d8cb9c550095203b686cb11e5c6b\'\n');
+                        throw new Error(`USER_ADDRESSES 中存在无效的以太坊地址: ${addr}`);
                     }
                 }
                 return addresses;
@@ -218,14 +218,14 @@ const parseUserAddresses = (input: string): string[] => {
     // Validate each address
     for (const addr of addresses) {
         if (!isValidEthereumAddress(addr)) {
-            console.error('\n❌ Invalid Trader Address in USER_ADDRESSES\n');
-            console.error(`Invalid address: ${addr}`);
-            console.error('Expected format: 0x followed by 40 hexadecimal characters\n');
-            console.error('💡 Where to find trader addresses:');
-            console.error('   • Polymarket Leaderboard: https://polymarket.com/leaderboard');
+            console.error('\n❌ USER_ADDRESSES 中存在无效的交易员地址\n');
+            console.error(`无效地址: ${addr}`);
+            console.error('期望格式: 0x 开头，后跟 40 位十六进制字符\n');
+            console.error('💡 在哪里找到交易员地址:');
+            console.error('   • Polymarket 排行榜: https://polymarket.com/leaderboard');
             console.error('   • Predictfolio: https://predictfolio.com\n');
-            console.error('Example: USER_ADDRESSES=\'0x7c3db723f1d4d8cb9c550095203b686cb11e5c6b\'\n');
-            throw new Error(`Invalid Ethereum address in USER_ADDRESSES: ${addr}`);
+            console.error('示例: USER_ADDRESSES=\'0x7c3db723f1d4d8cb9c550095203b686cb11e5c6b\'\n');
+            throw new Error(`USER_ADDRESSES 中存在无效的以太坊地址: ${addr}`);
         }
     }
     return addresses;
@@ -238,7 +238,7 @@ const parseCopyStrategy = (): CopyStrategyConfig => {
 
     if (hasLegacyConfig) {
         console.warn(
-            '⚠️  Using legacy COPY_PERCENTAGE configuration. Consider migrating to COPY_STRATEGY.'
+            '⚠️  正在使用旧的 COPY_PERCENTAGE 配置，建议迁移到 COPY_STRATEGY。'
         );
         const copyPercentage = parseFloat(process.env.COPY_PERCENTAGE || '10.0');
         const tradeMultiplier = parseFloat(process.env.TRADE_MULTIPLIER || '1.0');
@@ -261,7 +261,7 @@ const parseCopyStrategy = (): CopyStrategyConfig => {
         if (process.env.TIERED_MULTIPLIERS) {
             try {
                 config.tieredMultipliers = parseTieredMultipliers(process.env.TIERED_MULTIPLIERS);
-                console.log(`✓ Loaded ${config.tieredMultipliers.length} tiered multipliers`);
+                console.log(`✓ 已加载 ${config.tieredMultipliers.length} 个分层乘数`);
             } catch (error) {
                 throw new Error(`Failed to parse TIERED_MULTIPLIERS: ${error instanceof Error ? error.message : String(error)}`);
             }
@@ -304,9 +304,9 @@ const parseCopyStrategy = (): CopyStrategyConfig => {
 
     // Parse tiered multipliers if configured
     if (process.env.TIERED_MULTIPLIERS) {
-        try {
-            config.tieredMultipliers = parseTieredMultipliers(process.env.TIERED_MULTIPLIERS);
-            console.log(`✓ Loaded ${config.tieredMultipliers.length} tiered multipliers`);
+            try {
+                config.tieredMultipliers = parseTieredMultipliers(process.env.TIERED_MULTIPLIERS);
+                console.log(`✓ 已加载 ${config.tieredMultipliers.length} 个分层乘数`);
         } catch (error) {
             throw new Error(`Failed to parse TIERED_MULTIPLIERS: ${error instanceof Error ? error.message : String(error)}`);
         }
@@ -315,7 +315,7 @@ const parseCopyStrategy = (): CopyStrategyConfig => {
         const singleMultiplier = parseFloat(process.env.TRADE_MULTIPLIER);
         if (singleMultiplier !== 1.0) {
             config.tradeMultiplier = singleMultiplier;
-            console.log(`✓ Using single trade multiplier: ${singleMultiplier}x`);
+            console.log(`✓ 使用单一交易乘数: ${singleMultiplier}x`);
         }
     }
 

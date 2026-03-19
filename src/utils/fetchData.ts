@@ -41,7 +41,7 @@ const fetchData = async (url: string) => {
             if (isNetworkError(error) && !isLastAttempt) {
                 const delay = retryDelay * Math.pow(2, attempt - 1); // Exponential backoff: 1s, 2s, 4s
                 console.warn(
-                    `⚠️  Network error (attempt ${attempt}/${retries}), retrying in ${delay / 1000}s...`
+                    `⚠️  网络错误 (第 ${attempt}/${retries} 次)，${(delay / 1000).toFixed(1)} 秒后重试...`
                 );
                 await sleep(delay);
                 continue;
@@ -50,8 +50,8 @@ const fetchData = async (url: string) => {
             // If it's the last attempt or not a network error, throw
             if (isLastAttempt && isNetworkError(error)) {
                 console.error(
-                    `❌ Network timeout after ${retries} attempts -`,
-                    axios.isAxiosError(error) ? error.code : 'Unknown error'
+                    `❌ 网络超时，${retries} 次重试后仍失败 -`,
+                    axios.isAxiosError(error) ? error.code : '未知错误'
                 );
             }
             throw error;

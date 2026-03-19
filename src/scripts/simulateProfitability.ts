@@ -106,141 +106,195 @@ const MAX_TRADES_LIMIT = (() => {
 })(); // Limit on number of trades for quick testing
 
 async function fetchBatch(offset: number, limit: number, sinceTimestamp: number): Promise<Trade[]> {
-    const response = await axios.get(
-        `https://data-api.polymarket.com/activity?user=${TRADER_ADDRESS}&type=TRADE&limit=${limit}&offset=${offset}`,
-        {
-            timeout: 10000,
-            headers: {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-            },
-        }
-    );
-
-    const trades: Trade[] = response.data.map((item: any) => ({
-        id: item.id,
-        timestamp: item.timestamp,
-        market: item.slug || item.market,
-        asset: item.asset,
-        side: item.side,
-        price: item.price,
-        usdcSize: item.usdcSize,
-        size: item.size,
-        outcome: item.outcome || 'Unknown',
-    }));
-
-    return trades.filter((t) => t.timestamp >= sinceTimestamp);
-}
-
-async function fetchTraderActivity(): Promise<Trade[]> {
     try {
-        const fs = await import('fs');
-        const path = await import('path');
-
-        // Check cache first
-        const cacheDir = path.join(process.cwd(), 'trader_data_cache');
-        const today = new Date().toISOString().split('T')[0];
-        const cacheFile = path.join(cacheDir, `${TRADER_ADDRESS}_${HISTORY_DAYS}d_${today}.json`);
-
-        if (fs.existsSync(cacheFile)) {
-            console.log(colors.cyan('📦 Loading cached trader activity...'));
-            const cached = JSON.parse(fs.readFileSync(cacheFile, 'utf8'));
-            console.log(
-                colors.green(`✓ Loaded ${cached.trades.length} trades from cache (${cached.name})`)
-            );
-            return cached.trades;
-        }
-
-        console.log(
-            colors.cyan(
-                `📊 Fetching trader activity from last ${HISTORY_DAYS} days (with parallel requests)...`
-            )
+        const response = await axios.get(
+            `https://data-api.polymarket.com/activity?user=${TRADER_ADDRESS}&type=TRADE&limit=${limit}&offset=${offset}`,
+            {
+                timeout: 10000,
+                headers: {
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+                },
+            }
         );
 
-        // Calculate timestamp for history window
-        const sinceTimestamp = Math.floor((Date.now() - HISTORY_DAYS * 24 * 60 * 60 * 1000) / 1000);
+        const trades: Trade[] = response.data.map((item: any) => ({
+            id: item.id,
+            timestamp: item.timestamp,
+            market: item.slug || item.market,
+            asset: item.asset,
+            side: item.side,
+            price: item.price,
+            usdcSize: item.usdcSize,
+            size: item.size,
+            outcome: item.outcome || 'Unknown',
+        }));
 
-        // First, get a sample to estimate total
-        const firstBatch = await fetchBatch(0, 100, sinceTimestamp);
-        let allTrades: Trade[] = [...firstBatch];
-
-        if (firstBatch.length === 100) {
-            // Need to fetch more - do it in parallel batches
-            const batchSize = 100;
-            const maxParallel = 5; // 5 parallel requests at a time
-            let offset = 100;
-            let hasMore = true;
-
-            while (hasMore && allTrades.length < MAX_TRADES_LIMIT) {
-                // Create batch of parallel requests
-                const promises: Promise<Trade[]>[] = [];
-                for (let i = 0; i < maxParallel; i++) {
-                    promises.push(fetchBatch(offset + i * batchSize, batchSize, sinceTimestamp));
-                }
-
-                const results = await Promise.all(promises);
-                let addedCount = 0;
-
-                for (const batch of results) {
-                    if (batch.length > 0) {
-                        allTrades = allTrades.concat(batch);
-                        addedCount += batch.length;
-                    }
-                    if (batch.length < batchSize) {
-                        hasMore = false;
-                        break;
-                    }
-                }
-
-                if (addedCount === 0) {
-                    hasMore = false;
-                }
-
-                // Check limit
-                if (allTrades.length >= MAX_TRADES_LIMIT) {
-                    console.log(
-                        colors.yellow(
-                            `⚠️  Reached trade limit (${MAX_TRADES_LIMIT}), stopping fetch...`
-                        )
-                    );
-                    allTrades = allTrades.slice(0, MAX_TRADES_LIMIT);
-                    hasMore = false;
-                }
-
-                offset += maxParallel * batchSize;
-                console.log(colors.gray(`  Fetched ${allTrades.length} trades so far...`));
-            }
+        return trades.filter((t) => t.timestamp >= sinceTimestamp);
+    } catch (error: any) {
+        // 400 错误表示没有更多数据了（offset 超出范围）
+        if (error.response?.status === 400 || error.code === 'ERR_BAD_REQUEST') {
+            return [];
         }
-
-        const sortedTrades = allTrades.sort((a, b) => a.timestamp - b.timestamp);
-        console.log(colors.green(`✓ Fetched ${sortedTrades.length} trades from last 7 days`));
-
-        // Save to cache
-        if (!fs.existsSync(cacheDir)) {
-            fs.mkdirSync(cacheDir, { recursive: true });
-        }
-
-        const cacheData = {
-            name: `trader_${TRADER_ADDRESS.slice(0, 6)}_${HISTORY_DAYS}d_${today}`,
-            traderAddress: TRADER_ADDRESS,
-            fetchedAt: new Date().toISOString(),
-            period: `${HISTORY_DAYS}_days`,
-            totalTrades: sortedTrades.length,
-            trades: sortedTrades,
-        };
-
-        fs.writeFileSync(cacheFile, JSON.stringify(cacheData, null, 2), 'utf8');
-        console.log(colors.green(`✓ Cached trades to: ${cacheFile}\n`));
-
-        return sortedTrades;
-    } catch (error) {
-        console.error(colors.red('Error fetching trader activity:'), error);
+        // 其他错误继续抛出
         throw error;
     }
 }
 
+async function fetchTraderActivity(): Promise<Trade[]> {
+    const fs = await import('fs');
+    const path = await import('path');
+
+    // Check cache first
+    const cacheDir = path.join(process.cwd(), 'trader_data_cache');
+    const today = new Date().toISOString().split('T')[0];
+    const cacheFile = path.join(cacheDir, `${TRADER_ADDRESS}_${HISTORY_DAYS}d_${today}.json`);
+
+    if (fs.existsSync(cacheFile)) {
+        console.log(colors.cyan('📦 正在加载缓存的交易数据...'));
+        const cached = JSON.parse(fs.readFileSync(cacheFile, 'utf8'));
+        console.log(
+            colors.green(`✓ 已从缓存加载 ${cached.trades.length} 笔交易 (${cached.name})`)
+        );
+        return cached.trades;
+    }
+
+    console.log(
+        colors.cyan(
+            `📊 正在获取交易员最近 ${HISTORY_DAYS} 天的交易数据（并行请求）...`
+        )
+    );
+
+    // Calculate timestamp for history window
+    const sinceTimestamp = Math.floor((Date.now() - HISTORY_DAYS * 24 * 60 * 60 * 1000) / 1000);
+
+    // First, get a sample to estimate total
+    const firstBatch = await fetchBatch(0, 100, sinceTimestamp);
+
+        // Check if trader has any recent activity
+        if (firstBatch.length === 0) {
+            console.log(colors.yellow(`⚠️  该交易员最近 ${HISTORY_DAYS} 天内没有交易记录。`));
+            console.log(colors.yellow(`   交易员可能不活跃，或者交易次数少于预期。`));
+            console.log(colors.yellow(`   建议：减少 HISTORY_DAYS 或选择其他交易员。\n`));
+
+        // Try to check if there are any trades at all
+        try {
+            const response = await axios.get(
+                `https://data-api.polymarket.com/activity?user=${TRADER_ADDRESS}&type=TRADE&limit=1`,
+                {
+                    timeout: 10000,
+                    headers: {
+                        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+                    },
+                }
+            );
+
+                if (response.data && response.data.length > 0) {
+                    const lastTrade = response.data[0];
+                    const lastTradeDate = new Date(lastTrade.timestamp * 1000);
+                    console.log(colors.cyan(`   最近一笔交易: ${lastTradeDate.toLocaleString('zh-CN')}`));
+                    console.log(colors.gray(`   距今 ${Math.floor((Date.now() - lastTrade.timestamp * 1000) / (1000 * 60 * 60 * 24))} 天\n`));
+                }
+        } catch {
+            // Ignore errors in this diagnostic check
+        }
+
+        return [];
+    }
+
+    let allTrades: Trade[] = [...firstBatch];
+    let fetchCompleted = false;
+
+    if (firstBatch.length === 100) {
+        // Need to fetch more - do it in parallel batches
+        const batchSize = 100;
+        const maxParallel = 5; // 5 parallel requests at a time
+        let offset = 100;
+
+        while (allTrades.length < MAX_TRADES_LIMIT) {
+            // Create batch of parallel requests
+            const promises: Promise<Trade[]>[] = [];
+            for (let i = 0; i < maxParallel; i++) {
+                promises.push(fetchBatch(offset + i * batchSize, batchSize, sinceTimestamp));
+            }
+
+            let results: Trade[][];
+            try {
+                results = await Promise.all(promises);
+            } catch (error: any) {
+                // 400 错误表示没有更多数据了
+                if (error.response?.status === 400 || error.code === 'ERR_BAD_REQUEST') {
+                    console.log(colors.yellow('⚠️  API 返回 400 - 没有更多可用的交易数据'));
+                    break;
+                }
+                throw error;
+            }
+
+            let addedCount = 0;
+
+            for (const batch of results) {
+                if (batch.length > 0) {
+                    allTrades = allTrades.concat(batch);
+                    addedCount += batch.length;
+                }
+                if (batch.length < batchSize) {
+                    // Empty batch means no more data
+                    fetchCompleted = true;
+                    break;
+                }
+            }
+
+            if (fetchCompleted || addedCount === 0) {
+                break;
+            }
+
+            // Check limit
+            if (allTrades.length >= MAX_TRADES_LIMIT) {
+                console.log(
+                    colors.yellow(
+                        `⚠️  已达到交易数量上限 (${MAX_TRADES_LIMIT})，停止获取...`
+                    )
+                );
+                allTrades = allTrades.slice(0, MAX_TRADES_LIMIT);
+                break;
+            }
+
+            offset += maxParallel * batchSize;
+            console.log(colors.gray(`  已获取 ${allTrades.length} 笔交易...`));
+        }
+    }
+
+    const sortedTrades = allTrades.sort((a: Trade, b: Trade) => a.timestamp - b.timestamp);
+
+    if (sortedTrades.length === 0) {
+        console.log(colors.yellow(`⚠️  在最近 ${HISTORY_DAYS} 天内没有找到交易。\n`));
+        return sortedTrades;
+    }
+
+    console.log(colors.green(`✓ 已获取最近 ${HISTORY_DAYS} 天的 ${sortedTrades.length} 笔交易`));
+
+    // 保存到缓存
+    if (!fs.existsSync(cacheDir)) {
+        fs.mkdirSync(cacheDir, { recursive: true });
+    }
+
+    const cacheData = {
+        name: `trader_${TRADER_ADDRESS.slice(0, 6)}_${HISTORY_DAYS}d_${today}`,
+        traderAddress: TRADER_ADDRESS,
+        fetchedAt: new Date().toISOString(),
+        period: `${HISTORY_DAYS}_days`,
+        totalTrades: sortedTrades.length,
+        trades: sortedTrades,
+    };
+
+    fs.writeFileSync(cacheFile, JSON.stringify(cacheData, null, 2), 'utf8');
+    console.log(colors.green(`✓ 已缓存到: ${cacheFile}\n`));
+
+    return sortedTrades;
+}
+
 async function fetchTraderPositions(): Promise<Position[]> {
     try {
-        console.log(colors.cyan('📈 Fetching trader positions...'));
+        console.log(colors.cyan('📈 正在获取交易员持仓...'));
         const response = await axios.get(
             `https://data-api.polymarket.com/positions?user=${TRADER_ADDRESS}`,
             {
@@ -251,16 +305,16 @@ async function fetchTraderPositions(): Promise<Position[]> {
             }
         );
 
-        console.log(colors.green(`✓ Fetched ${response.data.length} positions`));
+        console.log(colors.green(`✓ 已获取 ${response.data.length} 个持仓`));
         return response.data;
     } catch (error) {
-        console.error(colors.red('Error fetching positions:'), error);
+        console.error(colors.red('获取交易员持仓失败：'), error);
         throw error;
     }
 }
 
 async function simulateCopyTrading(trades: Trade[]): Promise<SimulationResult> {
-    console.log(colors.cyan('\n🎮 Starting simulation...\n'));
+    console.log(colors.cyan('\n🎮 开始模拟...\n'));
 
     let yourCapital = STARTING_CAPITAL;
     let totalInvested = 0;
@@ -443,71 +497,71 @@ async function simulateCopyTrading(trades: Trade[]): Promise<SimulationResult> {
 
 function printReport(result: SimulationResult) {
     console.log('\n' + colors.cyan('═'.repeat(80)));
-    console.log(colors.cyan('  📊 COPY TRADING SIMULATION REPORT (FIXED ALGORITHM)'));
+    console.log(colors.cyan('  📊 跟单交易模拟报告'));
     console.log(colors.cyan('═'.repeat(80)) + '\n');
 
-    console.log('Trader:', colors.blue(result.traderAddress));
+    console.log('交易员:', colors.blue(result.traderAddress));
     console.log(
-        'Copy %:',
+        '跟单比例:',
         colors.yellow(`${COPY_PERCENTAGE}%`),
-        colors.gray('(of trader order size)')
+        colors.gray('(按交易员订单金额)')
     );
-    console.log('Multiplier:', colors.yellow(`${MULTIPLIER}x`));
+    console.log('倍数:', colors.yellow(`${MULTIPLIER}x`));
     console.log();
 
-    console.log(colors.bold('Capital:'));
-    console.log(`  Starting: ${colors.green('$' + result.startingCapital.toFixed(2))}`);
-    console.log(`  Current:  ${colors.green('$' + result.currentCapital.toFixed(2))}`);
+    console.log(colors.bold('资金:'));
+    console.log(`  起始资金: ${colors.green('$' + result.startingCapital.toFixed(2))}`);
+    console.log(`  当前资金: ${colors.green('$' + result.currentCapital.toFixed(2))}`);
     console.log();
 
-    console.log(colors.bold('Performance:'));
+    console.log(colors.bold('表现:'));
     const pnlColor = result.totalPnl >= 0 ? colors.green : colors.red;
     const roiColor = result.roi >= 0 ? colors.green : colors.red;
     const pnlSign = result.totalPnl >= 0 ? '+' : '';
     const roiSign = result.roi >= 0 ? '+' : '';
-    console.log(`  Total P&L:     ${pnlColor(pnlSign + '$' + result.totalPnl.toFixed(2))}`);
-    console.log(`  ROI:           ${roiColor(roiSign + result.roi.toFixed(2) + '%')}`);
+    console.log(`  总盈亏:     ${pnlColor(pnlSign + '$' + result.totalPnl.toFixed(2))}`);
+    console.log(`  收益率:     ${roiColor(roiSign + result.roi.toFixed(2) + '%')}`);
     console.log(
-        `  Realized:      ${result.realizedPnl >= 0 ? '+' : ''}$${result.realizedPnl.toFixed(2)}`
+        `  已实现盈亏: ${result.realizedPnl >= 0 ? '+' : ''}$${result.realizedPnl.toFixed(2)}`
     );
     console.log(
-        `  Unrealized:    ${result.unrealizedPnl >= 0 ? '+' : ''}$${result.unrealizedPnl.toFixed(2)}`
+        `  未实现盈亏: ${result.unrealizedPnl >= 0 ? '+' : ''}$${result.unrealizedPnl.toFixed(2)}`
     );
     console.log();
 
-    console.log(colors.bold('Trades:'));
-    console.log(`  Total trades:  ${colors.cyan(String(result.totalTrades))}`);
-    console.log(`  Copied:        ${colors.green(String(result.copiedTrades))}`);
+    console.log(colors.bold('交易统计:'));
+    console.log(`  总交易数:  ${colors.cyan(String(result.totalTrades))}`);
+    console.log(`  已复制:    ${colors.green(String(result.copiedTrades))}`);
     console.log(
-        `  Skipped:       ${colors.yellow(String(result.skippedTrades))} (below $${MIN_ORDER_SIZE} minimum)`
+        `  已跳过:    ${colors.yellow(String(result.skippedTrades))} (低于 $${MIN_ORDER_SIZE} 最低金额)`
     );
     console.log();
 
     const openPositions = result.positions.filter((p) => !p.closed);
     const closedPositions = result.positions.filter((p) => p.closed);
 
-    console.log(colors.bold('Open Positions:'));
-    console.log(`  Count: ${openPositions.length}\n`);
+    console.log(colors.bold('未平仓位:'));
+    console.log(`  数量: ${openPositions.length}\n`);
 
     openPositions.slice(0, 10).forEach((pos, i) => {
         const pnlStr =
             pos.pnl >= 0
                 ? colors.green(`+$${pos.pnl.toFixed(2)}`)
                 : colors.red(`-$${Math.abs(pos.pnl).toFixed(2)}`);
-        const marketLabel = (pos.market || 'Unknown market').slice(0, 50);
+        const marketLabel = (pos.market || '未知市场').slice(0, 50);
         console.log(`  ${i + 1}. ${marketLabel}`);
         console.log(
-            `     Outcome: ${pos.outcome} | Invested: $${pos.invested.toFixed(2)} | Value: $${pos.currentValue.toFixed(2)} | P&L: ${pnlStr}`
+            `     结果: ${pos.outcome} | 投入: $${pos.invested.toFixed(2)} | 当前价值: $${pos.currentValue.toFixed(2)} | 盈亏: ${pnlStr}`
         );
     });
 
     if (openPositions.length > 10) {
-        console.log(colors.gray(`\n  ... and ${openPositions.length - 10} more positions`));
+        console.log(colors.gray(`\n  ... 还有 ${openPositions.length - 10} 个仓位`));
     }
 
     if (closedPositions.length > 0) {
-        console.log('\n' + colors.bold('Closed Positions:'));
-        console.log(`  Count: ${closedPositions.length}\n`);
+        console.log('\n' + colors.bold('已平仓位:'));
+        console.log(`  数量: ${closedPositions.length}\n`);
 
         closedPositions.slice(0, 5).forEach((pos, i) => {
             const pnlStr =
@@ -516,12 +570,12 @@ function printReport(result: SimulationResult) {
                     : colors.red(`-$${Math.abs(pos.pnl).toFixed(2)}`);
             const marketLabel = (pos.market || 'Unknown market').slice(0, 50);
             console.log(`  ${i + 1}. ${marketLabel}`);
-            console.log(`     Outcome: ${pos.outcome} | P&L: ${pnlStr}`);
+            console.log(`     结果: ${pos.outcome} | 盈亏: ${pnlStr}`);
         });
 
         if (closedPositions.length > 5) {
             console.log(
-                colors.gray(`\n  ... and ${closedPositions.length - 5} more closed positions`)
+                colors.gray(`\n  ... 还有 ${closedPositions.length - 5} 个已平仓位`)
             );
         }
     }
@@ -530,21 +584,27 @@ function printReport(result: SimulationResult) {
 }
 
 async function main() {
-    console.log(colors.cyan('\n🚀 POLYMARKET COPY TRADING PROFITABILITY SIMULATOR (FIXED)\n'));
-    console.log(colors.gray(`Trader: ${TRADER_ADDRESS}`));
-    console.log(colors.gray(`Starting Capital: $${STARTING_CAPITAL}`));
-    console.log(colors.gray(`Copy Percentage: ${COPY_PERCENTAGE}% (of trader order size)`));
-    console.log(colors.gray(`Multiplier: ${MULTIPLIER}x`));
+    console.log(colors.cyan('\n🚀 Polymarket 跟单交易模拟器\n'));
+    console.log(colors.gray(`交易员: ${TRADER_ADDRESS}`));
+    console.log(colors.gray(`起始资金: $${STARTING_CAPITAL}`));
+    console.log(colors.gray(`跟单比例: ${COPY_PERCENTAGE}% (按交易员订单金额)`));
+    console.log(colors.gray(`倍数: ${MULTIPLIER}x`));
     console.log(
-        colors.gray(`History window: ${HISTORY_DAYS} day(s), max trades: ${MAX_TRADES_LIMIT}\n`)
+        colors.gray(`历史窗口: ${HISTORY_DAYS} 天，最大交易数: ${MAX_TRADES_LIMIT}\n`)
     );
 
     try {
         const trades = await fetchTraderActivity();
+
+        if (trades.length === 0) {
+            console.log(colors.yellow('⚠️  没有交易数据可模拟。退出。\n'));
+            process.exit(0);
+        }
+
         const result = await simulateCopyTrading(trades);
         printReport(result);
 
-        // Save to JSON file
+        // 保存到 JSON 文件
         const fs = await import('fs');
         const path = await import('path');
         const resultsDir = path.join(process.cwd(), 'simulation_results');
@@ -562,11 +622,11 @@ async function main() {
         const filepath = path.join(resultsDir, filename);
 
         fs.writeFileSync(filepath, JSON.stringify(result, null, 2), 'utf8');
-        console.log(colors.green(`✓ Results saved to: ${filepath}\n`));
+        console.log(colors.green(`✓ 结果已保存到: ${filepath}\n`));
 
-        console.log(colors.green('✓ Simulation completed successfully!\n'));
+        console.log(colors.green('✓ 模拟完成！\n'));
     } catch (error) {
-        console.error(colors.red('\n✗ Simulation failed:'), error);
+        console.error(colors.red('\n✗ 模拟失败：'), error);
         process.exit(1);
     }
 }

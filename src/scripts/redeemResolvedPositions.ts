@@ -59,22 +59,20 @@ const redeemPosition = async (
         // We use [1, 2] to redeem all positions for this condition
         const indexSets = [1, 2];
 
-        console.log(`   Attempting redemption...`);
-        console.log(`   Condition ID: ${conditionIdBytes32}`);
-        console.log(`   Index Sets: [${indexSets.join(', ')}]`);
+        console.log(`   正在尝试赎回...`);
+        console.log(`   条件 ID: ${conditionIdBytes32}`);
+        console.log(`   索引集: [${indexSets.join(', ')}]`);
 
-        // Get current gas price from network
         const feeData = await ctfContract.provider.getFeeData();
         const gasPrice = feeData.gasPrice || feeData.maxFeePerGas;
 
         if (!gasPrice) {
-            throw new Error('Could not determine gas price');
+            throw new Error('无法确定 Gas 价格');
         }
 
-        // Add 20% buffer to ensure transaction goes through
         const adjustedGasPrice = gasPrice.mul(120).div(100);
 
-        console.log(`   Gas price: ${ethers.utils.formatUnits(adjustedGasPrice, 'gwei')} Gwei`);
+        console.log(`   Gas 价格: ${ethers.utils.formatUnits(adjustedGasPrice, 'gwei')} Gwei`);
 
         const tx = await ctfContract.redeemPositions(
             USDC_ADDRESS,
@@ -82,79 +80,74 @@ const redeemPosition = async (
             conditionIdBytes32,
             indexSets,
             {
-                gasLimit: 500000, // Set a reasonable gas limit
+                gasLimit: 500000,
                 gasPrice: adjustedGasPrice,
             }
         );
 
-        console.log(`   ⏳ Transaction submitted: ${tx.hash}`);
-        console.log(`   ⏳ Waiting for confirmation...`);
+        console.log(`   ⏳ 交易已提交: ${tx.hash}`);
+        console.log(`   ⏳ 等待确认...`);
 
         const receipt = await tx.wait();
 
         if (receipt.status === 1) {
-            console.log(`   ✅ Redemption successful! Gas used: ${receipt.gasUsed.toString()}`);
+            console.log(`   ✅ 赎回成功！使用的 Gas: ${receipt.gasUsed.toString()}`);
             return { success: true };
         } else {
-            console.log(`   ❌ Transaction failed`);
-            return { success: false, error: 'Transaction reverted' };
+            console.log(`   ❌ 交易失败`);
+            return { success: false, error: '交易回滚' };
         }
     } catch (error: any) {
         const errorMessage = error.message || String(error);
-        console.log(`   ❌ Redemption failed: ${errorMessage}`);
+        console.log(`   ❌ 赎回失败: ${errorMessage}`);
         return { success: false, error: errorMessage };
     }
 };
 
 const logPositionHeader = (position: Position, index: number, total: number) => {
-    const status = position.curPrice >= RESOLVED_HIGH ? '🎉 WIN' : '❌ LOSS';
+    const status = position.curPrice >= RESOLVED_HIGH ? '🎉 赢' : '❌ 输';
     console.log(
         `\n${index + 1}/${total} ▶ ${status} | ${position.title || position.slug || position.asset}`
     );
     if (position.outcome) {
-        console.log(`   Outcome: ${position.outcome}`);
+        console.log(`   结果: ${position.outcome}`);
     }
-    console.log(`   Size: ${position.size.toFixed(2)} tokens`);
-    console.log(`   Current price: $${position.curPrice.toFixed(4)}`);
-    console.log(`   Expected value: $${position.currentValue.toFixed(2)}`);
-    console.log(`   Redeemable: ${position.redeemable ? 'YES' : 'NO'}`);
+    console.log(`   持仓数量: ${position.size.toFixed(2)} 个代币`);
+    console.log(`   当前价格: $${position.curPrice.toFixed(4)}`);
+    console.log(`   预期价值: $${position.currentValue.toFixed(2)}`);
+    console.log(`   可赎回: ${position.redeemable ? '是' : '否'}`);
 };
 
 const main = async () => {
-    console.log('🚀 Redeeming resolved positions');
+    console.log('🚀 正在赎回已解决的仓位');
     console.log('════════════════════════════════════════════════════');
-    console.log(`Wallet: ${PROXY_WALLET}`);
-    console.log(`CTF Contract: ${CTF_CONTRACT_ADDRESS}`);
-    console.log(`Win threshold: price >= $${RESOLVED_HIGH}`);
-    console.log(`Loss threshold: price <= $${RESOLVED_LOW}`);
+    console.log(`钱包: ${PROXY_WALLET}`);
+    console.log(`CTF 合约: ${CTF_CONTRACT_ADDRESS}`);
+    console.log(`盈利阈值: 价格 >= $${RESOLVED_HIGH}`);
+    console.log(`亏损阈值: 价格 <= $${RESOLVED_LOW}`);
 
-    // Setup provider and signer
     const provider = new ethers.providers.JsonRpcProvider(RPC_URL);
     const wallet = new ethers.Wallet(PRIVATE_KEY, provider);
 
-    console.log(`\n✅ Connected to Polygon RPC`);
-    console.log(`Signer address: ${wallet.address}`);
+    console.log(`\n✅ 已连接到 Polygon RPC`);
+    console.log(`签名者地址: ${wallet.address}`);
 
-    // Check if signer is proxy wallet or owner
     if (wallet.address.toLowerCase() !== PROXY_WALLET.toLowerCase()) {
         console.log(
-            `⚠️  Note: Signer (${wallet.address}) differs from proxy wallet (${PROXY_WALLET})`
+            `⚠️  注意: 签名者 (${wallet.address}) 与代理钱包 (${PROXY_WALLET}) 不同`
         );
-        console.log(`   Make sure signer has permission to execute transactions on proxy wallet`);
+        console.log(`   请确保签名者有权限代表代理钱包执行交易`);
     }
 
-    // Create contract instance
     const ctfContract = new ethers.Contract(CTF_CONTRACT_ADDRESS, CTF_ABI, wallet);
 
-    // Load positions
     const allPositions = await loadPositions(PROXY_WALLET);
 
     if (allPositions.length === 0) {
-        console.log('\n🎉 No open positions detected for proxy wallet.');
+        console.log('\n🎉 代理钱包未检测到任何开仓。');
         return;
     }
 
-    // Filter for resolved and redeemable positions
     const redeemablePositions = allPositions.filter(
         (pos) =>
             (pos.curPrice >= RESOLVED_HIGH || pos.curPrice <= RESOLVED_LOW) &&
@@ -165,24 +158,23 @@ const main = async () => {
         (pos) => pos.curPrice > RESOLVED_LOW && pos.curPrice < RESOLVED_HIGH
     );
 
-    console.log(`\n📊 Position statistics:`);
-    console.log(`   Total positions: ${allPositions.length}`);
-    console.log(`   ✅ Resolved and redeemable: ${redeemablePositions.length}`);
-    console.log(`   ⏳ Active (not touching): ${activePositions.length}`);
+    console.log(`\n📊 仓位统计:`);
+    console.log(`   总仓位: ${allPositions.length}`);
+    console.log(`   ✅ 已解决可赎回: ${redeemablePositions.length}`);
+    console.log(`   ⏳ 活跃中 (无需处理): ${activePositions.length}`);
 
     if (redeemablePositions.length === 0) {
-        console.log('\n✅ No positions to redeem.');
+        console.log('\n✅ 没有需要赎回的仓位。');
         return;
     }
 
-    console.log(`\n🔄 Redeeming ${redeemablePositions.length} positions...`);
-    console.log(`⚠️  WARNING: Each redemption requires gas fees on Polygon`);
+    console.log(`\n🔄 正在赎回 ${redeemablePositions.length} 个仓位...`);
+    console.log(`⚠️  警告: 每次赎回都需要支付 Polygon 上的 Gas 费`);
 
     let successCount = 0;
     let failCount = 0;
     let totalValue = 0;
 
-    // Group positions by conditionId to avoid duplicate redemptions
     const positionsByCondition = new Map<string, Position[]>();
     redeemablePositions.forEach((pos) => {
         const existing = positionsByCondition.get(pos.conditionId) || [];
@@ -191,7 +183,7 @@ const main = async () => {
     });
 
     console.log(
-        `\n📦 Grouped into ${positionsByCondition.size} unique conditions`
+        `\n📦 已分为 ${positionsByCondition.size} 个独立条件组`
     );
 
     let conditionIndex = 0;
@@ -200,20 +192,18 @@ const main = async () => {
         const totalPositionValue = positions.reduce((sum, pos) => sum + pos.currentValue, 0);
 
         console.log(`\n${'='.repeat(60)}`);
-        console.log(`Condition ${conditionIndex}/${positionsByCondition.size}`);
-        console.log(`Condition ID: ${conditionId}`);
-        console.log(`Positions in this condition: ${positions.length}`);
-        console.log(`Total expected value: $${totalPositionValue.toFixed(2)}`);
+        console.log(`条件 ${conditionIndex}/${positionsByCondition.size}`);
+        console.log(`条件 ID: ${conditionId}`);
+        console.log(`此条件的仓位数量: ${positions.length}`);
+        console.log(`预期总价值: $${totalPositionValue.toFixed(2)}`);
 
-        // Show all positions for this condition
         positions.forEach((pos, idx) => {
             const status = pos.curPrice >= RESOLVED_HIGH ? '🎉' : '❌';
             console.log(
-                `   ${status} ${pos.title || pos.slug} | ${pos.outcome} | ${pos.size.toFixed(2)} tokens | $${pos.currentValue.toFixed(2)}`
+                `   ${status} ${pos.title || pos.slug} | ${pos.outcome} | ${pos.size.toFixed(2)} 个代币 | $${pos.currentValue.toFixed(2)}`
             );
         });
 
-        // Redeem once for this condition (redeems all positions)
         const result = await redeemPosition(ctfContract, positions[0]);
 
         if (result.success) {
@@ -223,25 +213,24 @@ const main = async () => {
             failCount++;
         }
 
-        // Small delay between transactions
         if (conditionIndex < positionsByCondition.size) {
-            console.log(`   ⏳ Waiting 2s before next transaction...`);
+            console.log(`   ⏳ 等待 2 秒后进行下一笔交易...`);
             await new Promise((resolve) => setTimeout(resolve, 2000));
         }
     }
 
     console.log('\n════════════════════════════════════════════════════');
-    console.log('✅ Summary of position redemption');
-    console.log(`Conditions processed: ${positionsByCondition.size}`);
-    console.log(`Successful redemptions: ${successCount}`);
-    console.log(`Failed: ${failCount}`);
-    console.log(`Expected value of redeemed positions: $${totalValue.toFixed(2)}`);
+    console.log('✅ 仓位赎回汇总');
+    console.log(`已处理条件数: ${positionsByCondition.size}`);
+    console.log(`成功赎回数: ${successCount}`);
+    console.log(`失败数: ${failCount}`);
+    console.log(`已赎回仓位的预期价值: $${totalValue.toFixed(2)}`);
     console.log('════════════════════════════════════════════════════\n');
 };
 
 main()
     .then(() => process.exit(0))
     .catch((error) => {
-        console.error('❌ Script aborted due to error:', error);
+        console.error('❌ 脚本因错误中止:', error);
         process.exit(1);
     });
