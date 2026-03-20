@@ -352,4 +352,11 @@ export const ENV = {
     MONGO_URI: process.env.MONGO_URI as string,
     RPC_URL: process.env.RPC_URL as string,
     USDC_CONTRACT_ADDRESS: process.env.USDC_CONTRACT_ADDRESS as string,
+    // Dry run (simulation) settings
+    DRY_INITIAL_BALANCE: parseFloat(process.env.DRY_INITIAL_BALANCE || '1000.0'),
+    DRY_HISTORY_HOURS: parseFloat(process.env.DRY_HISTORY_HOURS || '24'),
+    DRY_REPLAY_SPEED: parseFloat(process.env.DRY_REPLAY_SPEED || '1000'),
+    DRY_REALTIME: process.env.DRY_REALTIME === 'true',
+    // When true: load real positions from Polymarket as starting point; false: start fresh
+    DRY_START_FROM_REAL: process.env.DRY_START_FROM_REAL !== 'false',
 };

@@ -63,6 +63,7 @@ const activitySchema = new Schema({
     bot: { type: Boolean, required: false },
     botExcutedTime: { type: Number, required: false },
     myBoughtSize: { type: Number, required: false }, // Tracks actual tokens we bought
+    oppositeAsset: { type: String, required: false }, // The opposite outcome's asset ID (for reverse trading)
 });
 
 const getUserPositionModel = (walletAddress: string) => {

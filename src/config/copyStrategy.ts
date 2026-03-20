@@ -444,13 +444,15 @@ export function getTradeMultiplier(config: CopyStrategyConfig, traderOrderSize: 
 /**
  * Determine the actual trading side based on copy mode
  *
+ * REVERSE mode: Same direction as trader (trader BUY → you BUY, trader SELL → you SELL)
+ * FOLLOW mode: Same direction as trader (trader BUY → you BUY, trader SELL → you SELL)
+ *
  * @param traderSide - The trader's side ('BUY' or 'SELL')
- * @param copyMode - FOLLOW (same direction) or REVERSE (opposite direction)
+ * @param copyMode - FOLLOW (same direction) or REVERSE (same direction but opposite asset)
  * @returns The actual side to trade ('BUY' or 'SELL')
  */
 export function getActualSide(traderSide: string, copyMode: CopyMode): 'BUY' | 'SELL' {
-    if (copyMode === CopyMode.REVERSE) {
-        return traderSide === 'BUY' ? 'SELL' : 'BUY';
-    }
+    // Both FOLLOW and REVERSE use same direction
+    // REVERSE differs only in the asset (oppositeAsset instead of asset)
     return traderSide as 'BUY' | 'SELL';
 }

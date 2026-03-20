@@ -154,11 +154,12 @@ const doTrading = async (clobClient: ClobClient, trades: TradeWithUser[]) => {
         const actualSide = getActualSide(trade.side || 'BUY', ENV.COPY_STRATEGY_CONFIG.copyMode);
 
         if (ENV.COPY_STRATEGY_CONFIG.copyMode === CopyMode.REVERSE) {
-            Logger.info(`🔄 反买模式: 交易员 ${trade.side} → 跟单 ${actualSide}`);
+            const ourAsset = trade.oppositeAsset || trade.asset;
+            Logger.info(`🔄 反买模式: 交易员 ${trade.side} ${trade.asset.slice(0, 12)}... → 我 ${actualSide} ${ourAsset.slice(0, 12)}...`);
         }
 
         Logger.trade(trade.userAddress, actualSide, {
-            asset: trade.asset,
+            asset: trade.asset, // Always use the same asset
             side: trade.side,
             amount: trade.usdcSize,
             price: trade.price,
@@ -173,9 +174,17 @@ const doTrading = async (clobClient: ClobClient, trades: TradeWithUser[]) => {
         const user_positions: UserPositionInterface[] = await fetchData(
             `https://data-api.polymarket.com/positions?user=${trade.userAddress}`
         );
-        const my_position = my_positions.find(
-            (position: UserPositionInterface) => position.conditionId === trade.conditionId
-        );
+
+        // In REVERSE mode, find position on opposite side (we hold opposite tokens to trader)
+        // In FOLLOW mode, find position on same side as trader
+        let my_position = my_positions.find((position: UserPositionInterface) => {
+            if (ENV.COPY_STRATEGY_CONFIG.copyMode === CopyMode.REVERSE) {
+                // REVERSE: match oppositeAsset to our position asset
+                return position.conditionId === trade.conditionId && position.asset === trade.oppositeAsset;
+            }
+            // FOLLOW: match same asset as trader
+            return position.conditionId === trade.conditionId && position.asset === trade.asset;
+        });
         const user_position = user_positions.find(
             (position: UserPositionInterface) => position.conditionId === trade.conditionId
         );
@@ -245,9 +254,17 @@ const doAggregatedTrading = async (clobClient: ClobClient, aggregatedTrades: Agg
         const user_positions: UserPositionInterface[] = await fetchData(
             `https://data-api.polymarket.com/positions?user=${agg.userAddress}`
         );
-        const my_position = my_positions.find(
-            (position: UserPositionInterface) => position.conditionId === agg.conditionId
-        );
+
+        // In REVERSE mode, find position on opposite side (we hold opposite tokens to trader)
+        // In FOLLOW mode, find position on same side as trader
+        let my_position = my_positions.find((position: UserPositionInterface) => {
+            if (ENV.COPY_STRATEGY_CONFIG.copyMode === CopyMode.REVERSE) {
+                // REVERSE: match oppositeAsset to our position asset
+                return position.conditionId === agg.conditionId && position.asset === agg.trades[0].oppositeAsset;
+            }
+            // FOLLOW: match same asset as trader
+            return position.conditionId === agg.conditionId && position.asset === agg.asset;
+        });
         const user_position = user_positions.find(
             (position: UserPositionInterface) => position.conditionId === agg.conditionId
         );
@@ -281,7 +298,8 @@ const doAggregatedTrading = async (clobClient: ClobClient, aggregatedTrades: Agg
         };
 
         if (ENV.COPY_STRATEGY_CONFIG.copyMode === CopyMode.REVERSE) {
-            Logger.info(`🔄 反买模式: 交易员 ${agg.side} → 跟单 ${actualSide}`);
+            const ourAsset = (agg.trades[0].oppositeAsset || agg.asset).slice(0, 12);
+            Logger.info(`🔄 反买模式: 交易员 ${agg.side} ${agg.asset.slice(0, 12)}... → 我 ${actualSide} ${ourAsset}...`);
         }
 
         // Execute the aggregated trade

@@ -3,6 +3,150 @@ import { getUserActivityModel, getUserPositionModel } from '../models/userHistor
 import fetchData from '../utils/fetchData';
 import Logger from '../utils/logger';
 
+/**
+ * Fetch the opposite asset ID for a given conditionId and current asset.
+ * Uses Gamma API (https://gamma-api.polymarket.com) for market data.
+ */
+const fetchOppositeAsset = async (conditionId: string, currentAsset: string): Promise<string> => {
+    Logger.info(`正在获取反向代币: conditionId=${conditionId.slice(0, 16)}..., asset=${currentAsset.slice(0, 20)}...`);
+
+    // Helper function to search for opposite in a market
+    const findOppositeInMarket = (market: any): string | null => {
+        // Gamma API 字段是 clobTokenIds，是一个 JSON 字符串数组
+        if (market.clobTokenIds) {
+            try {
+                const tokenIds: string[] = JSON.parse(market.clobTokenIds);
+                if (tokenIds.length >= 2) {
+                    const opposite = tokenIds.find((id: string) => id !== currentAsset);
+                    if (opposite) {
+                        return opposite;
+                    }
+                }
+            } catch {
+                // 解析失败
+            }
+        }
+
+        // 尝试 outcomeAssets
+        if (Array.isArray(market.outcomeAssets) && market.outcomeAssets.length >= 2) {
+            const opposite = market.outcomeAssets.find((a: string) => a !== currentAsset);
+            if (opposite) {
+                return opposite;
+            }
+        }
+
+        return null;
+    };
+
+    // Method 1: 先尝试按 condition_id 查询，如果返回空或错误市场，再尝试其他方法
+    let foundOpposite: string | null = null;
+
+    try {
+        const response = await fetchData(
+            `https://gamma-api.polymarket.com/markets?condition_id=${conditionId}`
+        );
+
+        if (response && typeof response === 'object') {
+            const markets = Array.isArray(response) ? response : (response.markets || response.data || []);
+
+            if (markets.length > 0) {
+                // 检查第一个市场是否匹配
+                const firstMarket = markets[0];
+                if (firstMarket.conditionId === conditionId) {
+                    Logger.info(`   找到匹配市场: ${(firstMarket.question || '').slice(0, 50)}...`);
+                    foundOpposite = findOppositeInMarket(firstMarket);
+                    if (foundOpposite) {
+                        Logger.info(`✅ Gamma API (condition_id) 找到反向代币: ${foundOpposite.slice(0, 20)}...`);
+                        return foundOpposite;
+                    }
+                }
+            }
+        }
+    } catch (error) {
+        Logger.warning(`Gamma API condition_id 查询失败: ${error}`);
+    }
+
+    // Method 2: 使用 orderbook 获取 condition_id，再查询 Gamma API
+    try {
+        const orderbookResponse = await fetchData(
+            `https://clob.polymarket.com/book?token_id=${currentAsset}`
+        );
+
+        if (orderbookResponse && typeof orderbookResponse === 'object') {
+            const marketConditionId = (orderbookResponse as any).market;
+            if (marketConditionId) {
+                Logger.info(`   orderbook 返回 condition_id: ${marketConditionId.slice(0, 20)}...`);
+
+                const response = await fetchData(
+                    `https://gamma-api.polymarket.com/markets?condition_id=${marketConditionId}`
+                );
+
+                if (response && typeof response === 'object') {
+                    const markets = Array.isArray(response) ? response : (response.markets || response.data || []);
+
+                    for (const market of markets) {
+                        foundOpposite = findOppositeInMarket(market);
+                        if (foundOpposite) {
+                            Logger.info(`✅ orderbook + Gamma API 找到反向代币: ${foundOpposite.slice(0, 20)}...`);
+                            return foundOpposite;
+                        }
+                    }
+                }
+            }
+        }
+    } catch (error) {
+        Logger.warning(`CLOB orderbook 查询失败: ${error}`);
+    }
+
+    // Method 3: 遍历市场列表查找包含当前 asset 的市场
+    // 分批获取活跃市场
+    try {
+        const pageSize = 100;
+        let offset = 0;
+        let found = false;
+
+        while (!found) {
+            const response = await fetchData(
+                `https://gamma-api.polymarket.com/markets?active=true&closed=false&limit=${pageSize}&offset=${offset}`
+            );
+
+            if (response && typeof response === 'object') {
+                const markets = Array.isArray(response) ? response : (response.markets || response.data || []);
+
+                if (markets.length === 0) {
+                    break; // 没有更多市场
+                }
+
+                for (const market of markets) {
+                    // 检查这个市场是否包含我们的 conditionId 或者包含我们的 asset
+                    if (market.conditionId === conditionId) {
+                        Logger.info(`   遍历找到匹配市场: ${(market.question || '').slice(0, 50)}...`);
+                        foundOpposite = findOppositeInMarket(market);
+                        if (foundOpposite) {
+                            Logger.info(`✅ 遍历市场列表找到反向代币: ${foundOpposite.slice(0, 20)}...`);
+                            return foundOpposite;
+                        }
+                    }
+                }
+
+                offset += pageSize;
+
+                // 防止无限循环，最多查询 500 个市场
+                if (offset > 500) {
+                    break;
+                }
+            } else {
+                break;
+            }
+        }
+    } catch (error) {
+        Logger.warning(`遍历市场列表失败: ${error}`);
+    }
+
+    Logger.warning(`❌ 无法获取反向代币 for ${conditionId.slice(0, 16)}...`);
+    return '';
+};
+
 const USER_ADDRESSES = ENV.USER_ADDRESSES;
 const FETCH_INTERVAL = ENV.FETCH_INTERVAL;
 
@@ -110,6 +254,42 @@ const init = async () => {
 const fetchTradeData = async () => {
     for (const { address, UserActivity, UserPosition } of userModels) {
         try {
+            // Build cache for reverse trading:
+            // key: `${conditionId}:${asset}` -> oppositeAsset
+            // This must be asset-specific (YES/NO share the same conditionId).
+            const oppositeAssetCache: Record<string, string> = {};
+            const cacheKey = (conditionId: string, asset: string): string => `${conditionId}:${asset}`;
+
+            // Fetch trader's positions
+            const traderPositionsUrl = `https://data-api.polymarket.com/positions?user=${address}`;
+            const traderPositions = await fetchData(traderPositionsUrl);
+            if (Array.isArray(traderPositions)) {
+                for (const pos of traderPositions) {
+                    if (pos.conditionId && pos.asset && pos.oppositeAsset && pos.oppositeAsset !== pos.asset) {
+                        oppositeAssetCache[cacheKey(pos.conditionId, pos.asset)] = pos.oppositeAsset;
+                    }
+                }
+            }
+
+            // Also fetch our proxy wallet's positions (they have opposite assets)
+            try {
+                const myPositionsUrl = `https://data-api.polymarket.com/positions?user=${ENV.PROXY_WALLET}`;
+                const myPositions = await fetchData(myPositionsUrl);
+                if (Array.isArray(myPositions)) {
+                    for (const pos of myPositions) {
+                        if (pos.conditionId && pos.asset && pos.oppositeAsset) {
+                            // pos.oppositeAsset is the opposite outcome's token id
+                            const key = cacheKey(pos.conditionId, pos.asset);
+                            if (!oppositeAssetCache[key]) {
+                                oppositeAssetCache[key] = pos.oppositeAsset;
+                            }
+                        }
+                    }
+                }
+            } catch {
+                // Ignore errors from our own positions fetch
+            }
+
             // Fetch trade activities from Polymarket API
             const apiUrl = `https://data-api.polymarket.com/activity?user=${address}&type=TRADE`;
             const activities = await fetchData(apiUrl);
@@ -148,6 +328,12 @@ const fetchTradeData = async () => {
                     asset: activity.asset,
                     side: activity.side,
                     outcomeIndex: activity.outcomeIndex,
+                    oppositeAsset:
+                        activity.oppositeAsset ||
+                        (activity.conditionId && activity.asset
+                            ? oppositeAssetCache[cacheKey(activity.conditionId, activity.asset)]
+                            : undefined) ||
+                        (await fetchOppositeAsset(activity.conditionId, activity.asset)),
                     title: activity.title,
                     slug: activity.slug,
                     icon: activity.icon,
@@ -167,11 +353,11 @@ const fetchTradeData = async () => {
             }
 
             // Also fetch and update positions
-            const positionsUrl = `https://data-api.polymarket.com/positions?user=${address}`;
-            const positions = await fetchData(positionsUrl);
+            const positionsUpdateUrl = `https://data-api.polymarket.com/positions?user=${address}`;
+            const positionsUpdate = await fetchData(positionsUpdateUrl);
 
-            if (Array.isArray(positions) && positions.length > 0) {
-                for (const position of positions) {
+            if (Array.isArray(positionsUpdate) && positionsUpdate.length > 0) {
+                for (const position of positionsUpdate) {
                     // Update or create position
                     await UserPosition.findOneAndUpdate(
                         { asset: position.asset, conditionId: position.conditionId },

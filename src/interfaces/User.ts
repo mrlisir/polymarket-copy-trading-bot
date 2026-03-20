@@ -26,6 +26,7 @@ export interface UserActivityInterface {
     bot: boolean;
     botExcutedTime: number;
     myBoughtSize?: number; // Tracks actual tokens we bought
+    oppositeAsset?: string; // The opposite outcome's asset ID (for reverse trading)
 }
 
 export interface UserPositionInterface {

@@ -3,7 +3,7 @@ import { ENV } from '../config/env';
 import { UserActivityInterface, UserPositionInterface } from '../interfaces/User';
 import { getUserActivityModel } from '../models/userHistory';
 import Logger from './logger';
-import { calculateOrderSize, getTradeMultiplier } from '../config/copyStrategy';
+import { calculateOrderSize, getTradeMultiplier, CopyMode } from '../config/copyStrategy';
 
 const RETRY_LIMIT = ENV.RETRY_LIMIT;
 const COPY_STRATEGY_CONFIG = ENV.COPY_STRATEGY_CONFIG;
@@ -15,6 +15,26 @@ const COPY_PERCENTAGE = ENV.COPY_PERCENTAGE;
 // Polymarket minimum order sizes
 const MIN_ORDER_SIZE_USD = 1.0; // Minimum order size in USD for BUY orders
 const MIN_ORDER_SIZE_TOKENS = 1.0; // Minimum order size in tokens for SELL/MERGE orders
+
+// Check if reverse mode is enabled
+const isReverseMode = (): boolean => COPY_STRATEGY_CONFIG.copyMode === CopyMode.REVERSE;
+
+// Get the correct position to check for reverse trading
+// In reverse mode, we trade the OPPOSITE asset as the trader
+// - Trader BUY YES → we BUY NO (oppositeAsset)
+// - Trader SELL YES → we SELL NO (oppositeAsset)
+const getPositionAsset = (trade: UserActivityInterface): string => {
+    if (isReverseMode()) {
+        if (trade.oppositeAsset) {
+            Logger.info(`🔄 反买模式: 交易员交易 ${trade.asset} → 我反向交易 ${trade.oppositeAsset}`);
+            return trade.oppositeAsset;
+        } else {
+            Logger.warning(`⚠️  反买模式缺少反向代币 (oppositeAsset)，将使用相同代币 ${trade.asset}`);
+            return trade.asset;
+        }
+    }
+    return trade.asset;
+};
 
 const extractOrderError = (response: unknown): string | undefined => {
     if (!response) {
@@ -184,7 +204,19 @@ const postOrder = async (
         return totalMergedUsdc;
     } else if (condition === 'buy') {
         //Buy strategy
-        Logger.info('正在执行买入策略...');
+        // In REVERSE mode, 'buy' means trader sold → we buy opposite side
+        const tradeAsset = getPositionAsset(trade);
+        if (isReverseMode()) {
+            Logger.info(`🔄 反买模式: 交易员 ${trade.side} → 我买入反向资产 ${tradeAsset}`);
+            Logger.info(`   原始订单: ${trade.side} $${trade.usdcSize.toFixed(2)} @ $${trade.price}`);
+        }
+        // Safety: in REVERSE mode we must buy the OPPOSITE token.
+        // If oppositeAsset is missing/invalid, do not fall back to the same asset.
+        if (isReverseMode() && (!trade.oppositeAsset || trade.oppositeAsset === trade.asset)) {
+            Logger.warning('⚠️ 反买模式缺少有效 oppositeAsset（或与原 asset 相同），本笔跳过，避免执行成跟随单');
+            await UserActivity.updateOne({ _id: trade._id }, { bot: true });
+            return 0;
+        }
 
         Logger.info(`您的余额: $${my_balance.toFixed(2)}`);
         Logger.info(`交易员买入: $${trade.usdcSize.toFixed(2)}`);
@@ -246,7 +278,7 @@ const postOrder = async (
         while (remaining > 0 && retry < RETRY_LIMIT) {
             let orderBook;
             try {
-                orderBook = await clobClient.getOrderBook(trade.asset);
+                orderBook = await clobClient.getOrderBook(tradeAsset);
             } catch (orderBookError: unknown) {
                 const axiosError = orderBookError as any;
                 const status = axiosError?.response?.status;
@@ -299,7 +331,7 @@ const postOrder = async (
 
             const order_arges = {
                 side: Side.BUY,
-                tokenID: trade.asset,
+                tokenID: tradeAsset,
                 amount: orderSize,
                 price: parseFloat(minPriceAsk.price),
             };
@@ -367,6 +399,7 @@ const postOrder = async (
         return totalSpentUsdc;
     } else if (condition === 'sell') {
         //Sell strategy
+        // In REVERSE mode, 'sell' means trader bought → we sell our opposite position
         Logger.info('正在执行卖出策略...');
         let remaining = 0;
         if (!my_position) {
@@ -375,9 +408,22 @@ const postOrder = async (
             return 0;
         }
 
+        // Determine which asset we're selling
+        // In REVERSE mode: we sell oppositeAsset (we hold the opposite tokens)
+        // In FOLLOW mode: we sell the same asset as trader
+        const sellAsset = isReverseMode() ? (trade.oppositeAsset || trade.asset) : trade.asset;
+        // Safety: in REVERSE mode we must sell the OPPOSITE token.
+        if (isReverseMode() && (!trade.oppositeAsset || trade.oppositeAsset === trade.asset)) {
+            Logger.warning('⚠️ 反买模式缺少有效 oppositeAsset（或与原 asset 相同），本笔跳过，避免执行成跟随单');
+            await UserActivity.updateOne({ _id: trade._id }, { bot: true });
+            return 0;
+        }
+
         // Get all previous BUY trades for this asset to calculate total bought
+        // In REVERSE mode: query by sellAsset (the opposite token we bought)
+        // In FOLLOW mode: query by trade.asset (the same token as trader)
         const previousBuys = await UserActivity.find({
-            asset: trade.asset,
+            asset: sellAsset,
             conditionId: trade.conditionId,
             side: 'BUY',
             bot: true,
@@ -465,7 +511,9 @@ const postOrder = async (
         while (remaining > 0 && retry < RETRY_LIMIT) {
             let orderBook;
             try {
-                orderBook = await clobClient.getOrderBook(trade.asset);
+                // In REVERSE mode, sellAsset is the opposite token — fetch its orderbook
+                // In FOLLOW mode, sellAsset === trade.asset so this is equivalent
+                orderBook = await clobClient.getOrderBook(sellAsset);
             } catch (orderBookError: unknown) {
                 const axiosError = orderBookError as any;
                 const status = axiosError?.response?.status;
@@ -511,7 +559,7 @@ const postOrder = async (
 
             const order_arges = {
                 side: Side.SELL,
-                tokenID: trade.asset,
+                tokenID: sellAsset,
                 amount: sellAmount,
                 price: parseFloat(maxPriceBid.price),
             };
@@ -554,7 +602,7 @@ const postOrder = async (
                 // Sold essentially all tracked tokens - clear tracking
                 await UserActivity.updateMany(
                     {
-                        asset: trade.asset,
+                        asset: sellAsset,
                         conditionId: trade.conditionId,
                         side: 'BUY',
                         bot: true,
