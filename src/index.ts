@@ -82,7 +82,7 @@ export const main = async () => {
         };
         
         console.log(`\n${colors.yellow}💡 首次运行机器人？${colors.reset}`);
-        console.log(`   阅读指南: ${colors.cyan}GETTING_STARTED.md${colors.reset}`);
+        console.log(`   阅读指南: ${colors.cyan}docs/入门指南.md${colors.reset}`);
         console.log(`   运行健康检查: ${colors.cyan}npm run health-check${colors.reset}\n`);
 
         await connectDB();

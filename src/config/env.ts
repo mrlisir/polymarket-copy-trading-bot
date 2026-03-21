@@ -37,7 +37,7 @@ const validateRequiredEnv = (): void => {
         console.error('🔧 快速修复:');
         console.error('   1. 运行设置向导: npm run setup');
         console.error('   2. 或手动创建 .env 文件并填写所有必需变量\n');
-        console.error('📖 详细说明请参阅: docs/QUICK_START.md\n');
+        console.error('📖 详细说明请参阅: docs/快速开始.md\n');
         throw new Error(
             `缺少必需的环境变量: ${missing.join(', ')}`
         );
@@ -354,6 +354,9 @@ export const ENV = {
     HTTP_PROXY_ENABLED: process.env.HTTP_PROXY_ENABLED === 'true',
     HTTP_PROXY_HOST: (process.env.HTTP_PROXY_HOST || '127.0.0.1').trim(),
     HTTP_PROXY_PORT: parseInt(process.env.HTTP_PROXY_PORT || '7890', 10),
+    // When true, keep RPC direct by adding RPC host into NO_PROXY.
+    // Set false if your network requires RPC requests through HTTP proxy.
+    HTTP_PROXY_BYPASS_RPC: process.env.HTTP_PROXY_BYPASS_RPC !== 'false',
     // Trade aggregation settings
     TRADE_AGGREGATION_ENABLED: process.env.TRADE_AGGREGATION_ENABLED === 'true',
     TRADE_AGGREGATION_WINDOW_SECONDS: parseInt(
@@ -449,6 +452,14 @@ export const ENV = {
     EMAIL_SMTP_PASS: (process.env.EMAIL_SMTP_PASS || '').trim(),
     EMAIL_FROM: (process.env.EMAIL_FROM || '').trim(),
     EMAIL_NOTIFY_TO: (process.env.EMAIL_NOTIFY_TO || '').trim(),
+    /**
+     * HTTP 邮件兜底（仅 Resend）：
+     * SMTP 失败时可自动走 HTTPS API，适合代理/公司网络环境。
+     */
+    EMAIL_HTTP_FALLBACK_ENABLED: process.env.EMAIL_HTTP_FALLBACK_ENABLED === 'true',
+    EMAIL_HTTP_PROVIDER: (process.env.EMAIL_HTTP_PROVIDER || 'AUTO').trim().toUpperCase(), // AUTO / RESEND
+    EMAIL_HTTP_FROM: (process.env.EMAIL_HTTP_FROM || '').trim(),
+    RESEND_API_KEY: (process.env.RESEND_API_KEY || '').trim(),
 
     /**
      * Polymarket Builder API（可选）：用于 CLOB 下单时附加 Builder 认证头，计入 Builder 量与排行榜。
@@ -464,4 +475,25 @@ if (ENV.HTTP_PROXY_ENABLED && ENV.HTTP_PROXY_HOST) {
     const proxyUrl = `http://${ENV.HTTP_PROXY_HOST}:${ENV.HTTP_PROXY_PORT}`;
     process.env.HTTP_PROXY = proxyUrl;
     process.env.HTTPS_PROXY = proxyUrl;
+
+    if (ENV.HTTP_PROXY_BYPASS_RPC) {
+        // Keep RPC traffic direct when proxy is enabled.
+        try {
+            const rpcHost = new URL(ENV.RPC_URL).hostname;
+            const noProxySet = new Set(
+                (process.env.NO_PROXY || process.env.no_proxy || '')
+                    .split(',')
+                    .map((item) => item.trim())
+                    .filter(Boolean)
+            );
+            noProxySet.add('localhost');
+            noProxySet.add('127.0.0.1');
+            noProxySet.add(rpcHost);
+            const noProxy = Array.from(noProxySet).join(',');
+            process.env.NO_PROXY = noProxy;
+            process.env.no_proxy = noProxy;
+        } catch {
+            // Ignore malformed RPC_URL here; URL validity is validated above.
+        }
+    }
 }

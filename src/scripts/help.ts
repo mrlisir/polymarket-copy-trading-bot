@@ -23,6 +23,7 @@ console.log(`${colors.reset}\n`);
 console.log(`${colors.yellow}${colors.bright}📖 GETTING STARTED${colors.reset}\n`);
 console.log(`  ${colors.green}npm run setup${colors.reset}          Interactive configuration wizard`);
 console.log(`  ${colors.green}npm run health-check${colors.reset}   Verify everything is working`);
+console.log(`  ${colors.green}npm run email-test${colors.reset}     Send a SMTP test email`);
 console.log(`  ${colors.green}npm run build${colors.reset}          Compile TypeScript to JavaScript`);
 console.log(`  ${colors.green}npm start${colors.reset}              Start the trading bot`);
 console.log(`  ${colors.green}npm run dev${colors.reset}            Run in development mode`);
@@ -71,10 +72,10 @@ console.log(`  ${colors.green}npm run aggregate${colors.reset}         Aggregate
 console.log('');
 
 console.log(`${colors.yellow}${colors.bright}📚 DOCUMENTATION${colors.reset}\n`);
-console.log(`  ${colors.cyan}GETTING_STARTED.md${colors.reset}        Complete beginner's guide`);
-console.log(`  ${colors.cyan}README.md${colors.reset}                 Full documentation`);
-console.log(`  ${colors.cyan}docs/QUICK_START.md${colors.reset}       5-minute quick start`);
-console.log(`  ${colors.cyan}docs/MULTI_TRADER_GUIDE.md${colors.reset}  Copy multiple traders`);
+console.log(`  ${colors.cyan}docs/入门指南.md${colors.reset}          Complete beginner's guide`);
+console.log(`  ${colors.cyan}项目说明.md${colors.reset}               Full documentation`);
+console.log(`  ${colors.cyan}docs/快速开始.md${colors.reset}          5-minute quick start`);
+console.log(`  ${colors.cyan}docs/多交易员指南.md${colors.reset}      Copy multiple traders`);
 console.log('');
 
 console.log(`${colors.blue}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${colors.reset}\n`);

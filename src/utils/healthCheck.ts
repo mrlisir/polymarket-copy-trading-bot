@@ -1,4 +1,5 @@
 import mongoose from 'mongoose';
+import axios from 'axios';
 import { ENV } from '../config/env';
 import getMyBalance from './getMyBalance';
 import fetchData from './fetchData';
@@ -51,21 +52,24 @@ export const performHealthCheck = async (): Promise<HealthCheckResult> => {
 
     // Check RPC endpoint
     try {
-        const response = await fetch(ENV.RPC_URL, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
+        const response = await axios.post(
+            ENV.RPC_URL,
+            {
                 jsonrpc: '2.0',
                 method: 'eth_blockNumber',
                 params: [],
                 id: 1,
-            }),
-            signal: AbortSignal.timeout(5000), // 5 second timeout
-        });
+            },
+            {
+                timeout: 5000, // 5 second timeout
+                proxy: false, // RPC should bypass proxy
+                headers: { 'Content-Type': 'application/json' },
+            }
+        );
 
-        if (response.ok) {
-            const data = await response.json();
-            if (data.result) {
+        if (response.status >= 200 && response.status < 300) {
+            const data = response.data;
+            if (data?.result) {
                 checks.rpc = { status: 'ok', message: 'RPC endpoint responding' };
             } else {
                 checks.rpc = { status: 'error', message: 'Invalid RPC response' };

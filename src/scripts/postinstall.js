@@ -28,7 +28,7 @@ console.log(`   2. ${colors.green}npm run health-check${colors.reset}          #
 console.log(`   3. ${colors.green}npm start${colors.reset}              # Start trading!\n`);
 
 console.log(`${colors.yellow}📖 First time user?${colors.reset}`);
-console.log(`   Read: ${colors.cyan}GETTING_STARTED.md${colors.reset} for complete guide\n`);
+console.log(`   Read: ${colors.cyan}docs/入门指南.md${colors.reset} for complete guide\n`);
 
 console.log(`${colors.yellow}❓ Need help?${colors.reset}`);
 console.log(`   Run: ${colors.green}npm run help${colors.reset} to see all available commands\n`);
