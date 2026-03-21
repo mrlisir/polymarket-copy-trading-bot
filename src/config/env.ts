@@ -114,6 +114,13 @@ const validateNumericConfig = (): void => {
             `Invalid NETWORK_RETRY_LIMIT: ${process.env.NETWORK_RETRY_LIMIT}. Must be between 1 and 10.`
         );
     }
+
+    const httpProxyPort = parseInt(process.env.HTTP_PROXY_PORT || '7890', 10);
+    if (isNaN(httpProxyPort) || httpProxyPort <= 0 || httpProxyPort > 65535) {
+        throw new Error(
+            `Invalid HTTP_PROXY_PORT: ${process.env.HTTP_PROXY_PORT}. Must be between 1 and 65535.`
+        );
+    }
 };
 
 /**
@@ -343,6 +350,10 @@ export const ENV = {
     // Network settings
     REQUEST_TIMEOUT_MS: parseInt(process.env.REQUEST_TIMEOUT_MS || '10000', 10),
     NETWORK_RETRY_LIMIT: parseInt(process.env.NETWORK_RETRY_LIMIT || '3', 10),
+    // Optional HTTP proxy for outbound API requests
+    HTTP_PROXY_ENABLED: process.env.HTTP_PROXY_ENABLED === 'true',
+    HTTP_PROXY_HOST: (process.env.HTTP_PROXY_HOST || '127.0.0.1').trim(),
+    HTTP_PROXY_PORT: parseInt(process.env.HTTP_PROXY_PORT || '7890', 10),
     // Trade aggregation settings
     TRADE_AGGREGATION_ENABLED: process.env.TRADE_AGGREGATION_ENABLED === 'true',
     TRADE_AGGREGATION_WINDOW_SECONDS: parseInt(
@@ -359,4 +370,98 @@ export const ENV = {
     DRY_REALTIME: process.env.DRY_REALTIME === 'true',
     // When true: load real positions from Polymarket as starting point; false: start fresh
     DRY_START_FROM_REAL: process.env.DRY_START_FROM_REAL !== 'false',
+    // In dry-run mode, cap how many pending trades to process per loop
+    // to avoid console flooding on startup when Mongo already has many bot-claimed trades.
+    DRY_MAX_TRADES_PER_RUN: parseInt(process.env.DRY_MAX_TRADES_PER_RUN || '20', 10),
+
+    // Orderbook caching (to reduce API load and 404 spam)
+    ORDERBOOK_CACHE_TTL_MS: parseInt(process.env.ORDERBOOK_CACHE_TTL_MS || '30000', 10),
+    ORDERBOOK_CACHE_MAX_ENTRIES: parseInt(process.env.ORDERBOOK_CACHE_MAX_ENTRIES || '500', 10),
+    ORDERBOOK_MISSING_LOG_THROTTLE_MS: parseInt(
+        process.env.ORDERBOOK_MISSING_LOG_THROTTLE_MS || '60000',
+        10
+    ),
+
+    // Price guard for BUY side (avoid buying too far away from the trader's price)
+    ORDER_PRICE_SLIPPAGE_USD: parseFloat(process.env.ORDER_PRICE_SLIPPAGE_USD || '0.05'),
+
+    // curPrice cache (Polymarket positions API) — used for dryrun + optional live portfolio log
+    CUR_PRICE_CACHE_TTL_MS: parseInt(process.env.CUR_PRICE_CACHE_TTL_MS || '15000', 10),
+
+    /** Data API positions?user= 共享缓存 TTL（tradeMonitor / 对账 / curPrice 等多处复用） */
+    DATA_API_POSITIONS_CACHE_TTL_MS: parseInt(process.env.DATA_API_POSITIONS_CACHE_TTL_MS || '10000', 10),
+
+    /** CLOB /midpoint、/last-trade-price 缓存 TTL（估值优先于整本 orderbook） */
+    CLOB_LIGHT_PRICE_CACHE_TTL_MS: parseInt(process.env.CLOB_LIGHT_PRICE_CACHE_TTL_MS || '15000', 10),
+
+    /**
+     * positions curPrice 与 CLOB 订单簿 mid 差值超过此阈值（美元概率价 0~1）时，用 mid 估值。
+     * dry run 与实盘 getProxyPortfolioMarkUsd(clob) 共用。
+     */
+    MARK_CUR_VS_BOOK_DIVERGENCE: parseFloat(process.env.MARK_CUR_VS_BOOK_DIVERGENCE || '0.12'),
+
+    // Dry run: print simulated positions snapshot periodically (0 = disable)
+    DRY_POSITIONS_SNAPSHOT_INTERVAL_MS: parseInt(
+        process.env.DRY_POSITIONS_SNAPSHOT_INTERVAL_MS || '30000',
+        10
+    ),
+
+    // Live: log proxy portfolio mark (sum size*curPrice) after trades, min interval ms (0 = off)
+    LIVE_PORTFOLIO_CURPRICE_LOG_INTERVAL_MS: parseInt(
+        process.env.LIVE_PORTFOLIO_CURPRICE_LOG_INTERVAL_MS || '0',
+        10
+    ),
+
+    /**
+     * 防止同一市场两头买的风控模式：
+     * - GLOBAL: 只要该 condition 已持有另一侧，就跳过新的 opposite BUY（默认）
+     * - TRADER_ONLY: 仅当「同一交易员」对应的另一侧仍有已跟单仓位时才跳过
+     * - OFF: 关闭此风控
+     */
+    COPY_DOUBLE_SIDE_GUARD_MODE: (
+        process.env.COPY_DOUBLE_SIDE_GUARD_MODE || 'GLOBAL'
+    ).trim().toUpperCase(),
+
+    /**
+     * 仓位对账周期（毫秒，0=关闭）。实盘（npm start / dev）与模拟（npm run dryrun）共用同一套变量。
+     */
+    POSITION_RECONCILE_INTERVAL_MS: parseInt(process.env.POSITION_RECONCILE_INTERVAL_MS || '0', 10),
+    POSITION_RECONCILE_MAX_PER_RUN: parseInt(process.env.POSITION_RECONCILE_MAX_PER_RUN || '5', 10),
+    POSITION_RECONCILE_COOLDOWN_MS: parseInt(process.env.POSITION_RECONCILE_COOLDOWN_MS || '120000', 10),
+    /** When false, do not auto-sell because trader flat (only resolved path may run). */
+    POSITION_RECONCILE_ON_TRADER_EXIT: process.env.POSITION_RECONCILE_ON_TRADER_EXIT !== 'false',
+    /** When false, do not auto-sell on resolved/ redeemable / curPrice ~0/1. */
+    POSITION_RECONCILE_ON_RESOLVED: process.env.POSITION_RECONCILE_ON_RESOLVED !== 'false',
+    /** If true, after CLOB sell attempt, call on-chain redeemPositions for redeemable conditions (Polygon gas). */
+    POSITION_RECONCILE_AUTO_REDEEM: process.env.POSITION_RECONCILE_AUTO_REDEEM === 'true',
+
+    /**
+     * 邮件通知（QQ 邮箱 SMTP）：
+     * - EMAIL_NOTIFY_ENABLED=true 时启用
+     * - 推荐 QQ SMTP: smtp.qq.com:465 (secure=true)
+     * - EMAIL_SMTP_PASS 填 QQ 邮箱「授权码」，不是登录密码
+     */
+    EMAIL_NOTIFY_ENABLED: process.env.EMAIL_NOTIFY_ENABLED === 'true',
+    EMAIL_SMTP_HOST: (process.env.EMAIL_SMTP_HOST || 'smtp.qq.com').trim(),
+    EMAIL_SMTP_PORT: parseInt(process.env.EMAIL_SMTP_PORT || '465', 10),
+    EMAIL_SMTP_SECURE: process.env.EMAIL_SMTP_SECURE !== 'false',
+    EMAIL_SMTP_USER: (process.env.EMAIL_SMTP_USER || '').trim(),
+    EMAIL_SMTP_PASS: (process.env.EMAIL_SMTP_PASS || '').trim(),
+    EMAIL_FROM: (process.env.EMAIL_FROM || '').trim(),
+    EMAIL_NOTIFY_TO: (process.env.EMAIL_NOTIFY_TO || '').trim(),
+
+    /**
+     * Polymarket Builder API（可选）：用于 CLOB 下单时附加 Builder 认证头，计入 Builder 量与排行榜。
+     * 与 Relayer 文档中的 Builder 头一致，见 https://docs.polymarket.com/api-reference/relayer/submit-a-transaction
+     * 切勿提交到 git；泄露请立即在 polymarket.com/settings?tab=builder 轮换密钥。
+     */
+    POLY_BUILDER_API_KEY: (process.env.POLY_BUILDER_API_KEY || '').trim(),
+    POLY_BUILDER_SECRET: (process.env.POLY_BUILDER_SECRET || '').trim(),
+    POLY_BUILDER_PASSPHRASE: (process.env.POLY_BUILDER_PASSPHRASE || '').trim(),
 };
+
+if (ENV.HTTP_PROXY_ENABLED && ENV.HTTP_PROXY_HOST) {
+    const proxyUrl = `http://${ENV.HTTP_PROXY_HOST}:${ENV.HTTP_PROXY_PORT}`;
+    process.env.HTTP_PROXY = proxyUrl;
+    process.env.HTTPS_PROXY = proxyUrl;
+}

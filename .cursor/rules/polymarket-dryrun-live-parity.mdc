@@ -1,0 +1,31 @@
+---
+description: Polymarket 跟单机器人 — Dry Run 与实盘行为对齐及环境变量约定
+alwaysApply: true
+---
+
+# Dry Run 与实盘同步（polymarket-copy-trading-bot）
+
+## 必须对齐（双向）
+
+- **实盘**：`npm run dev` / `npm start`（`tradeExecutor`、`postOrder`、链上相关）。
+- **模拟**：`npm run dryrun`（`dryRunExecutor`，不发送真实交易）。
+
+**硬性规则**：你在 dry run 里改的**任何**与跟单相关的逻辑（估值、订单簿、风控、对账、展示），**必须**同步到实盘路径；反过来，实盘改了同类逻辑，**必须**同步到 dry run。禁止只改一侧长期留存。
+
+凡涉及 **监控、跟单执行、仓位、对账、风控、订单簿行为、持仓估值** 的新功能或行为变更：
+
+1. **同时改** dry run + 实盘，或抽到 **共用模块**（如 `tokenMark.ts`、`positionReconciliationCore.ts`）。
+2. **优先抽取共享代码**；实盘与模拟仅保留「执行层」差异（真下单 vs 模拟成交）。
+3. 模拟侧 **不写私钥链上交易**；若实盘有赎回/Gas 步骤，dry run 用日志说明即可。
+
+## 新增环境变量
+
+每增加一个 `process.env.*` 配置，**必须**同步：
+
+- `src/config/env.ts`（解析并挂到 `ENV`）
+- `.env.example`（中文注释 + 可选示例行）
+- 本地 `.env` 由开发者自行维护（已在 `.gitignore`，勿提交）
+
+## 文档
+
+- 行为对照清单见：`docs/DRY_RUN_LIVE_PARITY.md`

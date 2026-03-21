@@ -8,8 +8,8 @@
  * - ADAPTIVE: Dynamically adjust percentage based on trader's order size
  *
  * Two copy modes are supported:
- * - FOLLOW: Copy the same direction as trader (trader BUY → you BUY, trader SELL → you SELL)
- * - REVERSE: Copy the opposite direction as trader (trader BUY → you SELL, trader SELL → you BUY)
+ * - FOLLOW: Same outcome token as trader (trader BUY/SELL on asset A → you BUY/SELL on A)
+ * - REVERSE: Same BUY/SELL side but opposite outcome token (oppositeAsset / 反买腿)
  */
 
 export enum CopyStrategy {

@@ -1,5 +1,6 @@
 import { ethers } from 'ethers';
 import { ClobClient } from '@polymarket/clob-client';
+import { BuilderConfig } from '@polymarket/builder-signing-sdk';
 import { SignatureType } from '@polymarket/order-utils';
 import { ENV } from '../config/env';
 import Logger from './logger';
@@ -22,6 +23,26 @@ const isGnosisSafe = async (address: string): Promise<boolean> => {
         Logger.error(`检查钱包类型时出错: ${error}`);
         return false;
     }
+};
+
+/** 可选：Builder 凭证齐全时用于订单归因（与 Relayer 共用 POLY_BUILDER_* 签名体系） */
+const getOptionalBuilderConfig = (): BuilderConfig | undefined => {
+    const key = ENV.POLY_BUILDER_API_KEY;
+    const secret = ENV.POLY_BUILDER_SECRET;
+    const passphrase = ENV.POLY_BUILDER_PASSPHRASE;
+    if (!key && !secret && !passphrase) {
+        return undefined;
+    }
+    if (!key || !secret || !passphrase) {
+        Logger.warning(
+            '已设置部分 POLY_BUILDER_* 环境变量，但必须同时配置 POLY_BUILDER_API_KEY、POLY_BUILDER_SECRET、POLY_BUILDER_PASSPHRASE 才会启用 Builder 头。'
+        );
+        return undefined;
+    }
+    Logger.info('已启用 Polymarket Builder API：CLOB 下单将附带 Builder 认证（量计入 Builder 计划）');
+    return new BuilderConfig({
+        localBuilderCreds: { key, secret, passphrase },
+    });
 };
 
 const createClobClient = async (): Promise<ClobClient> => {
@@ -62,13 +83,18 @@ const createClobClient = async (): Promise<ClobClient> => {
 
     Logger.info('API 凭证获取成功');
 
+    const builderConfig = getOptionalBuilderConfig();
+
     clobClient = new ClobClient(
         host,
         chainId,
         wallet,
         creds,
         signatureType,
-        PROXY_WALLET as string
+        PROXY_WALLET as string,
+        undefined,
+        false,
+        builderConfig
     );
 
     // Restore console functions

@@ -4,9 +4,80 @@ import { UserActivityInterface, UserPositionInterface } from '../interfaces/User
 import { getUserActivityModel } from '../models/userHistory';
 import Logger from './logger';
 import { calculateOrderSize, getTradeMultiplier, CopyMode } from '../config/copyStrategy';
+import {
+    getConditionTokensMetaCached,
+    outcomeLabelForAsset,
+    resolveReverseAssetForCondition,
+} from './conditionTokens';
+import { notifyOrderSuccess } from './emailNotifier';
 
 const RETRY_LIMIT = ENV.RETRY_LIMIT;
 const COPY_STRATEGY_CONFIG = ENV.COPY_STRATEGY_CONFIG;
+
+// Orderbook caching (reduce getOrderBook API load & 404 spam)
+const ORDERBOOK_CACHE_TTL_MS = ENV.ORDERBOOK_CACHE_TTL_MS;
+const ORDERBOOK_CACHE_MAX_ENTRIES = ENV.ORDERBOOK_CACHE_MAX_ENTRIES;
+const ORDERBOOK_MISSING_LOG_THROTTLE_MS = ENV.ORDERBOOK_MISSING_LOG_THROTTLE_MS;
+const ORDER_PRICE_SLIPPAGE_USD = ENV.ORDER_PRICE_SLIPPAGE_USD;
+
+type CachedOrderBook = {
+    fetchedAt: number;
+    // null means orderbook missing/404
+    value: any | null;
+};
+
+type OrderBookEntry = {
+    price: string;
+    size: string;
+};
+
+// LRU-ish cache via insertion order (Map keeps insertion order)
+const orderBookCache: Map<string, CachedOrderBook> = new Map();
+const orderBookMissingLastLoggedAt: Map<string, number> = new Map();
+
+const trimOrderBookCache = () => {
+    while (orderBookCache.size > ORDERBOOK_CACHE_MAX_ENTRIES) {
+        const firstKey = orderBookCache.keys().next().value;
+        if (!firstKey) break;
+        orderBookCache.delete(firstKey);
+    }
+};
+
+/** Exported for shared mark/valuation (dry run + live portfolio log). */
+export const fetchOrderBookCached = async (
+    clobClient: ClobClient,
+    tokenId: string
+): Promise<any | null> => {
+    const now = Date.now();
+    const cached = orderBookCache.get(tokenId);
+    if (cached && now - cached.fetchedAt <= ORDERBOOK_CACHE_TTL_MS) {
+        return cached.value;
+    }
+
+    try {
+        const orderBook = await clobClient.getOrderBook(tokenId);
+        orderBookCache.set(tokenId, { fetchedAt: now, value: orderBook });
+        trimOrderBookCache();
+        return orderBook;
+    } catch (err: any) {
+        const status = err?.response?.status;
+        if (status === 404) {
+            orderBookCache.set(tokenId, { fetchedAt: now, value: null });
+            trimOrderBookCache();
+
+            const lastLoggedAt = orderBookMissingLastLoggedAt.get(tokenId) || 0;
+            if (now - lastLoggedAt >= ORDERBOOK_MISSING_LOG_THROTTLE_MS) {
+                orderBookMissingLastLoggedAt.set(tokenId, now);
+                Logger.warning(
+                    `⚠️  订单簿不存在 (404): token ${tokenId.slice(0, 12)}...（已限流）`
+                );
+            }
+            return null;
+        }
+
+        throw err;
+    }
+};
 
 // Legacy parameters (for backward compatibility in SELL logic)
 const TRADE_MULTIPLIER = ENV.TRADE_MULTIPLIER;
@@ -118,18 +189,16 @@ const postOrder = async (
         while (remaining > 0 && retry < RETRY_LIMIT) {
             let orderBook;
             try {
-                orderBook = await clobClient.getOrderBook(trade.asset);
+                orderBook = await fetchOrderBookCached(clobClient, trade.asset);
             } catch (orderBookError: unknown) {
-                const axiosError = orderBookError as any;
-                const status = axiosError?.response?.status;
-                if (status === 404) {
-                    Logger.warning(`⚠️  订单簿不存在 (404): 该市场不可交易`);
-                    await UserActivity.updateOne({ _id: trade._id }, { bot: true });
-                    break;
-                }
                 retry += 1;
                 Logger.warning(`订单簿查询失败 (${retry}/${RETRY_LIMIT}): ${orderBookError}`);
                 continue;
+            }
+
+            if (!orderBook) {
+                await UserActivity.updateOne({ _id: trade._id }, { bot: true });
+                break;
             }
 
             if (!orderBook.bids || orderBook.bids.length === 0) {
@@ -138,9 +207,12 @@ const postOrder = async (
                 break;
             }
 
-            const maxPriceBid = orderBook.bids.reduce((max, bid) => {
-                return parseFloat(bid.price) > parseFloat(max.price) ? bid : max;
-            }, orderBook.bids[0]);
+            const bids = orderBook.bids as OrderBookEntry[];
+            const maxPriceBid = bids.reduce(
+                (max: OrderBookEntry, bid: OrderBookEntry) =>
+                    parseFloat(bid.price) > parseFloat(max.price) ? bid : max,
+                bids[0]
+            );
 
             Logger.info(`最优买价: ${maxPriceBid.size} @ $${maxPriceBid.price}`);
             let order_arges;
@@ -205,10 +277,27 @@ const postOrder = async (
     } else if (condition === 'buy') {
         //Buy strategy
         // In REVERSE mode, 'buy' means trader sold → we buy opposite side
+        if (isReverseMode() && trade.conditionId) {
+            const resolved = await resolveReverseAssetForCondition(
+                trade.conditionId,
+                trade.asset,
+                trade.oppositeAsset
+            );
+            if (resolved.valid && resolved.oppositeAsset) {
+                trade.oppositeAsset = resolved.oppositeAsset;
+            }
+        }
         const tradeAsset = getPositionAsset(trade);
         if (isReverseMode()) {
             Logger.info(`🔄 反买模式: 交易员 ${trade.side} → 我买入反向资产 ${tradeAsset}`);
             Logger.info(`   原始订单: ${trade.side} $${trade.usdcSize.toFixed(2)} @ $${trade.price}`);
+            const leg =
+                trade.outcome && String(trade.outcome).trim()
+                    ? String(trade.outcome).trim()
+                    : '交易员该笔合约腿';
+            Logger.info(
+                `📌 反买说明：你在 Polymarket 上买到的是「对侧 outcome」合约（与 activity 里 ${leg} 相反），不是跟交易员同方向；若要同向买 ${leg}，请把 COPY_MODE 设为 FOLLOW。`
+            );
         }
         // Safety: in REVERSE mode we must buy the OPPOSITE token.
         // If oppositeAsset is missing/invalid, do not fall back to the same asset.
@@ -216,6 +305,22 @@ const postOrder = async (
             Logger.warning('⚠️ 反买模式缺少有效 oppositeAsset（或与原 asset 相同），本笔跳过，避免执行成跟随单');
             await UserActivity.updateOne({ _id: trade._id }, { bot: true });
             return 0;
+        }
+
+        // Gamma 核对：二元市场以 clobTokenIds 为准，避免 UI 与 Data API 标反时误以为「同腿」
+        if (isReverseMode() && trade.conditionId) {
+            try {
+                const meta = await getConditionTokensMetaCached(trade.conditionId);
+                const traderLeg = outcomeLabelForAsset(meta.tokenIds, meta.outcomes, trade.asset);
+                const myLeg = outcomeLabelForAsset(meta.tokenIds, meta.outcomes, tradeAsset);
+                if (traderLeg || myLeg) {
+                    Logger.info(
+                        `🔬 Gamma 核对 outcome: 交易员本笔「${traderLeg ?? '?'}」→ 我方下单「${myLeg ?? '?'}」（应与前者相反；若 Polymarket 仍显示同侧，请对照 token_id / 交易哈希）`
+                    );
+                }
+            } catch {
+                // ignore
+            }
         }
 
         Logger.info(`您的余额: $${my_balance.toFixed(2)}`);
@@ -278,23 +383,18 @@ const postOrder = async (
         while (remaining > 0 && retry < RETRY_LIMIT) {
             let orderBook;
             try {
-                orderBook = await clobClient.getOrderBook(tradeAsset);
+                orderBook = await fetchOrderBookCached(clobClient, tradeAsset);
             } catch (orderBookError: unknown) {
-                const axiosError = orderBookError as any;
-                const status = axiosError?.response?.status;
-                if (status === 404) {
-                    Logger.warning(
-                        `⚠️  订单簿不存在 (404): 该市场可能在 Polymarket 上不可交易或已被移除`
-                    );
-                    Logger.info(`   跳过此交易 — 建议: 确认该市场是否仍在活跃交易`);
-                    await UserActivity.updateOne({ _id: trade._id }, { bot: true });
-                    break;
-                }
                 retry += 1;
                 Logger.warning(
                     `订单簿查询失败 (第 ${retry}/${RETRY_LIMIT} 次): ${orderBookError}`
                 );
                 continue;
+            }
+
+            if (!orderBook) {
+                await UserActivity.updateOne({ _id: trade._id }, { bot: true });
+                break;
             }
 
             if (!orderBook.asks || orderBook.asks.length === 0) {
@@ -303,12 +403,15 @@ const postOrder = async (
                 break;
             }
 
-            const minPriceAsk = orderBook.asks.reduce((min, ask) => {
-                return parseFloat(ask.price) < parseFloat(min.price) ? ask : min;
-            }, orderBook.asks[0]);
+            const asks = orderBook.asks as OrderBookEntry[];
+            const minPriceAsk = asks.reduce(
+                (min: OrderBookEntry, ask: OrderBookEntry) =>
+                    parseFloat(ask.price) < parseFloat(min.price) ? ask : min,
+                asks[0]
+            );
 
             Logger.info(`最优卖价: ${minPriceAsk.size} @ $${minPriceAsk.price}`);
-            if (parseFloat(minPriceAsk.price) - 0.05 > trade.price) {
+            if (parseFloat(minPriceAsk.price) - ORDER_PRICE_SLIPPAGE_USD > trade.price) {
                 Logger.warning('价格滑点过大 — 跳过此次交易');
                 await UserActivity.updateOne({ _id: trade._id }, { bot: true });
                 break;
@@ -328,6 +431,20 @@ const postOrder = async (
 
             const maxOrderSize = parseFloat(minPriceAsk.size) * parseFloat(minPriceAsk.price);
             const orderSize = Math.min(remaining, maxOrderSize);
+
+            // Polymarket market BUY requires >= $1 notional.
+            // If top ask depth only allows < $1 (e.g. 73.23 @ $0.01 => $0.73),
+            // retrying is pointless unless book depth changes; skip this trade gracefully.
+            if (orderSize < MIN_ORDER_SIZE_USD) {
+                Logger.warning(
+                    `当前盘口可成交金额仅 $${orderSize.toFixed(2)}，低于最小下单 $${MIN_ORDER_SIZE_USD.toFixed(2)}，跳过本笔`
+                );
+                await UserActivity.updateOne(
+                    { _id: trade._id },
+                    { bot: true, myBoughtSize: totalBoughtTokens }
+                );
+                break;
+            }
 
             const order_arges = {
                 side: Side.BUY,
@@ -352,6 +469,17 @@ const postOrder = async (
                     true,
                     `买入成功: $${order_arges.amount.toFixed(2)} @ $${order_arges.price} (${tokensBought.toFixed(2)} 个代币)`
                 );
+                await notifyOrderSuccess({
+                    side: 'BUY',
+                    amountUsd: order_arges.amount,
+                    tokens: tokensBought,
+                    price: order_arges.price,
+                    tokenId: tradeAsset,
+                    conditionId: trade.conditionId,
+                    trader: userAddress,
+                    title: trade.title,
+                    txHash: trade.transactionHash,
+                });
                 remaining -= order_arges.amount;
             } else {
                 const errorMessage = extractOrderError(resp);
@@ -406,6 +534,17 @@ const postOrder = async (
             Logger.warning('无可卖出的持仓');
             await UserActivity.updateOne({ _id: trade._id }, { bot: true });
             return 0;
+        }
+
+        if (isReverseMode() && trade.conditionId) {
+            const resolved = await resolveReverseAssetForCondition(
+                trade.conditionId,
+                trade.asset,
+                trade.oppositeAsset
+            );
+            if (resolved.valid && resolved.oppositeAsset) {
+                trade.oppositeAsset = resolved.oppositeAsset;
+            }
         }
 
         // Determine which asset we're selling
@@ -513,18 +652,16 @@ const postOrder = async (
             try {
                 // In REVERSE mode, sellAsset is the opposite token — fetch its orderbook
                 // In FOLLOW mode, sellAsset === trade.asset so this is equivalent
-                orderBook = await clobClient.getOrderBook(sellAsset);
+                orderBook = await fetchOrderBookCached(clobClient, sellAsset);
             } catch (orderBookError: unknown) {
-                const axiosError = orderBookError as any;
-                const status = axiosError?.response?.status;
-                if (status === 404) {
-                    Logger.warning(`⚠️  订单簿不存在 (404): 该市场不可交易`);
-                    await UserActivity.updateOne({ _id: trade._id }, { bot: true });
-                    break;
-                }
                 retry += 1;
                 Logger.warning(`订单簿查询失败 (${retry}/${RETRY_LIMIT}): ${orderBookError}`);
                 continue;
+            }
+
+            if (!orderBook) {
+                await UserActivity.updateOne({ _id: trade._id }, { bot: true });
+                break;
             }
 
             if (!orderBook.bids || orderBook.bids.length === 0) {
@@ -533,9 +670,12 @@ const postOrder = async (
                 break;
             }
 
-            const maxPriceBid = orderBook.bids.reduce((max, bid) => {
-                return parseFloat(bid.price) > parseFloat(max.price) ? bid : max;
-            }, orderBook.bids[0]);
+            const bids = orderBook.bids as OrderBookEntry[];
+            const maxPriceBid = bids.reduce(
+                (max: OrderBookEntry, bid: OrderBookEntry) =>
+                    parseFloat(bid.price) > parseFloat(max.price) ? bid : max,
+                bids[0]
+            );
 
             Logger.info(`最优买价: ${maxPriceBid.size} @ $${maxPriceBid.price}`);
 
@@ -574,6 +714,17 @@ const postOrder = async (
                     true,
                     `卖出成功: ${order_arges.amount} 个代币 @ $${order_arges.price}`
                 );
+                await notifyOrderSuccess({
+                    side: 'SELL',
+                    amountUsd: order_arges.amount * order_arges.price,
+                    tokens: order_arges.amount,
+                    price: order_arges.price,
+                    tokenId: sellAsset,
+                    conditionId: trade.conditionId,
+                    trader: userAddress,
+                    title: trade.title,
+                    txHash: trade.transactionHash,
+                });
                 remaining -= order_arges.amount;
             } else {
                 const errorMessage = extractOrderError(resp);
@@ -646,6 +797,86 @@ const postOrder = async (
     }
 
     return 0;
+};
+
+/**
+ * Market-sell up to `maxTokenAmount` of `tokenId` via FOK (no Mongo activity updates).
+ * Used by position reconciliation / emergency flattening.
+ */
+export const marketSellTokensFOK = async (
+    clobClient: ClobClient,
+    tokenId: string,
+    maxTokenAmount: number
+): Promise<{ proceedsUsd: number; soldTokens: number }> => {
+    let remaining = maxTokenAmount;
+    let proceedsUsd = 0;
+    let soldTokens = 0;
+    let retry = 0;
+
+    while (remaining >= MIN_ORDER_SIZE_TOKENS && retry < RETRY_LIMIT) {
+        let orderBook;
+        try {
+            orderBook = await fetchOrderBookCached(clobClient, tokenId);
+        } catch (orderBookError: unknown) {
+            retry += 1;
+            Logger.warning(
+                `[marketSell] 订单簿查询失败 (${retry}/${RETRY_LIMIT}): ${orderBookError}`
+            );
+            continue;
+        }
+
+        if (!orderBook) {
+            Logger.warning(`[marketSell] 无订单簿 (404/空): token ${tokenId.slice(0, 12)}...`);
+            break;
+        }
+
+        if (!orderBook.bids || orderBook.bids.length === 0) {
+            Logger.warning('[marketSell] 订单簿中无买方报价');
+            break;
+        }
+
+        const bids = orderBook.bids as OrderBookEntry[];
+        const maxPriceBid = bids.reduce(
+            (max: OrderBookEntry, bid: OrderBookEntry) =>
+                parseFloat(bid.price) > parseFloat(max.price) ? bid : max,
+            bids[0]
+        );
+
+        const sellAmount = Math.min(remaining, parseFloat(maxPriceBid.size));
+        if (sellAmount < MIN_ORDER_SIZE_TOKENS) {
+            break;
+        }
+
+        const order_arges = {
+            side: Side.SELL,
+            tokenID: tokenId,
+            amount: sellAmount,
+            price: parseFloat(maxPriceBid.price),
+        };
+
+        const signedOrder = await clobClient.createMarketOrder(order_arges);
+        const resp = await clobClient.postOrder(signedOrder, OrderType.FOK);
+        if (resp.success === true) {
+            retry = 0;
+            soldTokens += order_arges.amount;
+            proceedsUsd += order_arges.amount * order_arges.price;
+            remaining -= order_arges.amount;
+        } else {
+            const errorMessage = extractOrderError(resp);
+            if (isInsufficientBalanceOrAllowanceError(errorMessage)) {
+                Logger.warning(
+                    `[marketSell] 订单被拒绝: ${errorMessage || '余额或授权不足'}`
+                );
+                break;
+            }
+            retry += 1;
+            Logger.warning(
+                `[marketSell] 订单失败 (${retry}/${RETRY_LIMIT})${errorMessage ? ` - ${errorMessage}` : ''}`
+            );
+        }
+    }
+
+    return { proceedsUsd, soldTokens };
 };
 
 export default postOrder;

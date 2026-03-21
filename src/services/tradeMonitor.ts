@@ -1,7 +1,11 @@
 import { ENV } from '../config/env';
+import { CopyMode } from '../config/copyStrategy';
 import { getUserActivityModel, getUserPositionModel } from '../models/userHistory';
+import { resolveReverseAssetForCondition } from '../utils/conditionTokens';
+import { fetchPositionsForUser } from '../utils/dataApiCache';
 import fetchData from '../utils/fetchData';
 import Logger from '../utils/logger';
+import { formatBeijingDateTime } from '../utils/time';
 
 /**
  * Fetch the opposite asset ID for a given conditionId and current asset.
@@ -9,6 +13,13 @@ import Logger from '../utils/logger';
  */
 const fetchOppositeAsset = async (conditionId: string, currentAsset: string): Promise<string> => {
     Logger.info(`正在获取反向代币: conditionId=${conditionId.slice(0, 16)}..., asset=${currentAsset.slice(0, 20)}...`);
+
+    // Fast path: strictly trust tokens that belong to this condition.
+    const strict = await resolveReverseAssetForCondition(conditionId, currentAsset);
+    if (strict.valid && strict.oppositeAsset) {
+        Logger.info(`✅ 条件白名单校验命中反向代币: ${strict.oppositeAsset.slice(0, 20)}...`);
+        return strict.oppositeAsset;
+    }
 
     // Helper function to search for opposite in a market
     const findOppositeInMarket = (market: any): string | null => {
@@ -175,8 +186,7 @@ const init = async () => {
 
     // Show your own positions first
     try {
-        const myPositionsUrl = `https://data-api.polymarket.com/positions?user=${ENV.PROXY_WALLET}`;
-        const myPositions = await fetchData(myPositionsUrl);
+        const myPositions = await fetchPositionsForUser(ENV.PROXY_WALLET);
 
         // Get current USDC balance
         const getMyBalance = (await import('../utils/getMyBalance')).default;
@@ -252,6 +262,9 @@ const init = async () => {
 };
 
 const fetchTradeData = async () => {
+    const proxyPositionsRows = await fetchPositionsForUser(ENV.PROXY_WALLET);
+    const proxyPositionsArr = (Array.isArray(proxyPositionsRows) ? proxyPositionsRows : []) as any[];
+
     for (const { address, UserActivity, UserPosition } of userModels) {
         try {
             // Build cache for reverse trading:
@@ -260,34 +273,21 @@ const fetchTradeData = async () => {
             const oppositeAssetCache: Record<string, string> = {};
             const cacheKey = (conditionId: string, asset: string): string => `${conditionId}:${asset}`;
 
-            // Fetch trader's positions
-            const traderPositionsUrl = `https://data-api.polymarket.com/positions?user=${address}`;
-            const traderPositions = await fetchData(traderPositionsUrl);
-            if (Array.isArray(traderPositions)) {
-                for (const pos of traderPositions) {
-                    if (pos.conditionId && pos.asset && pos.oppositeAsset && pos.oppositeAsset !== pos.asset) {
-                        oppositeAssetCache[cacheKey(pos.conditionId, pos.asset)] = pos.oppositeAsset;
-                    }
+            const traderPositions = await fetchPositionsForUser(address);
+            const traderPositionsArr = (Array.isArray(traderPositions) ? traderPositions : []) as any[];
+            for (const pos of traderPositionsArr) {
+                if (pos.conditionId && pos.asset && pos.oppositeAsset && pos.oppositeAsset !== pos.asset) {
+                    oppositeAssetCache[cacheKey(pos.conditionId, pos.asset)] = pos.oppositeAsset;
                 }
             }
 
-            // Also fetch our proxy wallet's positions (they have opposite assets)
-            try {
-                const myPositionsUrl = `https://data-api.polymarket.com/positions?user=${ENV.PROXY_WALLET}`;
-                const myPositions = await fetchData(myPositionsUrl);
-                if (Array.isArray(myPositions)) {
-                    for (const pos of myPositions) {
-                        if (pos.conditionId && pos.asset && pos.oppositeAsset) {
-                            // pos.oppositeAsset is the opposite outcome's token id
-                            const key = cacheKey(pos.conditionId, pos.asset);
-                            if (!oppositeAssetCache[key]) {
-                                oppositeAssetCache[key] = pos.oppositeAsset;
-                            }
-                        }
+            for (const pos of proxyPositionsArr) {
+                if (pos.conditionId && pos.asset && pos.oppositeAsset) {
+                    const key = cacheKey(pos.conditionId, pos.asset);
+                    if (!oppositeAssetCache[key]) {
+                        oppositeAssetCache[key] = pos.oppositeAsset;
                     }
                 }
-            } catch {
-                // Ignore errors from our own positions fetch
             }
 
             // Fetch trade activities from Polymarket API
@@ -317,6 +317,7 @@ const fetchTradeData = async () => {
                 // Save new trade to database and immediately mark as "claimed" by bot
                 // This prevents tradeExecutor from missing it and tradeMonitor from re-detecting it
                 const newActivity = new UserActivity({
+                    // 先按既有来源拿候选 oppositeAsset，随后做 conditionId 白名单校验
                     proxyWallet: activity.proxyWallet,
                     timestamp: activity.timestamp,
                     conditionId: activity.conditionId,
@@ -348,15 +349,34 @@ const fetchTradeData = async () => {
                     botExcutedTime: 0,
                 });
 
+                if (newActivity.conditionId && newActivity.asset) {
+                    const checked = await resolveReverseAssetForCondition(
+                        newActivity.conditionId,
+                        newActivity.asset,
+                        newActivity.oppositeAsset || undefined
+                    );
+                    if (checked.valid && checked.oppositeAsset) {
+                        newActivity.oppositeAsset = checked.oppositeAsset;
+                    } else if (ENV.COPY_STRATEGY_CONFIG.copyMode === CopyMode.REVERSE) {
+                        Logger.warning(
+                            `[监控] oppositeAsset 未通过 condition 白名单校验: tx=${String(activity.transactionHash || '').slice(0, 12)}...`
+                        );
+                    }
+                }
+
                 await newActivity.save();
-                Logger.info(`检测到 ${address.slice(0, 6)}...${address.slice(-4)} 的新交易`);
+                const oc =
+                    activity.outcome && String(activity.outcome).trim()
+                        ? ` | Outcome: ${String(activity.outcome).trim()}`
+                        : '';
+                Logger.info(
+                    `检测到 ${address.slice(0, 6)}...${address.slice(-4)} 的新交易${oc}`
+                );
             }
 
-            // Also fetch and update positions
-            const positionsUpdateUrl = `https://data-api.polymarket.com/positions?user=${address}`;
-            const positionsUpdate = await fetchData(positionsUpdateUrl);
+            const positionsUpdate = traderPositionsArr;
 
-            if (Array.isArray(positionsUpdate) && positionsUpdate.length > 0) {
+            if (positionsUpdate.length > 0) {
                 for (const position of positionsUpdate) {
                     // Update or create position
                     await UserPosition.findOneAndUpdate(
@@ -420,7 +440,9 @@ const tradeMonitor = async () => {
     }
     Logger.success(`正在监控 ${USER_ADDRESSES.length} 位交易员，每 ${FETCH_INTERVAL} 秒检查一次`);
     Logger.separator();
-    Logger.info(`⏱ 仅跟踪 bot 启动后的新交易 (启动时间: ${new Date(BOT_START_TIME * 1000).toLocaleString()})`);
+    Logger.info(
+        `⏱ 仅跟踪 bot 启动后的新交易 (启动时间: ${formatBeijingDateTime(new Date(BOT_START_TIME * 1000))})`
+    );
     Logger.separator();
 
     while (isRunning) {

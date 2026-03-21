@@ -1,0 +1,92 @@
+import { CopyMode } from '../config/copyStrategy';
+import { ENV } from '../config/env';
+import { UserPositionInterface } from '../interfaces/User';
+import { getUserActivityModel } from '../models/userHistory';
+import { fetchPositionsForUser } from '../utils/dataApiCache';
+
+/** 与 postOrder / dryRun 卖出最小代币数对齐 */
+export const RECONCILE_MIN_SELL_TOKENS = 1.0;
+export const RESOLVED_HIGH = 0.99;
+export const RESOLVED_LOW = 0.01;
+/** 交易员镜像腿仍视为「有仓」的最小代币数 */
+export const TRADER_MIRROR_MIN = 0.25;
+
+export const positionKey = (conditionId: string, asset: string): string =>
+    `${conditionId}:${asset}`;
+
+/**
+ * conditionId -> 在 Mongo 中有过 TRADE 且 bot 认领的跟单地址
+ * （live / dry run 共用，避免平掉非跟单产生的仓位）
+ */
+export const loadCopiedConditionTraders = async (): Promise<Map<string, Set<string>>> => {
+    const map = new Map<string, Set<string>>();
+    for (const address of ENV.USER_ADDRESSES) {
+        const Model = getUserActivityModel(address);
+        const ids = await Model.distinct('conditionId', {
+            type: 'TRADE',
+            bot: true,
+        });
+        for (const cid of ids) {
+            if (typeof cid !== 'string' || !cid) continue;
+            if (!map.has(cid)) map.set(cid, new Set());
+            map.get(cid)!.add(address);
+        }
+    }
+    return map;
+};
+
+export const traderMirrorSize = (
+    traderPositions: UserPositionInterface[],
+    conditionId: string,
+    mirrorAsset: string
+): number => {
+    const p = traderPositions.find(
+        (pos) => pos.conditionId === conditionId && pos.asset === mirrorAsset
+    );
+    return p?.size ?? 0;
+};
+
+export const anyTraderStillInMirror = async (
+    involved: Set<string>,
+    conditionId: string,
+    mirrorAsset: string,
+    cache: Map<string, UserPositionInterface[]>
+): Promise<boolean> => {
+    for (const addr of involved) {
+        let list = cache.get(addr);
+        if (!list) {
+            const raw = await fetchPositionsForUser(addr);
+            list = raw as UserPositionInterface[];
+            cache.set(addr, list);
+        }
+        if (traderMirrorSize(list, conditionId, mirrorAsset) >= TRADER_MIRROR_MIN) {
+            return true;
+        }
+    }
+    return false;
+};
+
+/** curPrice 需为有效数字；NaN/无效时不因价格判定为已结算（避免无行情误平仓） */
+export const isMarketResolved = (curPrice: number, redeemable: boolean): boolean => {
+    if (redeemable === true) return true;
+    if (!isFinite(curPrice)) return false;
+    return curPrice >= RESOLVED_HIGH || curPrice <= RESOLVED_LOW;
+};
+
+/**
+ * FOLLOW: 镜像资产即我方持仓 asset。
+ * REVERSE: 镜像为交易员那一腿 = 我方 token 的 oppositeAsset。
+ */
+export const getMirrorAssetForReconcile = (
+    copyMode: CopyMode,
+    myAsset: string,
+    oppositeAsset: string | undefined
+): string | null => {
+    if (copyMode === CopyMode.FOLLOW) {
+        return myAsset;
+    }
+    if (!oppositeAsset || oppositeAsset === myAsset) {
+        return null;
+    }
+    return oppositeAsset;
+};

@@ -33,6 +33,15 @@ const fetchData = async (url: string) => {
                 },
                 // Force IPv4 to avoid IPv6 connectivity issues
                 family: 4,
+                ...(ENV.HTTP_PROXY_ENABLED
+                    ? {
+                          proxy: {
+                              protocol: 'http',
+                              host: ENV.HTTP_PROXY_HOST,
+                              port: ENV.HTTP_PROXY_PORT,
+                          },
+                      }
+                    : {}),
             });
             return response.data;
         } catch (error) {

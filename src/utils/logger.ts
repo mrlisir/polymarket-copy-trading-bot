@@ -1,13 +1,14 @@
 import chalk from 'chalk';
 import * as fs from 'fs';
 import * as path from 'path';
+import { formatBeijingClock, formatBeijingDate, formatBeijingDateTime } from './time';
 
 class Logger {
     private static logsDir = path.join(process.cwd(), 'logs');
     private static currentLogFile = '';
 
     private static getLogFileName(): string {
-        const date = new Date().toISOString().split('T')[0];
+        const date = formatBeijingDate();
         return path.join(this.logsDir, `bot-${date}.log`);
     }
 
@@ -21,7 +22,7 @@ class Logger {
         try {
             this.ensureLogsDir();
             const logFile = this.getLogFileName();
-            const timestamp = new Date().toISOString();
+            const timestamp = formatBeijingDateTime(new Date());
             const logEntry = `[${timestamp}] ${message}\n`;
             fs.appendFileSync(logFile, logEntry, 'utf8');
         } catch {
@@ -81,6 +82,22 @@ class Logger {
             const sideText = details.side === 'BUY' ? '买入 (BUY)' : '卖出 (SELL)';
             console.log(chalk.gray(`方向:   ${sideColor.bold(sideText)}`));
         }
+        if (details.title) {
+            console.log(chalk.gray(`标的:   ${chalk.white.bold(String(details.title))}`));
+        }
+        if (details.traderOutcome) {
+            console.log(
+                chalk.gray(`交易员 Outcome: ${chalk.yellow.bold(String(details.traderOutcome))}`)
+            );
+        }
+        if (details.myOutcome) {
+            console.log(
+                chalk.gray(`我跟单 Outcome: ${chalk.magenta.bold(String(details.myOutcome))}`)
+            );
+        }
+        if (details.outcomeModeHint) {
+            console.log(chalk.dim(`  └ ${details.outcomeModeHint}`));
+        }
         if (details.amount) {
             console.log(chalk.gray(`金额: ${chalk.yellow(`$${details.amount}`)}`));
         }
@@ -90,7 +107,7 @@ class Logger {
         if (details.eventSlug || details.slug) {
             const slug = details.eventSlug || details.slug;
             const marketUrl = `https://polymarket.com/event/${slug}`;
-            console.log(chalk.gray(`市场: ${chalk.blue.underline(marketUrl)}`));
+            console.log(chalk.gray(`链接: ${chalk.blue.underline(marketUrl)}`));
         }
         if (details.transactionHash) {
             const txUrl = `https://polygonscan.com/tx/${details.transactionHash}`;
@@ -103,6 +120,8 @@ class Logger {
         if (details.amount) tradeLog += ` | Amount: $${details.amount}`;
         if (details.price) tradeLog += ` | Price: ${details.price}`;
         if (details.title) tradeLog += ` | Market: ${details.title}`;
+        if (details.traderOutcome) tradeLog += ` | TraderOutcome: ${details.traderOutcome}`;
+        if (details.myOutcome) tradeLog += ` | MyOutcome: ${details.myOutcome}`;
         if (details.transactionHash) tradeLog += ` | TX: ${details.transactionHash}`;
         this.writeToFile(tradeLog);
     }
@@ -130,7 +149,7 @@ class Logger {
     }
 
     static monitoring(traderCount: number) {
-        const timestamp = new Date().toLocaleTimeString();
+        const timestamp = formatBeijingClock();
         console.log(
             chalk.dim(`[${timestamp}]`),
             chalk.cyan('👁️  监控中'),
@@ -174,7 +193,7 @@ class Logger {
     private static spinnerIndex = 0;
 
     static waiting(traderCount: number, extraInfo?: string) {
-        const timestamp = new Date().toLocaleTimeString();
+        const timestamp = formatBeijingClock();
         const spinner = this.spinnerFrames[this.spinnerIndex % this.spinnerFrames.length];
         this.spinnerIndex++;
 

@@ -1,0 +1,40 @@
+# Dry Run 与实盘行为对齐
+
+模拟跟单（`npm run dryrun`）的目的，是在不花真钱的前提下尽量复现实盘（`npm run dev` / `npm start`）的逻辑。新增功能时请按下列清单检查。
+
+> Cursor 持久约定：`.cursor/rules/polymarket-dryrun-live-parity.mdc`（`alwaysApply: true`）
+
+## 配置变量
+
+- **所有**新加的 `process.env.*` 必须在以下位置同步：
+  - `src/config/env.ts`（解析与 `ENV` 导出）
+  - `.env.example`（注释说明 + 可选示例行）
+- 本地私用配置放在 **`.env`**（已被 `.gitignore` 忽略）。请从 `.env.example` 复制需要的键到 `.env`，不要提交 `.env`。
+
+## 功能对称清单（维护时自查）
+
+| 能力 | 实盘 | Dry run |
+|------|------|---------|
+| 监控写库 | `tradeMonitor` | 同左 |
+| 读待处理单 | `tradeExecutor` / `dryRunExecutor` | 逻辑应对齐（时间戳、聚合等） |
+| 跟单 sizing / 反向 | `postOrder` + `copyStrategy` | `dryRunExecutor` 应对齐 |
+| 订单簿 404 | 跳过 | 跳过 |
+| 仓位对账 | `runPositionReconciliation` | `runDryRunPositionReconciliation`（共用 `POSITION_RECONCILE_*`） |
+| 链上赎回 | `POSITION_RECONCILE_AUTO_REDEEM` | 仅日志说明，不发交易 |
+| 单 token / 组合估值 | `getProxyPortfolioMarkUsd(clob)`、`resolveTokenMarkUsd` | `getValuationPriceUsd` → 同上（共用 `tokenMark.ts`、`MARK_CUR_VS_BOOK_DIVERGENCE`） |
+| Data `positions` 请求 | `fetchPositionsForUser`（`DATA_API_POSITIONS_CACHE_TTL_MS`） | 同上 |
+| CLOB 估值降级 | `clobPublicPrice.fetchClobLightPriceUsdCached`（`/midpoint`、`/last-trade-price`） | 同上（先于整本 `book`） |
+| Gamma 收盘估值 | `gammaSettlement.getGammaValuationUsdForAsset`（需 `conditionId`） | dry run 对 `getValuationPriceUsd` 传 `conditionId` |
+
+## 共享模块
+
+- 对账判定与 Mongo 条件范围：`src/services/positionReconciliationCore.ts`（实盘 + 模拟共用）
+- 估值链：`src/utils/tokenMark.ts`（Data curPrice → CLOB 轻量价 → Gamma → `postOrder.fetchOrderBookCached`）
+- Data API 缓存：`src/utils/dataApiCache.ts`
+- CLOB 轻量价格：`src/utils/clobPublicPrice.ts`
+- Gamma 结算/估值：`src/utils/gammaSettlement.ts`
+- **变更说明全文**：`docs/CHANGELOG_V2.md`
+
+## 文档
+
+- 命令与脚本说明可补充：`docs/COMMANDS_REFERENCE.md`
