@@ -11,7 +11,9 @@ import Logger from '../utils/logger';
 import { getProxyPortfolioMarkUsd } from '../utils/tokenMark';
 import { resolveCopyOutcomeLabels } from '../utils/copyOutcomeLabels';
 import { formatBeijingDateTime } from '../utils/time';
+import { notifyCopyRiskStop } from '../utils/emailNotifier';
 import { runPositionReconciliation } from './positionReconciliation';
+import { isRetryableTransientError, transientBackoffMs, sleep } from '../utils/transientErrors';
 
 const USER_ADDRESSES = ENV.USER_ADDRESSES;
 const RETRY_LIMIT = ENV.RETRY_LIMIT;
@@ -20,6 +22,10 @@ const TRADE_AGGREGATION_ENABLED = ENV.TRADE_AGGREGATION_ENABLED;
 const TRADE_AGGREGATION_WINDOW_SECONDS = ENV.TRADE_AGGREGATION_WINDOW_SECONDS;
 const TRADE_AGGREGATION_MIN_TOTAL_USD = 1.0; // Polymarket minimum
 const DOUBLE_SIDE_GUARD_MODE = ENV.COPY_DOUBLE_SIDE_GUARD_MODE;
+const DOUBLE_SIDE_GUARD_LOCK_TTL_MS = ENV.COPY_DOUBLE_SIDE_GUARD_LOCK_TTL_MS;
+const COPY_STOP_ON_LOSS_ENABLED = ENV.COPY_STOP_ON_LOSS_ENABLED;
+const COPY_STOP_LOSS_STREAK = ENV.COPY_STOP_LOSS_STREAK;
+const COPY_STOP_LOSS_USD = ENV.COPY_STOP_LOSS_USD;
 
 let lastPortfolioCurPriceLogAt = 0;
 /** 防止同一笔交易在短时间内被重复执行（API 抖动 / DB 重复记录） */
@@ -48,6 +54,40 @@ const touchRecentKey = (key: string): void => {
     }
 };
 
+type DoubleSideBuyLockEntry = {
+    asset: string;
+    at: number;
+};
+
+// In-process single-side lock: avoid opposite BUY slipping through when positions API lags.
+const doubleSideBuyLocks = new Map<string, DoubleSideBuyLockEntry>();
+
+const pruneDoubleSideBuyLocks = (): void => {
+    const now = Date.now();
+    for (const [conditionId, entry] of doubleSideBuyLocks) {
+        if (now - entry.at >= DOUBLE_SIDE_GUARD_LOCK_TTL_MS) {
+            doubleSideBuyLocks.delete(conditionId);
+        }
+    }
+};
+
+const getLockedAsset = (conditionId: string): string | undefined => {
+    const lock = doubleSideBuyLocks.get(conditionId);
+    if (!lock) return undefined;
+    if (Date.now() - lock.at >= DOUBLE_SIDE_GUARD_LOCK_TTL_MS) {
+        doubleSideBuyLocks.delete(conditionId);
+        return undefined;
+    }
+    return lock.asset;
+};
+
+const lockConditionAsset = (conditionId: string, asset: string): void => {
+    doubleSideBuyLocks.set(conditionId, { asset, at: Date.now() });
+    if (doubleSideBuyLocks.size > 2000) {
+        pruneDoubleSideBuyLocks();
+    }
+};
+
 /** Optional: log proxy wallet mark (curPrice，与盘口背离时用 mid)；throttled by env. */
 const maybeLogLivePortfolioCurPrice = async (clobClient: ClobClient): Promise<void> => {
     const intervalMs = ENV.LIVE_PORTFOLIO_CURPRICE_LOG_INTERVAL_MS;
@@ -73,6 +113,13 @@ interface TradeWithUser extends UserActivityInterface {
     userAddress: string;
 }
 
+type TraderRiskState = {
+    consecutiveLosses: number;
+    cumulativeLossUsd: number;
+    stopped: boolean;
+    reason?: string;
+};
+
 interface AggregatedTrade {
     userAddress: string;
     conditionId: string;
@@ -87,8 +134,64 @@ interface AggregatedTrade {
     lastTradeTime: number;
 }
 
+const traderRiskStates = new Map<string, TraderRiskState>();
+
+const getTraderRiskState = (userAddress: string): TraderRiskState => {
+    const existing = traderRiskStates.get(userAddress);
+    if (existing) return existing;
+    const fresh: TraderRiskState = {
+        consecutiveLosses: 0,
+        cumulativeLossUsd: 0,
+        stopped: false,
+    };
+    traderRiskStates.set(userAddress, fresh);
+    return fresh;
+};
+
+const isTraderStopped = (userAddress: string): boolean =>
+    COPY_STOP_ON_LOSS_ENABLED && getTraderRiskState(userAddress).stopped;
+
+const handleTraderRiskAfterSell = async (
+    userAddress: string,
+    realizedPnlUsd: number
+): Promise<void> => {
+    if (!COPY_STOP_ON_LOSS_ENABLED) return;
+    const state = getTraderRiskState(userAddress);
+    if (state.stopped) return;
+
+    if (realizedPnlUsd < 0) {
+        state.consecutiveLosses += 1;
+        state.cumulativeLossUsd += Math.abs(realizedPnlUsd);
+    } else {
+        state.consecutiveLosses = 0;
+    }
+
+    const hitStreak = state.consecutiveLosses >= COPY_STOP_LOSS_STREAK;
+    const hitAmount = state.cumulativeLossUsd >= COPY_STOP_LOSS_USD;
+    if (!hitStreak && !hitAmount) return;
+
+    state.stopped = true;
+    state.reason = hitStreak
+        ? `连续亏损达到 ${state.consecutiveLosses} 次（阈值 ${COPY_STOP_LOSS_STREAK}）`
+        : `累计亏损达到 $${state.cumulativeLossUsd.toFixed(2)}（阈值 $${COPY_STOP_LOSS_USD.toFixed(2)}）`;
+
+    Logger.warning(
+        `🛑 已停止跟单交易员 ${userAddress.slice(0, 6)}...${userAddress.slice(-4)}：${state.reason}`
+    );
+    await notifyCopyRiskStop({
+        trader: userAddress,
+        reason: state.reason,
+        consecutiveLosses: state.consecutiveLosses,
+        cumulativeLossUsd: state.cumulativeLossUsd,
+        mode: 'LIVE',
+    });
+};
+
 // Buffer for aggregating trades
 const tradeAggregationBuffer: Map<string, AggregatedTrade> = new Map();
+// Runtime position usd snapshot per condition+asset.
+// Used to enforce MAX_POSITION_SIZE_USD even when positions API has refresh lag.
+const runtimePositionUsdByKey = new Map<string, number>();
 
 // Only execute trades that were detected after this executor started.
 // This prevents older Mongo "bot: true && botExcutedTime: 0" records
@@ -121,7 +224,17 @@ const readTempTrades = async (): Promise<TradeWithUser[]> => {
             userAddress: address,
         }));
 
-        allTrades.push(...tradesWithUser);
+        allTrades.push(
+            ...tradesWithUser.filter((trade) => {
+                if (!isTraderStopped(trade.userAddress)) return true;
+                // Stop backlog growth for blocked traders.
+                model.updateOne(
+                    { _id: trade._id },
+                    { $set: { bot: true, botExcutedTime: 1 } }
+                ).exec();
+                return false;
+            })
+        );
     }
 
     return allTrades;
@@ -211,10 +324,23 @@ const getReadyAggregatedTrades = (): AggregatedTrade[] => {
     return ready;
 };
 
+const positionUsdKey = (conditionId: string, asset: string): string => `${conditionId}:${asset}`;
+
 const doTrading = async (clobClient: ClobClient, trades: TradeWithUser[]) => {
     for (const trade of trades) {
         const UserActivity = getUserActivityModel(trade.userAddress);
         const dedupKey = makeTradeDedupKey(trade);
+        if (isTraderStopped(trade.userAddress)) {
+            await UserActivity.updateOne(
+                { _id: trade._id },
+                { $set: { bot: true, botExcutedTime: 1 } }
+            );
+            Logger.warning(
+                `已停止该交易员跟单，跳过: ${trade.userAddress.slice(0, 6)}...${trade.userAddress.slice(-4)}`
+            );
+            Logger.separator();
+            continue;
+        }
 
         if (seenRecently(dedupKey)) {
             Logger.warning(`检测到重复待执行交易（短期去重）：${trade.transactionHash.slice(0, 12)}...，跳过`);
@@ -291,6 +417,19 @@ const doTrading = async (clobClient: ClobClient, trades: TradeWithUser[]) => {
         touchRecentKey(dedupKey);
 
         const actualSide = getActualSide(trade.side || 'BUY', ENV.COPY_STRATEGY_CONFIG.copyMode);
+        const buyTargetAsset =
+            actualSide === 'BUY'
+                ? (
+                      ENV.COPY_STRATEGY_CONFIG.copyMode === CopyMode.REVERSE
+                          ? (trade.oppositeAsset || trade.asset)
+                          : trade.asset
+                  )
+                : undefined;
+        const tradedAsset =
+            ENV.COPY_STRATEGY_CONFIG.copyMode === CopyMode.REVERSE
+                ? (trade.oppositeAsset || trade.asset)
+                : trade.asset;
+        const posUsdKey = positionUsdKey(trade.conditionId, tradedAsset);
         const outcomeLabels = resolveCopyOutcomeLabels(
             ENV.COPY_STRATEGY_CONFIG.copyMode,
             trade,
@@ -351,10 +490,23 @@ const doTrading = async (clobClient: ClobClient, trades: TradeWithUser[]) => {
 
         // Execute the trade (use actualSide to determine buy/sell direction)
         if (actualSide === 'BUY') {
-            const targetAsset =
-                ENV.COPY_STRATEGY_CONFIG.copyMode === CopyMode.REVERSE
-                    ? (trade.oppositeAsset || trade.asset)
-                    : trade.asset;
+            const targetAsset = buyTargetAsset as string;
+            const lockedAsset = getLockedAsset(trade.conditionId);
+            if (
+                DOUBLE_SIDE_GUARD_MODE !== 'OFF' &&
+                lockedAsset &&
+                lockedAsset !== targetAsset
+            ) {
+                Logger.warning(
+                    `⏭ 跳过两头买(内存锁): 条件 ${trade.conditionId.slice(0, 12)}... 已锁定 ${lockedAsset.slice(0, 12)}...，当前尝试 ${targetAsset.slice(0, 12)}...`
+                );
+                await UserActivity.updateOne(
+                    { _id: trade._id },
+                    { $set: { bot: true, botExcutedTime: 1 } }
+                );
+                Logger.separator();
+                continue;
+            }
             const oppositeHeld = my_positions.find(
                 (p: UserPositionInterface) =>
                     p.conditionId === trade.conditionId &&
@@ -399,7 +551,14 @@ const doTrading = async (clobClient: ClobClient, trades: TradeWithUser[]) => {
             my_balance,
             user_balance,
             trade.userAddress,
-            dailyVol
+            dailyVol,
+            async (summary) => {
+                await handleTraderRiskAfterSell(trade.userAddress, summary.realizedPnlUsd);
+            },
+            Math.max(
+                my_position ? my_position.size * my_position.avgPrice : 0,
+                runtimePositionUsdByKey.get(posUsdKey) || 0
+            )
         );
 
         // Track daily volume after successful trade
@@ -407,6 +566,19 @@ const doTrading = async (clobClient: ClobClient, trades: TradeWithUser[]) => {
             addDailyVolume(executedUsdc);
             Logger.info(`📈 今日累计交易量: $${getDailyVolume().toFixed(2)}`);
             await maybeLogLivePortfolioCurPrice(clobClient);
+            if (actualSide === 'BUY' && buyTargetAsset) {
+                lockConditionAsset(trade.conditionId, buyTargetAsset);
+            }
+            const baseUsd = Math.max(
+                my_position ? my_position.size * my_position.avgPrice : 0,
+                runtimePositionUsdByKey.get(posUsdKey) || 0
+            );
+            runtimePositionUsdByKey.set(
+                posUsdKey,
+                actualSide === 'BUY'
+                    ? baseUsd + executedUsdc
+                    : Math.max(0, baseUsd - executedUsdc)
+            );
         }
 
         Logger.separator();
@@ -418,6 +590,19 @@ const doTrading = async (clobClient: ClobClient, trades: TradeWithUser[]) => {
  */
 const doAggregatedTrading = async (clobClient: ClobClient, aggregatedTrades: AggregatedTrade[]) => {
     for (const agg of aggregatedTrades) {
+        if (isTraderStopped(agg.userAddress)) {
+            for (const tr of agg.trades) {
+                const UA = getUserActivityModel(tr.userAddress);
+                await UA.updateOne(
+                    { _id: tr._id },
+                    { $set: { bot: true, botExcutedTime: 1 } }
+                );
+            }
+            Logger.warning(
+                `已停止该交易员跟单，跳过聚合组: ${agg.userAddress.slice(0, 6)}...${agg.userAddress.slice(-4)}`
+            );
+            continue;
+        }
         Logger.header(`📊 聚合交易 (合并 ${agg.trades.length} 笔)`);
         Logger.info(`市场: ${agg.slug || agg.asset}`);
         Logger.info(`方向: ${agg.side}`);
@@ -550,6 +735,19 @@ const doAggregatedTrading = async (clobClient: ClobClient, aggregatedTrades: Agg
 
         // Create a synthetic trade object for postOrder using aggregated values
         const actualSide = getActualSide(agg.side as string, ENV.COPY_STRATEGY_CONFIG.copyMode);
+        const buyTargetAsset =
+            actualSide === 'BUY'
+                ? (
+                      ENV.COPY_STRATEGY_CONFIG.copyMode === CopyMode.REVERSE
+                          ? (agg.trades[0].oppositeAsset || agg.asset)
+                          : agg.asset
+                  )
+                : undefined;
+        const tradedAsset =
+            ENV.COPY_STRATEGY_CONFIG.copyMode === CopyMode.REVERSE
+                ? (agg.trades[0].oppositeAsset || agg.asset)
+                : agg.asset;
+        const posUsdKey = positionUsdKey(agg.conditionId, tradedAsset);
         const syntheticTrade: UserActivityInterface = {
             ...agg.trades[0], // Use first trade as template
             usdcSize: agg.totalUsdcSize,
@@ -564,10 +762,26 @@ const doAggregatedTrading = async (clobClient: ClobClient, aggregatedTrades: Agg
 
         // Execute the aggregated trade
         if (actualSide === 'BUY') {
-            const targetAsset =
-                ENV.COPY_STRATEGY_CONFIG.copyMode === CopyMode.REVERSE
-                    ? (agg.trades[0].oppositeAsset || agg.asset)
-                    : agg.asset;
+            const targetAsset = buyTargetAsset as string;
+            const lockedAsset = getLockedAsset(agg.conditionId);
+            if (
+                DOUBLE_SIDE_GUARD_MODE !== 'OFF' &&
+                lockedAsset &&
+                lockedAsset !== targetAsset
+            ) {
+                Logger.warning(
+                    `⏭ 跳过两头买(聚合内存锁): 条件 ${agg.conditionId.slice(0, 12)}... 已锁定 ${lockedAsset.slice(0, 12)}...，当前尝试 ${targetAsset.slice(0, 12)}...`
+                );
+                for (const tr of agg.trades) {
+                    const UA = getUserActivityModel(tr.userAddress);
+                    await UA.updateOne(
+                        { _id: tr._id },
+                        { $set: { bot: true, botExcutedTime: 1 } }
+                    );
+                }
+                Logger.separator();
+                continue;
+            }
             const oppositeHeld = my_positions.find(
                 (p: UserPositionInterface) =>
                     p.conditionId === agg.conditionId &&
@@ -616,7 +830,14 @@ const doAggregatedTrading = async (clobClient: ClobClient, aggregatedTrades: Agg
             my_balance,
             user_balance,
             agg.userAddress,
-            dailyVol
+            dailyVol,
+            async (summary) => {
+                await handleTraderRiskAfterSell(agg.userAddress, summary.realizedPnlUsd);
+            },
+            Math.max(
+                my_position ? my_position.size * my_position.avgPrice : 0,
+                runtimePositionUsdByKey.get(posUsdKey) || 0
+            )
         );
 
         // Track daily volume after successful trade
@@ -624,6 +845,19 @@ const doAggregatedTrading = async (clobClient: ClobClient, aggregatedTrades: Agg
             addDailyVolume(executedUsdc);
             Logger.info(`📈 今日累计交易量: $${getDailyVolume().toFixed(2)}`);
             await maybeLogLivePortfolioCurPrice(clobClient);
+            if (actualSide === 'BUY' && buyTargetAsset) {
+                lockConditionAsset(agg.conditionId, buyTargetAsset);
+            }
+            const baseUsd = Math.max(
+                my_position ? my_position.size * my_position.avgPrice : 0,
+                runtimePositionUsdByKey.get(posUsdKey) || 0
+            );
+            runtimePositionUsdByKey.set(
+                posUsdKey,
+                actualSide === 'BUY'
+                    ? baseUsd + executedUsdc
+                    : Math.max(0, baseUsd - executedUsdc)
+            );
         }
 
         Logger.separator();
@@ -713,7 +947,9 @@ const tradeExecutor = async (clobClient: ClobClient) => {
 
     let lastCheck = Date.now();
     let lastPositionReconcileAt = 0;
+    let transientStreak = 0;
     while (isRunning) {
+        try {
         const trades = await readTempTrades();
 
         if (TRADE_AGGREGATION_ENABLED) {
@@ -799,6 +1035,20 @@ const tradeExecutor = async (clobClient: ClobClient) => {
         }
 
         await new Promise((resolve) => setTimeout(resolve, 300));
+        transientStreak = 0;
+        } catch (err) {
+            if (!isRunning) break;
+            if (!isRetryableTransientError(err)) {
+                Logger.error(`交易执行器不可恢复错误: ${err}`);
+                throw err;
+            }
+            transientStreak += 1;
+            const delayMs = transientBackoffMs(transientStreak);
+            Logger.warning(
+                `交易执行器临时故障（Mongo/网络等），约 ${(delayMs / 1000).toFixed(1)}s 后重试（连续 ${transientStreak} 次）: ${err}`
+            );
+            await sleep(delayMs);
+        }
     }
 
     Logger.info('交易执行器已停止');

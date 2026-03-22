@@ -10,6 +10,8 @@ import {
     resolveReverseAssetForCondition,
 } from './conditionTokens';
 import { notifyOrderSuccess } from './emailNotifier';
+import { fetchPositionsForUser } from './dataApiCache';
+import { resolveCopyOutcomeLabels } from './copyOutcomeLabels';
 
 const RETRY_LIMIT = ENV.RETRY_LIMIT;
 const COPY_STRATEGY_CONFIG = ENV.COPY_STRATEGY_CONFIG;
@@ -19,6 +21,39 @@ const ORDERBOOK_CACHE_TTL_MS = ENV.ORDERBOOK_CACHE_TTL_MS;
 const ORDERBOOK_CACHE_MAX_ENTRIES = ENV.ORDERBOOK_CACHE_MAX_ENTRIES;
 const ORDERBOOK_MISSING_LOG_THROTTLE_MS = ENV.ORDERBOOK_MISSING_LOG_THROTTLE_MS;
 const ORDER_PRICE_SLIPPAGE_USD = ENV.ORDER_PRICE_SLIPPAGE_USD;
+
+/** 邮件：跟单模式 + outcome 文案（依赖交易员 positions，失败时降级） */
+const buildEmailNotifyExtras = async (
+    trade: UserActivityInterface,
+    userAddress: string
+): Promise<{
+    copyMode: 'FOLLOW' | 'REVERSE';
+    traderOutcome?: string;
+    myOutcome?: string;
+    modeHint?: string;
+    slug?: string;
+    eventSlug?: string;
+}> => {
+    try {
+        const traderPos = (await fetchPositionsForUser(userAddress)) as UserPositionInterface[];
+        const list = Array.isArray(traderPos) ? traderPos : [];
+        const labels = resolveCopyOutcomeLabels(COPY_STRATEGY_CONFIG.copyMode, trade, list);
+        return {
+            copyMode: COPY_STRATEGY_CONFIG.copyMode,
+            traderOutcome: labels.traderOutcome,
+            myOutcome: labels.myOutcome,
+            modeHint: labels.modeHint,
+            slug: trade.slug,
+            eventSlug: trade.eventSlug,
+        };
+    } catch {
+        return {
+            copyMode: COPY_STRATEGY_CONFIG.copyMode,
+            slug: trade.slug,
+            eventSlug: trade.eventSlug,
+        };
+    }
+};
 
 type CachedOrderBook = {
     fetchedAt: number;
@@ -154,6 +189,12 @@ const isInsufficientBalanceOrAllowanceError = (message: string | undefined): boo
     return lower.includes('not enough balance') || lower.includes('allowance');
 };
 
+type SellExecutionSummary = {
+    soldTokens: number;
+    proceedsUsd: number;
+    realizedPnlUsd: number;
+};
+
 const postOrder = async (
     clobClient: ClobClient,
     condition: string,
@@ -163,7 +204,9 @@ const postOrder = async (
     my_balance: number,
     user_balance: number,
     userAddress: string,
-    currentDailyVolume: number = 0
+    currentDailyVolume: number = 0,
+    onSellSummary?: (summary: SellExecutionSummary) => Promise<void> | void,
+    currentPositionValueUsdOverride?: number
 ): Promise<number> => {
     const UserActivity = getUserActivityModel(userAddress);
     //Merge strategy
@@ -327,7 +370,10 @@ const postOrder = async (
         Logger.info(`交易员买入: $${trade.usdcSize.toFixed(2)}`);
 
         // Get current position size for position limit checks
-        const currentPositionValue = my_position ? my_position.size * my_position.avgPrice : 0;
+        const currentPositionValue = Math.max(
+            my_position ? my_position.size * my_position.avgPrice : 0,
+            currentPositionValueUsdOverride ?? 0
+        );
 
         // Show daily volume status if limit is configured
         const dailyLimit = COPY_STRATEGY_CONFIG.maxDailyVolumeUSD;
@@ -469,6 +515,7 @@ const postOrder = async (
                     true,
                     `买入成功: $${order_arges.amount.toFixed(2)} @ $${order_arges.price} (${tokensBought.toFixed(2)} 个代币)`
                 );
+                const emailExtras = await buildEmailNotifyExtras(trade, userAddress);
                 await notifyOrderSuccess({
                     side: 'BUY',
                     amountUsd: order_arges.amount,
@@ -479,6 +526,7 @@ const postOrder = async (
                     trader: userAddress,
                     title: trade.title,
                     txHash: trade.transactionHash,
+                    ...emailExtras,
                 });
                 remaining -= order_arges.amount;
             } else {
@@ -714,6 +762,7 @@ const postOrder = async (
                     true,
                     `卖出成功: ${order_arges.amount} 个代币 @ $${order_arges.price}`
                 );
+                const emailExtrasSell = await buildEmailNotifyExtras(trade, userAddress);
                 await notifyOrderSuccess({
                     side: 'SELL',
                     amountUsd: order_arges.amount * order_arges.price,
@@ -724,6 +773,7 @@ const postOrder = async (
                     trader: userAddress,
                     title: trade.title,
                     txHash: trade.transactionHash,
+                    ...emailExtrasSell,
                 });
                 remaining -= order_arges.amount;
             } else {
@@ -790,6 +840,14 @@ const postOrder = async (
             await UserActivity.updateOne({ _id: trade._id }, { bot: true, botExcutedTime: retry });
         } else {
             await UserActivity.updateOne({ _id: trade._id }, { bot: true });
+        }
+        if (totalSoldTokens > 0 && onSellSummary) {
+            const realizedPnlUsd = totalSoldUsdc - totalSoldTokens * my_position.avgPrice;
+            await onSellSummary({
+                soldTokens: totalSoldTokens,
+                proceedsUsd: totalSoldUsdc,
+                realizedPnlUsd,
+            });
         }
         return totalSoldUsdc;
     } else {

@@ -6,6 +6,7 @@ import { fetchPositionsForUser } from '../utils/dataApiCache';
 import fetchData from '../utils/fetchData';
 import Logger from '../utils/logger';
 import { formatBeijingDateTime } from '../utils/time';
+import { isRetryableTransientError, transientBackoffMs, sleep } from '../utils/transientErrors';
 
 /**
  * Fetch the opposite asset ID for a given conditionId and current asset.
@@ -432,12 +433,32 @@ export const stopTradeMonitor = () => {
 };
 
 const tradeMonitor = async () => {
-    try {
-        await init();
-    } catch (initErr) {
-        Logger.error(`tradeMonitor init 失败: ${initErr}`);
+    let initStreak = 0;
+    while (isRunning) {
+        try {
+            await init();
+            initStreak = 0;
+            break;
+        } catch (initErr) {
+            if (!isRunning) return;
+            if (!isRetryableTransientError(initErr)) {
+                Logger.error(`tradeMonitor init 失败（不可重试）: ${initErr}`);
+                return;
+            }
+            initStreak += 1;
+            const delayMs = transientBackoffMs(initStreak);
+            Logger.warning(
+                `tradeMonitor init 临时失败，约 ${(delayMs / 1000).toFixed(1)}s 后重试（第 ${initStreak} 次）: ${initErr}`
+            );
+            await sleep(delayMs);
+        }
+    }
+
+    if (!isRunning) {
+        Logger.info('交易监控已停止');
         return;
     }
+
     Logger.success(`正在监控 ${USER_ADDRESSES.length} 位交易员，每 ${FETCH_INTERVAL} 秒检查一次`);
     Logger.separator();
     Logger.info(
@@ -445,10 +466,22 @@ const tradeMonitor = async () => {
     );
     Logger.separator();
 
+    let pollStreak = 0;
     while (isRunning) {
         try {
             await fetchTradeData();
+            pollStreak = 0;
         } catch (e) {
+            if (!isRunning) break;
+            if (isRetryableTransientError(e)) {
+                pollStreak += 1;
+                const delayMs = transientBackoffMs(pollStreak);
+                Logger.warning(
+                    `fetchTradeData 临时故障，约 ${(delayMs / 1000).toFixed(1)}s 后重试（连续 ${pollStreak} 次）: ${e}`
+                );
+                await sleep(delayMs);
+                continue;
+            }
             Logger.error(`fetchTradeData 出错: ${e}`);
         }
         if (!isRunning) break;

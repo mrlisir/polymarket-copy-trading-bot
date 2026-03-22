@@ -42,11 +42,17 @@ const run = async () => {
         amountUsd: 1.23,
         tokens: 3.21,
         price: 0.38,
-        tokenId: 'email-test-token-id',
-        conditionId: 'email-test-condition-id',
+        tokenId: '6724264134567890123456789012345678901234567890123456789012345678',
+        conditionId: '0x502745f100000000000000000000000000000000000000000000000000000000',
         trader: '0x0000000000000000000000000000000000000000',
-        title: 'Email Test - SMTP connectivity check',
-        txHash: `email-test-${Date.now()}`,
+        title: 'Email Test - SMTP connectivity check (Bitcoin Up or Down)',
+        txHash: `0x${'a'.repeat(64)}`,
+        copyMode: 'REVERSE',
+        traderOutcome: 'Up（示例）',
+        myOutcome: 'Down（示例）',
+        modeHint: '反买：与交易员相反结果方向（测试数据）',
+        slug: 'btc-updown-email-test',
+        eventSlug: 'btc-updown-email-test',
     });
 
     console.log('✅ 测试流程已执行完成。');

@@ -12,10 +12,12 @@
  */
 
 import connectDB, { closeDB } from './config/db';
+import { ENV } from './config/env';
 import createClobClient from './utils/createClobClient';
 import tradeMonitor, { stopTradeMonitor } from './services/tradeMonitor';
 import dryRunExecutor, { stopDryRunExecutor } from './services/dryRunExecutor';
 import Logger from './utils/logger';
+import { isRetryableTransientError, transientBackoffMs, sleep } from './utils/transientErrors';
 
 let isShuttingDown = false;
 
@@ -28,7 +30,9 @@ const gracefulShutdown = async (signal: string) => {
     Logger.info(`收到关闭信号 ${signal}，正在关闭...`);
     stopTradeMonitor();
     stopDryRunExecutor();
-    await new Promise((resolve) => setTimeout(resolve, 2000));
+    if (ENV.TRANSIENT_RESTART_SETTLE_MS > 0) {
+        await new Promise((resolve) => setTimeout(resolve, ENV.TRANSIENT_RESTART_SETTLE_MS));
+    }
     await closeDB();
     Logger.success('已关闭');
     process.exit(0);
@@ -37,33 +41,70 @@ const gracefulShutdown = async (signal: string) => {
 process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
 process.on('SIGINT', () => gracefulShutdown('SIGINT'));
 
+const createClobClientWithRetry = async () => {
+    let streak = 0;
+    const maxAttempts = ENV.CLOB_INIT_MAX_ATTEMPTS;
+    while (true) {
+        try {
+            return await createClobClient();
+        } catch (e) {
+            streak += 1;
+            if (!isRetryableTransientError(e) || streak >= maxAttempts) throw e;
+            const delayMs = transientBackoffMs(streak);
+            Logger.warning(
+                `CLOB 初始化失败，约 ${(delayMs / 1000).toFixed(1)}s 后重试（第 ${streak}/${maxAttempts} 次）: ${e}`
+            );
+            await sleep(delayMs);
+        }
+    }
+};
+
 const main = async () => {
-    try {
-        console.log('\n');
-        console.log('\x1b[35m' + '  ____     ___                   ____            _     __  __                                          ');
-        console.log('\x1b[35m' + ' |  _ \\   / _ \\ _ __   ___ _ __ |  _ \\ _   _  ___| | _|  \\/  | __ _ _ __   __ _  __ _  ___ _ __ ');
-        console.log("\x1b[35m" + " | | | | | | | | '_ \\ / _ \\ '_ \\| |_) | | | |/ __| |/ / |\\/| |/ _` | '_ \\ / _` |/ _` |/ _ \\ '__|");
-        console.log('\x1b[35m' + ' | |_| | | |_| | |_) |  __/ | | |  _ <| |_| | (__|   <| |  | | (_| | | | | (_| | (_| |  __/ |   ');
-        console.log('\x1b[35m' + ' |____/   \\___/| .__/ \\___|_| |_|_| \\_\\\\__,_|\\___|_|\\_\\_|  |_|\\__,_|_| |_|\\__, |\\__, |\\___|_|   ');
-        console.log('\x1b[35m' + '                 |_|                                                        |___/ |___/            ');
-        console.log('\x1b[33m' + '                        模拟跟单 · 实时监控 · 不执行真实交易\n');
+    console.log('\n');
+    console.log('\x1b[35m' + '  ____     ___                   ____            _     __  __                                          ');
+    console.log('\x1b[35m' + ' |  _ \\   / _ \\ _ __   ___ _ __ |  _ \\ _   _  ___| | _|  \\/  | __ _ _ __   __ _  __ _  ___ _ __ ');
+    console.log("\x1b[35m" + " | | | | | | | | '_ \\ / _ \\ '_ \\| |_) | | | |/ __| |/ / |\\/| |/ _` | '_ \\ / _` |/ _` |/ _ \\ '__|");
+    console.log('\x1b[35m' + ' | |_| | | |_| | |_) |  __/ | | |  _ <| |_| | (__|   <| |  | | (_| | | | | (_| | (_| |  __/ |   ');
+    console.log('\x1b[35m' + ' |____/   \\___/| .__/ \\___|_| |_|_| \\_\\\\__,_|\\___|_|\\_\\_|  |_|\\__,_|_| |_|\\__, |\\__, |\\___|_|   ');
+    console.log('\x1b[35m' + '                 |_|                                                        |___/ |___/            ');
+    console.log('\x1b[33m' + '                        模拟跟单 · 实时监控 · 不执行真实交易\n');
 
-        // Connect to DB (needed for tradeMonitor to write new trades)
-        await connectDB();
-        Logger.success('数据库连接就绪');
+    let streak = 0;
+    while (!isShuttingDown) {
+        try {
+            await connectDB();
+            streak = 0;
+            Logger.success('数据库连接就绪');
 
-        Logger.info('正在初始化 CLOB 客户端...');
-        const clobClient = await createClobClient();
-        Logger.success('CLOB 客户端就绪');
+            Logger.info('正在初始化 CLOB 客户端...');
+            const clobClient = await createClobClientWithRetry();
+            Logger.success('CLOB 客户端就绪');
 
-        // Start both: tradeMonitor (writes to DB) + dryRunExecutor (reads & simulates)
-        await Promise.all([
-            tradeMonitor(),
-            dryRunExecutor(clobClient),
-        ]);
-    } catch (error) {
-        Logger.error(`启动失败: ${error}`);
-        process.exit(1);
+            await Promise.all([tradeMonitor(), dryRunExecutor(clobClient)]);
+            break;
+        } catch (error) {
+            if (isShuttingDown) break;
+            if (!isRetryableTransientError(error)) {
+                Logger.error(`启动失败（不可重试）: ${error}`);
+                process.exit(1);
+            }
+            streak += 1;
+            const delayMs = transientBackoffMs(streak);
+            Logger.warning(
+                `模拟模式临时故障，约 ${(delayMs / 1000).toFixed(1)}s 后重连重试（第 ${streak} 次）: ${error}`
+            );
+            stopTradeMonitor();
+            stopDryRunExecutor();
+            if (ENV.TRANSIENT_RESTART_SETTLE_MS > 0) {
+                await sleep(ENV.TRANSIENT_RESTART_SETTLE_MS);
+            }
+            try {
+                await closeDB();
+            } catch {
+                // ignore
+            }
+            await sleep(delayMs);
+        }
     }
 };
 

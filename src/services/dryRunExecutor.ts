@@ -22,12 +22,18 @@ import {
 import { fetchGammaSettlementInfoCached, gammaTokenLooksSettled } from '../utils/gammaSettlement';
 import { resolveCopyOutcomeLabels } from '../utils/copyOutcomeLabels';
 import { formatBeijingDateTime } from '../utils/time';
+import { notifyCopyRiskStop } from '../utils/emailNotifier';
+import { isRetryableTransientError, transientBackoffMs, sleep } from '../utils/transientErrors';
 
 const USER_ADDRESSES = ENV.USER_ADDRESSES;
 const RETRY_LIMIT = ENV.RETRY_LIMIT;
 const DRY_INITIAL_BALANCE = ENV.DRY_INITIAL_BALANCE;
 const DRY_START_FROM_REAL = ENV.DRY_START_FROM_REAL;
 const DOUBLE_SIDE_GUARD_MODE = ENV.COPY_DOUBLE_SIDE_GUARD_MODE;
+const DOUBLE_SIDE_GUARD_LOCK_TTL_MS = ENV.COPY_DOUBLE_SIDE_GUARD_LOCK_TTL_MS;
+const COPY_STOP_ON_LOSS_ENABLED = ENV.COPY_STOP_ON_LOSS_ENABLED;
+const COPY_STOP_LOSS_STREAK = ENV.COPY_STOP_LOSS_STREAK;
+const COPY_STOP_LOSS_USD = ENV.COPY_STOP_LOSS_USD;
 // Match postOrder.ts: minimum sell size in outcome tokens
 const MIN_ORDER_SIZE_TOKENS = 1.0;
 
@@ -115,6 +121,62 @@ const userActivityModels = USER_ADDRESSES.map((address) => ({
     model: getUserActivityModel(address),
 }));
 
+type TraderRiskState = {
+    consecutiveLosses: number;
+    cumulativeLossUsd: number;
+    stopped: boolean;
+    reason?: string;
+};
+const dryTraderRiskStates = new Map<string, TraderRiskState>();
+
+const getDryRiskState = (userAddress: string): TraderRiskState => {
+    const existing = dryTraderRiskStates.get(userAddress);
+    if (existing) return existing;
+    const fresh: TraderRiskState = {
+        consecutiveLosses: 0,
+        cumulativeLossUsd: 0,
+        stopped: false,
+    };
+    dryTraderRiskStates.set(userAddress, fresh);
+    return fresh;
+};
+
+const isDryTraderStopped = (userAddress: string): boolean =>
+    COPY_STOP_ON_LOSS_ENABLED && getDryRiskState(userAddress).stopped;
+
+const handleDryRiskAfterSell = async (userAddress: string, realizedPnlUsd: number): Promise<void> => {
+    if (!COPY_STOP_ON_LOSS_ENABLED) return;
+    const state = getDryRiskState(userAddress);
+    if (state.stopped) return;
+
+    if (realizedPnlUsd < 0) {
+        state.consecutiveLosses += 1;
+        state.cumulativeLossUsd += Math.abs(realizedPnlUsd);
+    } else {
+        state.consecutiveLosses = 0;
+    }
+
+    const hitStreak = state.consecutiveLosses >= COPY_STOP_LOSS_STREAK;
+    const hitAmount = state.cumulativeLossUsd >= COPY_STOP_LOSS_USD;
+    if (!hitStreak && !hitAmount) return;
+
+    state.stopped = true;
+    state.reason = hitStreak
+        ? `连续亏损达到 ${state.consecutiveLosses} 次（阈值 ${COPY_STOP_LOSS_STREAK}）`
+        : `累计亏损达到 $${state.cumulativeLossUsd.toFixed(2)}（阈值 $${COPY_STOP_LOSS_USD.toFixed(2)}）`;
+
+    Logger.warning(
+        `🛑 [模拟] 已停止跟单交易员 ${userAddress.slice(0, 6)}...${userAddress.slice(-4)}：${state.reason}`
+    );
+    await notifyCopyRiskStop({
+        trader: userAddress,
+        reason: state.reason,
+        consecutiveLosses: state.consecutiveLosses,
+        cumulativeLossUsd: state.cumulativeLossUsd,
+        mode: 'DRYRUN',
+    });
+};
+
 const normalizeOutcomeForStorage = (label: string | undefined): string | undefined => {
     if (!label) return undefined;
     const trimmed = String(label).trim();
@@ -173,6 +235,29 @@ const orderBookMissingLogged: Set<string> = new Set();
 /** 与实盘共用 POSITION_RECONCILE_* 配置；冷却按 conditionId+asset */
 const dryReconcileLastAt = new Map<string, number>();
 const dryReconcileOppositeCache = new Map<string, string>();
+const dryDoubleSideBuyLocks = new Map<string, { asset: string; at: number }>();
+
+const getDryLockedAsset = (conditionId: string): string | undefined => {
+    const lock = dryDoubleSideBuyLocks.get(conditionId);
+    if (!lock) return undefined;
+    if (Date.now() - lock.at >= DOUBLE_SIDE_GUARD_LOCK_TTL_MS) {
+        dryDoubleSideBuyLocks.delete(conditionId);
+        return undefined;
+    }
+    return lock.asset;
+};
+
+const setDryConditionBuyLock = (conditionId: string, asset: string): void => {
+    dryDoubleSideBuyLocks.set(conditionId, { asset, at: Date.now() });
+    if (dryDoubleSideBuyLocks.size > 2000) {
+        const now = Date.now();
+        for (const [cid, entry] of dryDoubleSideBuyLocks) {
+            if (now - entry.at >= DOUBLE_SIDE_GUARD_LOCK_TTL_MS) {
+                dryDoubleSideBuyLocks.delete(cid);
+            }
+        }
+    }
+};
 
 /** 与实盘共用：Data curPrice → CLOB 轻量价 → Gamma → 最后 orderbook（见 tokenMark） */
 const getValuationPriceUsd = async (
@@ -275,7 +360,17 @@ const readPendingTrades = async () => {
                 ],
             })
             .exec();
-        allTrades.push(...trades.map((t) => ({ ...t.toObject(), userAddress: address })));
+        const normalized = trades.map((t) => ({ ...t.toObject(), userAddress: address }));
+        allTrades.push(
+            ...normalized.filter((trade) => {
+                if (!isDryTraderStopped(trade.userAddress)) return true;
+                model.updateOne(
+                    { _id: trade._id },
+                    { $set: { bot: true, botExcutedTime: 2 } }
+                ).exec();
+                return false;
+            })
+        );
     }
     return allTrades;
 };
@@ -337,6 +432,11 @@ const doDryTrading = async (
     // Mark as processed (botExcutedTime: 2 means "dry-run processed")
     const UserActivity = getUserActivityModel(trade.userAddress);
     await UserActivity.updateOne({ _id: trade._id }, { $set: { botExcutedTime: 2 } });
+    if (isDryTraderStopped(trade.userAddress)) {
+        console.log(`  ⏭  该交易员已触发亏损熔断，跳过`);
+        console.log('─'.repeat(70));
+        return;
+    }
 
     console.log('\n' + '─'.repeat(70));
     const time = formatBeijingDateTime(new Date(trade.timestamp * 1000));
@@ -388,6 +488,18 @@ const doDryTrading = async (
 
     // 风控：同一 condition 只跟一边。若已有另一侧持仓，则忽略后续另一边 BUY，避免两头买。
     if (actualSide === 'BUY') {
+        const lockedAsset = getDryLockedAsset(trade.conditionId);
+        if (
+            DOUBLE_SIDE_GUARD_MODE !== 'OFF' &&
+            lockedAsset &&
+            lockedAsset !== tradeAsset
+        ) {
+            console.log(
+                `  ⏭  跳过: 内存锁已锁定同市场另一侧 (${lockedAsset.slice(0, 12)}...)，禁止两头买入`
+            );
+            console.log('─'.repeat(70));
+            return;
+        }
         const oppositeHeld = [...simulatedPositions.values()].find(
             (p) =>
                 p.conditionId === trade.conditionId &&
@@ -517,6 +629,7 @@ const doDryTrading = async (
                 `  📈 未实现盈亏(curPrice): $${unrealized >= 0 ? '+' : ''}${unrealized.toFixed(2)}`
             );
         }
+        setDryConditionBuyLock(trade.conditionId, tradeAsset);
     } else {
         if (!orderBook.bids || orderBook.bids.length === 0) {
             const key = `noBids:${tradeAsset}`;
@@ -583,6 +696,7 @@ const doDryTrading = async (
         console.log(`  💰 余额: $${simulatedBalance.toFixed(2)} → $${(simulatedBalance + result.proceeds).toFixed(2)}`);
         console.log(`  📈 已实现盈亏: $${pnl >= 0 ? '+' : ''}${pnl.toFixed(2)} (成本 $${costBasis.toFixed(2)})`);
         simulatedBalance += result.proceeds;
+        await handleDryRiskAfterSell(trade.userAddress, pnl);
 
             existing.size -= result.tokens;
             if (existing.size <= 0.0001) {
@@ -991,6 +1105,8 @@ const dryRunExecutor = async (clobClient: ClobClient) => {
     processedIds.clear();
     dryReconcileLastAt.clear();
     dryReconcileOppositeCache.clear();
+    dryDoubleSideBuyLocks.clear();
+    dryTraderRiskStates.clear();
 
     await initSimulatedAccount();
 
@@ -1006,6 +1122,7 @@ const dryRunExecutor = async (clobClient: ClobClient) => {
     let lastPositionsSnapshotAt = 0;
     let lastPositionReconcileAt = 0;
     const snapshotIntervalMs = ENV.DRY_POSITIONS_SNAPSHOT_INTERVAL_MS ?? 0;
+    let dryTransientStreak = 0;
 
     while (isRunning) {
         try {
@@ -1044,8 +1161,19 @@ const dryRunExecutor = async (clobClient: ClobClient) => {
                     lastCheck = Date.now();
                 }
             }
+            dryTransientStreak = 0;
         } catch (error) {
             Logger.error(`模拟执行出错: ${error}`);
+            if (isRetryableTransientError(error)) {
+                dryTransientStreak += 1;
+                const delayMs = transientBackoffMs(dryTransientStreak);
+                Logger.warning(
+                    `模拟轮询临时故障，约 ${(delayMs / 1000).toFixed(1)}s 后再试（连续 ${dryTransientStreak} 次）`
+                );
+                await sleep(delayMs);
+            } else {
+                dryTransientStreak = 0;
+            }
         }
 
         if (!isRunning) break;

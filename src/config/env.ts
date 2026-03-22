@@ -121,6 +121,68 @@ const validateNumericConfig = (): void => {
             `Invalid HTTP_PROXY_PORT: ${process.env.HTTP_PROXY_PORT}. Must be between 1 and 65535.`
         );
     }
+
+    const doubleSideGuardLockTtlMs = parseInt(
+        process.env.COPY_DOUBLE_SIDE_GUARD_LOCK_TTL_MS || '600000',
+        10
+    );
+    if (isNaN(doubleSideGuardLockTtlMs) || doubleSideGuardLockTtlMs < 1000) {
+        throw new Error(
+            `Invalid COPY_DOUBLE_SIDE_GUARD_LOCK_TTL_MS: ${process.env.COPY_DOUBLE_SIDE_GUARD_LOCK_TTL_MS}. Must be at least 1000ms.`
+        );
+    }
+
+    const copyStopLossStreak = parseInt(process.env.COPY_STOP_LOSS_STREAK || '10', 10);
+    if (isNaN(copyStopLossStreak) || copyStopLossStreak < 1) {
+        throw new Error(
+            `Invalid COPY_STOP_LOSS_STREAK: ${process.env.COPY_STOP_LOSS_STREAK}. Must be at least 1.`
+        );
+    }
+
+    const copyStopLossUsd = parseFloat(process.env.COPY_STOP_LOSS_USD || '50');
+    if (isNaN(copyStopLossUsd) || copyStopLossUsd <= 0) {
+        throw new Error(
+            `Invalid COPY_STOP_LOSS_USD: ${process.env.COPY_STOP_LOSS_USD}. Must be positive.`
+        );
+    }
+
+    const transientRetryBaseMs = parseInt(process.env.TRANSIENT_RETRY_BASE_MS || '2000', 10);
+    if (isNaN(transientRetryBaseMs) || transientRetryBaseMs < 500 || transientRetryBaseMs > 600_000) {
+        throw new Error(
+            `Invalid TRANSIENT_RETRY_BASE_MS: ${process.env.TRANSIENT_RETRY_BASE_MS}. Must be 500–600000.`
+        );
+    }
+
+    const transientRetryMaxMs = parseInt(process.env.TRANSIENT_RETRY_MAX_MS || '120000', 10);
+    if (isNaN(transientRetryMaxMs) || transientRetryMaxMs < transientRetryBaseMs) {
+        throw new Error(
+            `Invalid TRANSIENT_RETRY_MAX_MS: ${process.env.TRANSIENT_RETRY_MAX_MS}. Must be >= TRANSIENT_RETRY_BASE_MS.`
+        );
+    }
+
+    const transientBackoffMaxExponent = parseInt(
+        process.env.TRANSIENT_BACKOFF_MAX_EXPONENT || '16',
+        10
+    );
+    if (isNaN(transientBackoffMaxExponent) || transientBackoffMaxExponent < 0 || transientBackoffMaxExponent > 32) {
+        throw new Error(
+            `Invalid TRANSIENT_BACKOFF_MAX_EXPONENT: ${process.env.TRANSIENT_BACKOFF_MAX_EXPONENT}. Must be 0–32.`
+        );
+    }
+
+    const clobInitMaxAttempts = parseInt(process.env.CLOB_INIT_MAX_ATTEMPTS || '12', 10);
+    if (isNaN(clobInitMaxAttempts) || clobInitMaxAttempts < 1 || clobInitMaxAttempts > 100) {
+        throw new Error(
+            `Invalid CLOB_INIT_MAX_ATTEMPTS: ${process.env.CLOB_INIT_MAX_ATTEMPTS}. Must be 1–100.`
+        );
+    }
+
+    const transientRestartSettleMs = parseInt(process.env.TRANSIENT_RESTART_SETTLE_MS || '2000', 10);
+    if (isNaN(transientRestartSettleMs) || transientRestartSettleMs < 0 || transientRestartSettleMs > 120_000) {
+        throw new Error(
+            `Invalid TRANSIENT_RESTART_SETTLE_MS: ${process.env.TRANSIENT_RESTART_SETTLE_MS}. Must be 0–120000.`
+        );
+    }
 };
 
 /**
@@ -424,6 +486,34 @@ export const ENV = {
     COPY_DOUBLE_SIDE_GUARD_MODE: (
         process.env.COPY_DOUBLE_SIDE_GUARD_MODE || 'GLOBAL'
     ).trim().toUpperCase(),
+    /**
+     * 两头买内存锁 TTL（毫秒）：
+     * 当同一 condition 已在本进程买入某一侧后，在 TTL 期间阻止另一侧 BUY，
+     * 用于覆盖 positions API 延迟窗口导致的双向新增仓位。
+     */
+    COPY_DOUBLE_SIDE_GUARD_LOCK_TTL_MS: parseInt(
+        process.env.COPY_DOUBLE_SIDE_GUARD_LOCK_TTL_MS || '600000',
+        10
+    ),
+    /**
+     * 跟单亏损熔断：
+     * 达到连续亏损次数或累计亏损金额后，停止跟单该交易员地址（仅本次进程）。
+     */
+    COPY_STOP_ON_LOSS_ENABLED: process.env.COPY_STOP_ON_LOSS_ENABLED !== 'false',
+    COPY_STOP_LOSS_STREAK: parseInt(process.env.COPY_STOP_LOSS_STREAK || '10', 10),
+    COPY_STOP_LOSS_USD: parseFloat(process.env.COPY_STOP_LOSS_USD || '50'),
+
+    /**
+     * Mongo/CLOB/网络临时故障时的指数退避（实盘、dryrun、tradeMonitor/Executor 共用）。
+     * delay = min(BASE * 2^min(streak-1, MAX_EXPONENT), MAX_MS)
+     */
+    TRANSIENT_RETRY_BASE_MS: parseInt(process.env.TRANSIENT_RETRY_BASE_MS || '2000', 10),
+    TRANSIENT_RETRY_MAX_MS: parseInt(process.env.TRANSIENT_RETRY_MAX_MS || '120000', 10),
+    TRANSIENT_BACKOFF_MAX_EXPONENT: parseInt(process.env.TRANSIENT_BACKOFF_MAX_EXPONENT || '16', 10),
+    /** CLOB createApiKey / 初始化最大尝试次数（每次失败会按上式退避） */
+    CLOB_INIT_MAX_ATTEMPTS: parseInt(process.env.CLOB_INIT_MAX_ATTEMPTS || '12', 10),
+    /** 停止子服务后等待多久再关库/重连（毫秒，0=不等待） */
+    TRANSIENT_RESTART_SETTLE_MS: parseInt(process.env.TRANSIENT_RESTART_SETTLE_MS || '2000', 10),
 
     /**
      * 仓位对账周期（毫秒，0=关闭）。实盘（npm start / dev）与模拟（npm run dryrun）共用同一套变量。
