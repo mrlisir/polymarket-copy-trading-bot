@@ -18,6 +18,7 @@ import tradeMonitor, { stopTradeMonitor } from './services/tradeMonitor';
 import dryRunExecutor, { stopDryRunExecutor } from './services/dryRunExecutor';
 import Logger from './utils/logger';
 import { isRetryableTransientError, transientBackoffMs, sleep } from './utils/transientErrors';
+import { endCopyTrackingSession, startCopyTrackingSession } from './services/copyTrackingService';
 
 let isShuttingDown = false;
 let envReloadTimer: ReturnType<typeof setInterval> | undefined;
@@ -39,6 +40,7 @@ const gracefulShutdown = async (signal: string) => {
     if (ENV.TRANSIENT_RESTART_SETTLE_MS > 0) {
         await new Promise((resolve) => setTimeout(resolve, ENV.TRANSIENT_RESTART_SETTLE_MS));
     }
+    await endCopyTrackingSession();
     await closeDB();
     Logger.success('已关闭');
     process.exit(0);
@@ -80,6 +82,12 @@ const main = async () => {
         try {
             await connectDB();
             streak = 0;
+            const trackingSid = await startCopyTrackingSession('dryrun');
+            if (trackingSid) {
+                Logger.info(
+                    `📒 模拟回溯已启用 | 会话 ${trackingSid} | 导出: npm run copy-tracking-export -- --session ${trackingSid}`
+                );
+            }
             Logger.success('数据库连接就绪');
 
             Logger.info('正在初始化 CLOB 客户端...');
@@ -124,6 +132,7 @@ const main = async () => {
                 await sleep(ENV.TRANSIENT_RESTART_SETTLE_MS);
             }
             try {
+                await endCopyTrackingSession();
                 await closeDB();
             } catch {
                 // ignore

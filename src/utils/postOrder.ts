@@ -15,6 +15,7 @@ import { fetchPositionsForUser } from './dataApiCache';
 import { resolveCopyOutcomeLabels } from './copyOutcomeLabels';
 import { normalizeClobAssetId } from './clobIds';
 import { fetchClobLightPriceUsdCached } from './clobPublicPrice';
+import { formatTraderDisplayName, recordCopyTrackingFill } from '../services/copyTrackingService';
 
 // Orderbook caching (reduce getOrderBook API load & 404 spam) — 读 ENV.* 以支持 .env 热更新
 
@@ -634,6 +635,28 @@ const postOrder = async (
                 `📝 已记录购买: ${totalBoughtTokens.toFixed(2)} 个代币，用于后续卖出计算`
             );
         }
+        if (ENV.COPY_TRACKING_ENABLED && totalSpentUsdc > 0) {
+            const extras = await buildEmailNotifyExtras(trade, userAddress);
+            await recordCopyTrackingFill({
+                runMode: 'live',
+                traderAddress: userAddress,
+                traderDisplayName: formatTraderDisplayName(trade, userAddress),
+                marketTitle: trade.title || trade.slug || '',
+                slug: trade.slug,
+                conditionId: trade.conditionId,
+                copyMode: getCopyModeForTrader(userAddress),
+                traderSide: trade.side === 'SELL' ? 'SELL' : 'BUY',
+                mySide: 'BUY',
+                traderOutcome: extras.traderOutcome,
+                myOutcome: extras.myOutcome,
+                traderAsset: normalizeClobAssetId(trade.asset),
+                myTradedAsset: tradeAsset,
+                executedUsdc: totalSpentUsdc,
+                myTokenDelta: totalBoughtTokens,
+                traderTxHash: trade.transactionHash,
+                activityObjectId: trade._id ? String(trade._id) : undefined,
+            });
+        }
         return totalSpentUsdc;
     } else if (condition === 'sell') {
         //Sell strategy
@@ -918,6 +941,31 @@ const postOrder = async (
             await onSellSummary({
                 soldTokens: totalSoldTokens,
                 proceedsUsd: totalSoldUsdc,
+                realizedPnlUsd,
+            });
+        }
+        if (ENV.COPY_TRACKING_ENABLED && totalSoldUsdc > 0) {
+            const extras = await buildEmailNotifyExtras(trade, userAddress);
+            const realizedPnlUsd =
+                totalSoldTokens > 0 ? totalSoldUsdc - totalSoldTokens * my_position.avgPrice : undefined;
+            await recordCopyTrackingFill({
+                runMode: 'live',
+                traderAddress: userAddress,
+                traderDisplayName: formatTraderDisplayName(trade, userAddress),
+                marketTitle: trade.title || trade.slug || '',
+                slug: trade.slug,
+                conditionId: trade.conditionId,
+                copyMode: getCopyModeForTrader(userAddress),
+                traderSide: trade.side === 'SELL' ? 'SELL' : 'BUY',
+                mySide: 'SELL',
+                traderOutcome: extras.traderOutcome,
+                myOutcome: extras.myOutcome,
+                traderAsset: normalizeClobAssetId(trade.asset),
+                myTradedAsset: sellAsset,
+                executedUsdc: totalSoldUsdc,
+                myTokenDelta: -totalSoldTokens,
+                traderTxHash: trade.transactionHash,
+                activityObjectId: trade._id ? String(trade._id) : undefined,
                 realizedPnlUsd,
             });
         }

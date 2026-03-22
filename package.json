@@ -39,6 +39,7 @@
         "health-check": "ts-node src/scripts/healthCheck.ts",
         "email-test": "ts-node src/scripts/emailTest.ts",
         "verify-clob-book": "ts-node src/scripts/verifyClobReverseBook.ts",
+        "copy-tracking-export": "ts-node src/scripts/exportCopyTrackingReport.ts",
         "lint": "eslint .",
         "lint:fix": "eslint --fix .",
         "format": "prettier --write ."
@@ -73,6 +74,7 @@
         "chalk": "^5.4.1",
         "dotenv": "^16.4.7",
         "ethers": "^5.8.0",
+        "exceljs": "^4.4.0",
         "moment": "^2.30.1",
         "mongoose": "^8.9.5",
         "nodemailer": "^8.0.3",

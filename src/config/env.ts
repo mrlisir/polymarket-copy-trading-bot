@@ -598,6 +598,11 @@ export const ENV = {
     /** 周期性重新读取项目根目录 `.env` 并更新内存中的 `ENV`（毫秒，0=关闭） */
     ENV_FILE_RELOAD_INTERVAL_MS: parseInt(process.env.ENV_FILE_RELOAD_INTERVAL_MS || '0', 10),
 
+    /** 跟单回溯：写入 Mongo 会话与成交流水；false 关闭 */
+    COPY_TRACKING_ENABLED: process.env.COPY_TRACKING_ENABLED !== 'false',
+    /** 导出 Excel 默认目录（`npm run copy-tracking-export`） */
+    COPY_TRACKING_REPORT_DIR: (process.env.COPY_TRACKING_REPORT_DIR || 'reports').trim(),
+
     /**
      * 仓位对账周期（毫秒，0=关闭）。实盘（npm start / dev）与模拟（npm run dryrun）共用同一套变量。
      */
@@ -755,6 +760,8 @@ const applyReloadableProcessEnvToRuntimeEnv = (): void => {
     ENV.CLOB_INIT_MAX_ATTEMPTS = parseInt(process.env.CLOB_INIT_MAX_ATTEMPTS || '12', 10);
     ENV.TRANSIENT_RESTART_SETTLE_MS = parseInt(process.env.TRANSIENT_RESTART_SETTLE_MS || '2000', 10);
     ENV.ENV_FILE_RELOAD_INTERVAL_MS = parseInt(process.env.ENV_FILE_RELOAD_INTERVAL_MS || '0', 10);
+    ENV.COPY_TRACKING_ENABLED = process.env.COPY_TRACKING_ENABLED !== 'false';
+    ENV.COPY_TRACKING_REPORT_DIR = (process.env.COPY_TRACKING_REPORT_DIR || 'reports').trim();
     ENV.POSITION_RECONCILE_INTERVAL_MS = parseInt(process.env.POSITION_RECONCILE_INTERVAL_MS || '0', 10);
     ENV.POSITION_RECONCILE_MAX_PER_RUN = parseInt(process.env.POSITION_RECONCILE_MAX_PER_RUN || '5', 10);
     ENV.POSITION_RECONCILE_COOLDOWN_MS = parseInt(process.env.POSITION_RECONCILE_COOLDOWN_MS || '120000', 10);

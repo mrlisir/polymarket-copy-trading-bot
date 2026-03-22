@@ -30,6 +30,8 @@ import {
 } from './positionReconciliationCore';
 import { fetchGammaSettlementInfoCached, gammaTokenLooksSettled } from '../utils/gammaSettlement';
 import { resolveCopyOutcomeLabels } from '../utils/copyOutcomeLabels';
+import { normalizeClobAssetId } from '../utils/clobIds';
+import { formatTraderDisplayName, recordCopyTrackingFill } from './copyTrackingService';
 import { formatBeijingDateTime } from '../utils/time';
 import { notifyCopyRiskStop } from '../utils/emailNotifier';
 import { isRetryableTransientError, transientBackoffMs, sleep } from '../utils/transientErrors';
@@ -643,6 +645,28 @@ const doDryTrading = async (
             );
         }
         setDryConditionBuyLock(trade.conditionId, tradeAsset);
+
+        if (ENV.COPY_TRACKING_ENABLED && result.spent > 0) {
+            await recordCopyTrackingFill({
+                runMode: 'dryrun',
+                traderAddress: trade.userAddress,
+                traderDisplayName: formatTraderDisplayName(trade, trade.userAddress),
+                marketTitle: trade.title || trade.slug || '',
+                slug: trade.slug,
+                conditionId: trade.conditionId,
+                copyMode,
+                traderSide: trade.side === 'SELL' ? 'SELL' : 'BUY',
+                mySide: 'BUY',
+                traderOutcome: outcomeLabels.traderOutcome,
+                myOutcome: outcomeLabels.myOutcome,
+                traderAsset: normalizeClobAssetId(trade.asset),
+                myTradedAsset: normalizeClobAssetId(tradeAsset),
+                executedUsdc: result.spent,
+                myTokenDelta: result.tokens,
+                traderTxHash: trade.transactionHash,
+                activityObjectId: trade._id ? String(trade._id) : undefined,
+            });
+        }
     } else {
         if (!orderBook.bids || orderBook.bids.length === 0) {
             const key = `noBids:${tradeAsset}`;
@@ -710,6 +734,29 @@ const doDryTrading = async (
         console.log(`  📈 已实现盈亏: $${pnl >= 0 ? '+' : ''}${pnl.toFixed(2)} (成本 $${costBasis.toFixed(2)})`);
         simulatedBalance += result.proceeds;
         await handleDryRiskAfterSell(trade.userAddress, pnl);
+
+        if (ENV.COPY_TRACKING_ENABLED && result.proceeds > 0) {
+            await recordCopyTrackingFill({
+                runMode: 'dryrun',
+                traderAddress: trade.userAddress,
+                traderDisplayName: formatTraderDisplayName(trade, trade.userAddress),
+                marketTitle: trade.title || trade.slug || '',
+                slug: trade.slug,
+                conditionId: trade.conditionId,
+                copyMode,
+                traderSide: 'SELL',
+                mySide: 'SELL',
+                traderOutcome: outcomeLabels.traderOutcome,
+                myOutcome: outcomeLabels.myOutcome,
+                traderAsset: normalizeClobAssetId(trade.asset),
+                myTradedAsset: normalizeClobAssetId(tradeAsset),
+                executedUsdc: result.proceeds,
+                myTokenDelta: -result.tokens,
+                traderTxHash: trade.transactionHash,
+                activityObjectId: trade._id ? String(trade._id) : undefined,
+                realizedPnlUsd: pnl,
+            });
+        }
 
             existing.size -= result.tokens;
             if (existing.size <= 0.0001) {

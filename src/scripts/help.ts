@@ -64,6 +64,7 @@ console.log(`  ${colors.green}npm run simulate-old${colors.reset}      Simulate 
 console.log(`  ${colors.green}npm run sim${colors.reset}               Run comprehensive simulations`);
 console.log(`  ${colors.green}npm run compare${colors.reset}           Compare simulation results`);
 console.log(`  ${colors.green}npm run verify-clob-book${colors.reset}  Gamma + CLOB book (正买/反买对账自检)`);
+console.log(`  ${colors.green}npm run copy-tracking-export${colors.reset}  跟单回溯 Excel（流水/汇总/市场结算）`);
 console.log('');
 
 console.log(`${colors.yellow}${colors.bright}🔧 ADVANCED & UTILITIES${colors.reset}\n`);
@@ -77,6 +78,7 @@ console.log(`  ${colors.cyan}docs/入门指南.md${colors.reset}          Comple
 console.log(`  ${colors.cyan}项目说明.md${colors.reset}               Full documentation`);
 console.log(`  ${colors.cyan}docs/快速开始.md${colors.reset}          5-minute quick start`);
 console.log(`  ${colors.cyan}docs/多交易员指南.md${colors.reset}      Copy multiple traders`);
+console.log(`  ${colors.cyan}docs/更新日志_V6.md${colors.reset}      跟单回溯报表（Excel）`);
 console.log('');
 
 console.log(`${colors.blue}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${colors.reset}\n`);

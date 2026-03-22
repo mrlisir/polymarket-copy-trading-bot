@@ -13,6 +13,7 @@ import Logger from './utils/logger';
 import { performHealthCheck, logHealthCheck } from './utils/healthCheck';
 import { closeStalePositionsIfAny } from './scripts/closeStalePositions';
 import { isRetryableTransientError, transientBackoffMs, sleep } from './utils/transientErrors';
+import { endCopyTrackingSession, startCopyTrackingSession } from './services/copyTrackingService';
 
 // Graceful shutdown handler
 let isShuttingDown = false;
@@ -52,6 +53,7 @@ const gracefulShutdown = async (signal: string) => {
             await new Promise((resolve) => setTimeout(resolve, ENV.TRANSIENT_RESTART_SETTLE_MS));
         }
 
+        await endCopyTrackingSession();
         // Close database connection
         await closeDB();
 
@@ -122,6 +124,12 @@ export const main = async () => {
         try {
             await connectDB();
             supervisorStreak = 0;
+            const trackingSid = await startCopyTrackingSession('live');
+            if (trackingSid) {
+                Logger.info(
+                    `📒 跟单回溯已启用 | 会话 ${trackingSid} | 导出: npm run copy-tracking-export -- --session ${trackingSid}`
+                );
+            }
             Logger.startup(ENV.USER_ADDRESSES, ENV.PROXY_WALLET, {
                 copyModeSummary: buildCopyModeStartupSummary(),
                 copyModeTag: (a) => copyModeLabelZhShort(getCopyModeForTrader(a)),
@@ -196,6 +204,7 @@ export const main = async () => {
                 await sleep(ENV.TRANSIENT_RESTART_SETTLE_MS);
             }
             try {
+                await endCopyTrackingSession();
                 await closeDB();
             } catch {
                 // ignore
