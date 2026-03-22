@@ -3,6 +3,7 @@ import { copyModeLabelZhShort } from '../config/copyStrategy';
 import { CopyMode } from '../config/copyStrategy';
 import { getUserActivityModel, getUserPositionModel } from '../models/userHistory';
 import { resolveReverseAssetForCondition } from '../utils/conditionTokens';
+import { normalizeClobAssetId, safeClobAssetFromApi } from '../utils/clobIds';
 import { fetchPositionsForUser } from '../utils/dataApiCache';
 import fetchData from '../utils/fetchData';
 import Logger from '../utils/logger';
@@ -14,10 +15,11 @@ import { isRetryableTransientError, transientBackoffMs, sleep } from '../utils/t
  * Uses Gamma API (https://gamma-api.polymarket.com) for market data.
  */
 const fetchOppositeAsset = async (conditionId: string, currentAsset: string): Promise<string> => {
-    Logger.info(`正在获取反向代币: conditionId=${conditionId.slice(0, 16)}..., asset=${currentAsset.slice(0, 20)}...`);
+    const cur = normalizeClobAssetId(currentAsset);
+    Logger.info(`正在获取反向代币: conditionId=${conditionId.slice(0, 16)}..., asset=${cur.slice(0, 20)}...`);
 
     // Fast path: strictly trust tokens that belong to this condition.
-    const strict = await resolveReverseAssetForCondition(conditionId, currentAsset);
+    const strict = await resolveReverseAssetForCondition(conditionId, cur);
     if (strict.valid && strict.oppositeAsset) {
         Logger.info(`✅ 条件白名单校验命中反向代币: ${strict.oppositeAsset.slice(0, 20)}...`);
         return strict.oppositeAsset;
@@ -30,7 +32,9 @@ const fetchOppositeAsset = async (conditionId: string, currentAsset: string): Pr
             try {
                 const tokenIds: string[] = JSON.parse(market.clobTokenIds);
                 if (tokenIds.length >= 2) {
-                    const opposite = tokenIds.find((id: string) => id !== currentAsset);
+                    const opposite = tokenIds
+                        .map((id) => normalizeClobAssetId(id))
+                        .find((id: string) => id !== cur);
                     if (opposite) {
                         return opposite;
                     }
@@ -42,7 +46,9 @@ const fetchOppositeAsset = async (conditionId: string, currentAsset: string): Pr
 
         // 尝试 outcomeAssets
         if (Array.isArray(market.outcomeAssets) && market.outcomeAssets.length >= 2) {
-            const opposite = market.outcomeAssets.find((a: string) => a !== currentAsset);
+            const opposite = market.outcomeAssets
+                .map((a: string) => normalizeClobAssetId(a))
+                .find((a: string) => a !== cur);
             if (opposite) {
                 return opposite;
             }
@@ -51,12 +57,12 @@ const fetchOppositeAsset = async (conditionId: string, currentAsset: string): Pr
         return null;
     };
 
-    // Method 1: 先尝试按 condition_id 查询，如果返回空或错误市场，再尝试其他方法
+    // Method 1: 先尝试按 condition_ids 查询（勿用 condition_id，Gamma 会忽略并返回无关列表）
     let foundOpposite: string | null = null;
 
     try {
         const response = await fetchData(
-            `https://gamma-api.polymarket.com/markets?condition_id=${conditionId}`
+            `https://gamma-api.polymarket.com/markets?condition_ids=${encodeURIComponent(conditionId)}`
         );
 
         if (response && typeof response === 'object') {
@@ -65,24 +71,26 @@ const fetchOppositeAsset = async (conditionId: string, currentAsset: string): Pr
             if (markets.length > 0) {
                 // 检查第一个市场是否匹配
                 const firstMarket = markets[0];
-                if (firstMarket.conditionId === conditionId) {
+                const fc = String(firstMarket.conditionId || '').toLowerCase();
+                if (fc && fc === conditionId.toLowerCase()) {
                     Logger.info(`   找到匹配市场: ${(firstMarket.question || '').slice(0, 50)}...`);
                     foundOpposite = findOppositeInMarket(firstMarket);
                     if (foundOpposite) {
-                        Logger.info(`✅ Gamma API (condition_id) 找到反向代币: ${foundOpposite.slice(0, 20)}...`);
-                        return foundOpposite;
+                        const out = normalizeClobAssetId(foundOpposite);
+                        Logger.info(`✅ Gamma API (condition_ids) 找到反向代币: ${out.slice(0, 20)}...`);
+                        return out;
                     }
                 }
             }
         }
     } catch (error) {
-        Logger.warning(`Gamma API condition_id 查询失败: ${error}`);
+        Logger.warning(`Gamma API condition_ids 查询失败: ${error}`);
     }
 
     // Method 2: 使用 orderbook 获取 condition_id，再查询 Gamma API
     try {
         const orderbookResponse = await fetchData(
-            `https://clob.polymarket.com/book?token_id=${currentAsset}`
+            `https://clob.polymarket.com/book?token_id=${encodeURIComponent(cur)}`
         );
 
         if (orderbookResponse && typeof orderbookResponse === 'object') {
@@ -91,7 +99,7 @@ const fetchOppositeAsset = async (conditionId: string, currentAsset: string): Pr
                 Logger.info(`   orderbook 返回 condition_id: ${marketConditionId.slice(0, 20)}...`);
 
                 const response = await fetchData(
-                    `https://gamma-api.polymarket.com/markets?condition_id=${marketConditionId}`
+                    `https://gamma-api.polymarket.com/markets?condition_ids=${encodeURIComponent(marketConditionId)}`
                 );
 
                 if (response && typeof response === 'object') {
@@ -100,8 +108,9 @@ const fetchOppositeAsset = async (conditionId: string, currentAsset: string): Pr
                     for (const market of markets) {
                         foundOpposite = findOppositeInMarket(market);
                         if (foundOpposite) {
-                            Logger.info(`✅ orderbook + Gamma API 找到反向代币: ${foundOpposite.slice(0, 20)}...`);
-                            return foundOpposite;
+                            const out = normalizeClobAssetId(foundOpposite);
+                            Logger.info(`✅ orderbook + Gamma API 找到反向代币: ${out.slice(0, 20)}...`);
+                            return out;
                         }
                     }
                 }
@@ -136,8 +145,9 @@ const fetchOppositeAsset = async (conditionId: string, currentAsset: string): Pr
                         Logger.info(`   遍历找到匹配市场: ${(market.question || '').slice(0, 50)}...`);
                         foundOpposite = findOppositeInMarket(market);
                         if (foundOpposite) {
-                            Logger.info(`✅ 遍历市场列表找到反向代币: ${foundOpposite.slice(0, 20)}...`);
-                            return foundOpposite;
+                            const out = normalizeClobAssetId(foundOpposite);
+                            Logger.info(`✅ 遍历市场列表找到反向代币: ${out.slice(0, 20)}...`);
+                            return out;
                         }
                     }
                 }
@@ -283,15 +293,23 @@ const fetchTradeData = async () => {
             const traderPositionsArr = (Array.isArray(traderPositions) ? traderPositions : []) as any[];
             for (const pos of traderPositionsArr) {
                 if (pos.conditionId && pos.asset && pos.oppositeAsset && pos.oppositeAsset !== pos.asset) {
-                    oppositeAssetCache[cacheKey(pos.conditionId, pos.asset)] = pos.oppositeAsset;
+                    const a = safeClobAssetFromApi(pos.asset, 'traderPositions.asset');
+                    oppositeAssetCache[cacheKey(pos.conditionId, a)] = safeClobAssetFromApi(
+                        pos.oppositeAsset,
+                        'traderPositions.oppositeAsset'
+                    );
                 }
             }
 
             for (const pos of proxyPositionsArr) {
                 if (pos.conditionId && pos.asset && pos.oppositeAsset) {
-                    const key = cacheKey(pos.conditionId, pos.asset);
+                    const a = safeClobAssetFromApi(pos.asset, 'positions.asset');
+                    const key = cacheKey(pos.conditionId, a);
                     if (!oppositeAssetCache[key]) {
-                        oppositeAssetCache[key] = pos.oppositeAsset;
+                        oppositeAssetCache[key] = safeClobAssetFromApi(
+                            pos.oppositeAsset,
+                            'positions.oppositeAsset'
+                        );
                     }
                 }
             }
@@ -322,6 +340,15 @@ const fetchTradeData = async () => {
 
                 // Save new trade to database and immediately mark as "claimed" by bot
                 // This prevents tradeExecutor from missing it and tradeMonitor from re-detecting it
+                const assetNorm = safeClobAssetFromApi(activity.asset, 'activity.asset');
+                let rawOpp: string | undefined =
+                    safeClobAssetFromApi(activity.oppositeAsset, 'activity.oppositeAsset') ||
+                    (activity.conditionId && assetNorm
+                        ? oppositeAssetCache[cacheKey(activity.conditionId, assetNorm)]
+                        : undefined);
+                if (!rawOpp && activity.conditionId && assetNorm) {
+                    rawOpp = await fetchOppositeAsset(activity.conditionId, assetNorm);
+                }
                 const newActivity = new UserActivity({
                     // 先按既有来源拿候选 oppositeAsset，随后做 conditionId 白名单校验
                     proxyWallet: activity.proxyWallet,
@@ -332,15 +359,10 @@ const fetchTradeData = async () => {
                     usdcSize: activity.usdcSize,
                     transactionHash: activity.transactionHash,
                     price: activity.price,
-                    asset: activity.asset,
+                    asset: assetNorm,
                     side: activity.side,
                     outcomeIndex: activity.outcomeIndex,
-                    oppositeAsset:
-                        activity.oppositeAsset ||
-                        (activity.conditionId && activity.asset
-                            ? oppositeAssetCache[cacheKey(activity.conditionId, activity.asset)]
-                            : undefined) ||
-                        (await fetchOppositeAsset(activity.conditionId, activity.asset)),
+                    oppositeAsset: normalizeClobAssetId(rawOpp || '') || undefined,
                     title: activity.title,
                     slug: activity.slug,
                     icon: activity.icon,

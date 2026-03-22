@@ -43,7 +43,7 @@ export const fetchGammaSettlementInfoCached = async (
     let info: GammaSettlementCacheValue = { status: 'not_found' };
     try {
         const raw = await fetchData(
-            `https://gamma-api.polymarket.com/markets?condition_id=${encodeURIComponent(conditionId)}`
+            `https://gamma-api.polymarket.com/markets?condition_ids=${encodeURIComponent(conditionId)}`
         );
         const markets = Array.isArray(raw) ? raw : [];
         const market = markets[0] as Record<string, unknown> | undefined;

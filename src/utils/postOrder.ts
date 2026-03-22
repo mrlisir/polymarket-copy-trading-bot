@@ -13,6 +13,8 @@ import {
 import { notifyOrderSuccess } from './emailNotifier';
 import { fetchPositionsForUser } from './dataApiCache';
 import { resolveCopyOutcomeLabels } from './copyOutcomeLabels';
+import { normalizeClobAssetId } from './clobIds';
+import { fetchClobLightPriceUsdCached } from './clobPublicPrice';
 
 // Orderbook caching (reduce getOrderBook API load & 404 spam) — 读 ENV.* 以支持 .env 热更新
 
@@ -73,34 +75,57 @@ const trimOrderBookCache = () => {
     }
 };
 
+/** 统一 bids/asks 字段名（部分网关/SDK 变体可能用 sells/buys） */
+const normalizeOrderBookShape = (raw: unknown): any => {
+    if (!raw || typeof raw !== 'object') return raw;
+    const ob = raw as Record<string, unknown>;
+    const asksRaw = ob.asks ?? ob.sells;
+    const bidsRaw = ob.bids ?? ob.buys;
+    return {
+        ...ob,
+        asks: Array.isArray(asksRaw) ? asksRaw : [],
+        bids: Array.isArray(bidsRaw) ? bidsRaw : [],
+    };
+};
+
+const orderBookAsksLen = (ob: any): number =>
+    Array.isArray(ob?.asks) ? ob.asks.length : 0;
+
+export type FetchOrderBookCachedOptions = { bypassCache?: boolean };
+
 /** Exported for shared mark/valuation (dry run + live portfolio log). */
 export const fetchOrderBookCached = async (
     clobClient: ClobClient,
-    tokenId: string
+    tokenId: string,
+    options?: FetchOrderBookCachedOptions
 ): Promise<any | null> => {
+    const id = normalizeClobAssetId(tokenId);
+    if (!id) return null;
+
     const now = Date.now();
-    const cached = orderBookCache.get(tokenId);
-    if (cached && now - cached.fetchedAt <= ENV.ORDERBOOK_CACHE_TTL_MS) {
-        return cached.value;
+    if (!options?.bypassCache) {
+        const cached = orderBookCache.get(id);
+        if (cached && now - cached.fetchedAt <= ENV.ORDERBOOK_CACHE_TTL_MS) {
+            return cached.value;
+        }
     }
 
     try {
-        const orderBook = await clobClient.getOrderBook(tokenId);
-        orderBookCache.set(tokenId, { fetchedAt: now, value: orderBook });
+        const raw = await clobClient.getOrderBook(id);
+        const orderBook = normalizeOrderBookShape(raw);
+        orderBookCache.set(id, { fetchedAt: now, value: orderBook });
         trimOrderBookCache();
         return orderBook;
     } catch (err: any) {
         const status = err?.response?.status;
         if (status === 404) {
-            orderBookCache.set(tokenId, { fetchedAt: now, value: null });
+            orderBookCache.set(id, { fetchedAt: now, value: null });
             trimOrderBookCache();
 
-            const lastLoggedAt = orderBookMissingLastLoggedAt.get(tokenId) || 0;
+            const lastLoggedAt = orderBookMissingLastLoggedAt.get(id) || 0;
             if (now - lastLoggedAt >= ENV.ORDERBOOK_MISSING_LOG_THROTTLE_MS) {
-                orderBookMissingLastLoggedAt.set(tokenId, now);
-                Logger.warning(
-                    `⚠️  订单簿不存在 (404): token ${tokenId.slice(0, 12)}...（已限流）`
-                );
+                orderBookMissingLastLoggedAt.set(id, now);
+                Logger.warning(`⚠️  订单簿不存在 (404): token ${id.slice(0, 12)}...（已限流）`);
             }
             return null;
         }
@@ -131,6 +156,18 @@ const getPositionAsset = (trade: UserActivityInterface, userAddress: string): st
         }
     }
     return trade.asset;
+};
+
+/**
+ * 滑点参考价：正买时用交易员成交价；反买 BUY 时买的是对侧代币，二元市场可用 1 - p 近似对侧公允（与盘口同侧比较）。
+ */
+const buySlippageReferencePrice = (trade: UserActivityInterface, userAddress: string): number => {
+    const p = Number(trade.price);
+    if (!Number.isFinite(p)) return trade.price;
+    if (isReverseForUser(userAddress) && p > 0 && p < 1) {
+        return 1 - p;
+    }
+    return p;
 };
 
 const extractOrderError = (response: unknown): string | undefined => {
@@ -223,7 +260,7 @@ const postOrder = async (
         while (remaining > 0 && retry < ENV.RETRY_LIMIT) {
             let orderBook;
             try {
-                orderBook = await fetchOrderBookCached(clobClient, trade.asset);
+                orderBook = await fetchOrderBookCached(clobClient, normalizeClobAssetId(trade.asset));
             } catch (orderBookError: unknown) {
                 retry += 1;
                 Logger.warning(`订单簿查询失败 (${retry}/${ENV.RETRY_LIMIT}): ${orderBookError}`);
@@ -314,14 +351,14 @@ const postOrder = async (
         if (isReverseForUser(userAddress) && trade.conditionId) {
             const resolved = await resolveReverseAssetForCondition(
                 trade.conditionId,
-                trade.asset,
-                trade.oppositeAsset
+                normalizeClobAssetId(trade.asset),
+                trade.oppositeAsset ? normalizeClobAssetId(trade.oppositeAsset) : undefined
             );
             if (resolved.valid && resolved.oppositeAsset) {
                 trade.oppositeAsset = resolved.oppositeAsset;
             }
         }
-        const tradeAsset = getPositionAsset(trade, userAddress);
+        const tradeAsset = normalizeClobAssetId(getPositionAsset(trade, userAddress));
         if (isReverseForUser(userAddress)) {
             Logger.info(`🔄 反买模式: 交易员 ${trade.side} → 我买入反向资产 ${tradeAsset}`);
             Logger.info(`   原始订单: ${trade.side} $${trade.usdcSize.toFixed(2)} @ $${trade.price}`);
@@ -335,7 +372,11 @@ const postOrder = async (
         }
         // Safety: in REVERSE mode we must buy the OPPOSITE token.
         // If oppositeAsset is missing/invalid, do not fall back to the same asset.
-        if (isReverseForUser(userAddress) && (!trade.oppositeAsset || trade.oppositeAsset === trade.asset)) {
+        if (
+            isReverseForUser(userAddress) &&
+            (!trade.oppositeAsset ||
+                normalizeClobAssetId(trade.oppositeAsset) === normalizeClobAssetId(trade.asset))
+        ) {
             Logger.warning('⚠️ 反买模式缺少有效 oppositeAsset（或与原 asset 相同），本笔跳过，避免执行成跟随单');
             await UserActivity.updateOne({ _id: trade._id }, { bot: true });
             return 0;
@@ -434,8 +475,33 @@ const postOrder = async (
                 break;
             }
 
-            if (!orderBook.asks || orderBook.asks.length === 0) {
-                Logger.warning('No asks available in order book');
+            if (!orderBookAsksLen(orderBook)) {
+                orderBookCache.delete(tradeAsset);
+                Logger.info(
+                    `订单簿 asks 为空，已丢弃缓存并强制向 CLOB 再拉一次（token=${tradeAsset.slice(0, 16)}...）`
+                );
+                try {
+                    orderBook = await fetchOrderBookCached(clobClient, tradeAsset, {
+                        bypassCache: true,
+                    });
+                } catch {
+                    // 保持下方统一无 asks 分支
+                }
+            }
+
+            if (!orderBook || !orderBookAsksLen(orderBook)) {
+                const mid = await fetchClobLightPriceUsdCached(tradeAsset);
+                const hint =
+                    mid != null
+                        ? ` CLOB midpoint≈${mid.toFixed(4)} 仍可读，若网页有挂单而此处无 asks，常见原因：token_id 与页面展示不一致、或卖单在快照间被吃光。`
+                        : ` 轻量价也为空；请用浏览器开发者工具核对 Polymarket 上该 outcome 的 token_id 是否与本日志一致（${tradeAsset.slice(0, 20)}...）。`;
+                if (isReverseForUser(userAddress)) {
+                    Logger.warning(
+                        `订单簿无卖单（反买，已跳缓存重试）。下单 token=${tradeAsset.slice(0, 20)}...${hint}`
+                    );
+                } else {
+                    Logger.warning(`No asks after cache-bypass retry. token=${tradeAsset.slice(0, 20)}...${hint}`);
+                }
                 await UserActivity.updateOne({ _id: trade._id }, { bot: true });
                 break;
             }
@@ -448,7 +514,8 @@ const postOrder = async (
             );
 
             Logger.info(`最优卖价: ${minPriceAsk.size} @ $${minPriceAsk.price}`);
-            if (parseFloat(minPriceAsk.price) - ENV.ORDER_PRICE_SLIPPAGE_USD > trade.price) {
+            const slipRef = buySlippageReferencePrice(trade, userAddress);
+            if (parseFloat(minPriceAsk.price) - ENV.ORDER_PRICE_SLIPPAGE_USD > slipRef) {
                 Logger.warning('价格滑点过大 — 跳过此次交易');
                 await UserActivity.updateOne({ _id: trade._id }, { bot: true });
                 break;
@@ -582,8 +649,8 @@ const postOrder = async (
         if (isReverseForUser(userAddress) && trade.conditionId) {
             const resolved = await resolveReverseAssetForCondition(
                 trade.conditionId,
-                trade.asset,
-                trade.oppositeAsset
+                normalizeClobAssetId(trade.asset),
+                trade.oppositeAsset ? normalizeClobAssetId(trade.oppositeAsset) : undefined
             );
             if (resolved.valid && resolved.oppositeAsset) {
                 trade.oppositeAsset = resolved.oppositeAsset;
@@ -593,11 +660,15 @@ const postOrder = async (
         // Determine which asset we're selling
         // In REVERSE mode: we sell oppositeAsset (we hold the opposite tokens)
         // In FOLLOW mode: we sell the same asset as trader
-        const sellAsset = isReverseForUser(userAddress)
-            ? (trade.oppositeAsset || trade.asset)
-            : trade.asset;
+        const sellAsset = normalizeClobAssetId(
+            isReverseForUser(userAddress) ? trade.oppositeAsset || trade.asset : trade.asset
+        );
         // Safety: in REVERSE mode we must sell the OPPOSITE token.
-        if (isReverseForUser(userAddress) && (!trade.oppositeAsset || trade.oppositeAsset === trade.asset)) {
+        if (
+            isReverseForUser(userAddress) &&
+            (!trade.oppositeAsset ||
+                normalizeClobAssetId(trade.oppositeAsset) === normalizeClobAssetId(trade.asset))
+        ) {
             Logger.warning('⚠️ 反买模式缺少有效 oppositeAsset（或与原 asset 相同），本笔跳过，避免执行成跟随单');
             await UserActivity.updateOne({ _id: trade._id }, { bot: true });
             return 0;
@@ -875,7 +946,7 @@ export const marketSellTokensFOK = async (
     while (remaining >= MIN_ORDER_SIZE_TOKENS && retry < ENV.RETRY_LIMIT) {
         let orderBook;
         try {
-            orderBook = await fetchOrderBookCached(clobClient, tokenId);
+            orderBook = await fetchOrderBookCached(clobClient, normalizeClobAssetId(tokenId));
         } catch (orderBookError: unknown) {
             retry += 1;
             Logger.warning(

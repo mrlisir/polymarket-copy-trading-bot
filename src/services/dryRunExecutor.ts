@@ -43,9 +43,9 @@ const MIN_ORDER_SIZE_TOKENS = 1.0;
  */
 const fetchOppositeAssetDryRun = async (conditionId: string, currentAsset: string): Promise<string> => {
     try {
-        // Try Gamma API with condition_id
+        // Try Gamma API with condition_ids（condition_id 会被忽略）
         const response = await fetchData(
-            `https://gamma-api.polymarket.com/markets?condition_id=${conditionId}`
+            `https://gamma-api.polymarket.com/markets?condition_ids=${encodeURIComponent(conditionId)}`
         );
 
         if (response && typeof response === 'object') {
@@ -87,7 +87,7 @@ const fetchOppositeAssetDryRun = async (conditionId: string, currentAsset: strin
             const marketConditionId = (orderbookResponse as any).market;
             if (marketConditionId) {
                 const response = await fetchData(
-                    `https://gamma-api.polymarket.com/markets?condition_id=${marketConditionId}`
+                    `https://gamma-api.polymarket.com/markets?condition_ids=${encodeURIComponent(marketConditionId)}`
                 );
 
                 if (response && typeof response === 'object') {
@@ -579,8 +579,14 @@ const doDryTrading = async (
             const key = `noAsks:${tradeAsset}`;
             if (!noAsksLogged.has(key)) {
                 noAsksLogged.add(key);
-            console.log(`  ⚠️  无卖单，跳过`);
-            console.log('─'.repeat(70));
+                if (isReversed) {
+                    console.log(
+                        `  ⚠️  无卖单，跳过（反买：对侧代币常无深度，与 REVERSE 列配置无关；可试正买或更长周期市场）`
+                    );
+                } else {
+                    console.log(`  ⚠️  无卖单，跳过`);
+                }
+                console.log('─'.repeat(70));
             }
             return;
         }

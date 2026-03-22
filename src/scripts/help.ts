@@ -63,6 +63,7 @@ console.log(`  ${colors.green}npm run simulate${colors.reset}          Simulate 
 console.log(`  ${colors.green}npm run simulate-old${colors.reset}      Simulate with old algorithm`);
 console.log(`  ${colors.green}npm run sim${colors.reset}               Run comprehensive simulations`);
 console.log(`  ${colors.green}npm run compare${colors.reset}           Compare simulation results`);
+console.log(`  ${colors.green}npm run verify-clob-book${colors.reset}  Gamma + CLOB book (正买/反买对账自检)`);
 console.log('');
 
 console.log(`${colors.yellow}${colors.bright}🔧 ADVANCED & UTILITIES${colors.reset}\n`);

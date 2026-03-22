@@ -260,6 +260,7 @@ validateUrls();
 
 /**
  * 解析跟单地址列表：支持逗号分隔或 JSON 数组；`fieldName` 用于报错文案。
+ * 与早期单一变量 `USER_ADDRESSES` 的 `parseUserAddresses` 逻辑一致。
  */
 const parseTraderAddresses = (input: string, fieldName: string): string[] => {
     const trimmed = input.trim();

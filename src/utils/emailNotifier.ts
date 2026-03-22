@@ -103,7 +103,7 @@ const fullOrMask = (value?: string, maxLen = 200): string => {
 
 /** Gamma：按 condition 查市场元数据（含 clobTokenIds） */
 const linkGammaMarkets = (conditionId: string): string =>
-    `https://gamma-api.polymarket.com/markets?condition_id=${encodeURIComponent(conditionId)}`;
+    `https://gamma-api.polymarket.com/markets?condition_ids=${encodeURIComponent(conditionId)}`;
 
 /** CLOB：该 token 的订单簿（成交价/深度） */
 const linkClobBook = (tokenId: string): string =>

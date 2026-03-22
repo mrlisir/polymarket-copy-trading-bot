@@ -38,6 +38,7 @@
         "audit-old": "ts-node src/scripts/auditCopyTradingAlgorithm.ts",
         "health-check": "ts-node src/scripts/healthCheck.ts",
         "email-test": "ts-node src/scripts/emailTest.ts",
+        "verify-clob-book": "ts-node src/scripts/verifyClobReverseBook.ts",
         "lint": "eslint .",
         "lint:fix": "eslint --fix .",
         "format": "prettier --write ."
