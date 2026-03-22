@@ -1,7 +1,12 @@
 import { ethers } from 'ethers';
 import { AssetType, ClobClient, OrderType, Side } from '@polymarket/clob-client';
-import { SignatureType } from '@polymarket/order-utils';
 import { ENV } from '../config/env';
+import { resolveSellScriptClobSignerMode } from '../utils/resolveSellScriptClobSignerMode';
+import {
+    capSellSizeByBalance,
+    isInsufficientBalanceOrAllowanceMessage,
+    syncConditionalBalanceShares,
+} from '../utils/clobConditionalSellSync';
 
 const PROXY_WALLET = ENV.PROXY_WALLET;
 const PRIVATE_KEY = ENV.PRIVATE_KEY;
@@ -24,60 +29,53 @@ interface Position {
     outcome: string;
 }
 
-const isGnosisSafe = async (
-    address: string,
-    provider: ethers.providers.JsonRpcProvider
-): Promise<boolean> => {
-    try {
-        const code = await provider.getCode(address);
-        return code !== '0x';
-    } catch (error) {
-        console.error(`检查钱包类型时出错: ${error}`);
-        return false;
-    }
-};
-
 const createClobClient = async (
     provider: ethers.providers.JsonRpcProvider
 ): Promise<ClobClient> => {
     const wallet = new ethers.Wallet(PRIVATE_KEY, provider);
-    const isProxySafe = await isGnosisSafe(PROXY_WALLET, provider);
-    const signatureType = isProxySafe ? SignatureType.POLY_GNOSIS_SAFE : SignatureType.EOA;
+    const { signatureType, funderAddress, modeLabel } = await resolveSellScriptClobSignerMode(
+        provider,
+        PRIVATE_KEY,
+        PROXY_WALLET
+    );
 
-    console.log(`钱包类型: ${isProxySafe ? 'Gnosis Safe 多签钱包' : 'EOA 普通钱包'}`);
+    console.log(`CLOB 签名模式: ${modeLabel}`);
 
     const originalConsoleLog = console.log;
     const originalConsoleError = console.error;
-    console.log = function () {};
-    console.error = function () {};
 
-    let clobClient = new ClobClient(
-        CLOB_HTTP_URL,
-        POLYGON_CHAIN_ID,
-        wallet,
-        undefined,
-        signatureType,
-        isProxySafe ? PROXY_WALLET : undefined
-    );
+    try {
+        console.log = function () {};
+        console.error = function () {};
 
-    let creds = await clobClient.createApiKey();
-    if (!creds.key) {
-        creds = await clobClient.deriveApiKey();
+        let clobClient = new ClobClient(
+            CLOB_HTTP_URL,
+            POLYGON_CHAIN_ID,
+            wallet,
+            undefined,
+            signatureType,
+            funderAddress
+        );
+
+        let creds = await clobClient.createApiKey();
+        if (!creds.key) {
+            creds = await clobClient.deriveApiKey();
+        }
+
+        clobClient = new ClobClient(
+            CLOB_HTTP_URL,
+            POLYGON_CHAIN_ID,
+            wallet,
+            creds,
+            signatureType,
+            funderAddress
+        );
+
+        return clobClient;
+    } finally {
+        console.log = originalConsoleLog;
+        console.error = originalConsoleError;
     }
-
-    clobClient = new ClobClient(
-        CLOB_HTTP_URL,
-        POLYGON_CHAIN_ID,
-        wallet,
-        creds,
-        signatureType,
-        isProxySafe ? PROXY_WALLET : undefined
-    );
-
-    console.log = originalConsoleLog;
-    console.error = originalConsoleError;
-
-    return clobClient;
 };
 
 const fetchPositions = async (): Promise<Position[]> => {
@@ -109,7 +107,6 @@ const updatePolymarketCache = async (clobClient: ClobClient, tokenId: string) =>
 };
 
 const sellPosition = async (clobClient: ClobClient, position: Position, sellSize: number) => {
-    let remaining = sellSize;
     let retry = 0;
 
     console.log(
@@ -118,8 +115,29 @@ const sellPosition = async (clobClient: ClobClient, position: Position, sellSize
     console.log(`代币 ID: ${position.asset}`);
     console.log(`市场: ${position.title} - ${position.outcome}\n`);
 
-    // Update Polymarket cache before selling
     await updatePolymarketCache(clobClient, position.asset);
+    const synced = await syncConditionalBalanceShares(clobClient, position.asset);
+    let remaining = capSellSizeByBalance(sellSize, synced?.balance);
+    if (synced) {
+        const alw =
+            synced.allowanceFormatted !== undefined
+                ? ` | CLOB 授权: ${synced.allowanceFormatted}`
+                : '';
+        console.log(
+            `📎 CLOB 条件代币同步后: 余额 ${synced.balance.toFixed(6)} 股 → 最多卖 ${remaining.toFixed(6)}${alw}\n`
+        );
+    } else {
+        console.log(`📎 未取到 CLOB 余额；舍入保护后最多卖 ${remaining.toFixed(6)} 股\n`);
+    }
+    if (remaining < sellSize - 1e-6) {
+        console.log(`   （data-api 为 ${sellSize.toFixed(6)} 股，已按 CLOB 可卖量封顶）\n`);
+    }
+    if (remaining < 1.0) {
+        console.log(
+            `⚠️ 封顶后不足 1 股最低卖出。请执行: npm run set-token-allowance（CTF 需授权标准 + Neg-risk 交易所）\n`
+        );
+        return;
+    }
 
     while (remaining > 0 && retry < RETRY_LIMIT) {
         try {
@@ -176,6 +194,19 @@ const sellPosition = async (clobClient: ClobClient, position: Position, sellSize
                 console.log(
                     `⚠️  订单失败 (第 ${retry}/${RETRY_LIMIT} 次)${errorMsg ? `: ${errorMsg}` : ''}`
                 );
+
+                if (isInsufficientBalanceOrAllowanceMessage(errorMsg)) {
+                    console.log(
+                        '💡 余额/授权不足: 请运行 npm run set-token-allowance（CTF 对标准所 + Neg-risk 所 setApprovalForAll），链上需 MATIC gas。\n'
+                    );
+                    const again = await syncConditionalBalanceShares(clobClient, position.asset, 700);
+                    const capped = capSellSizeByBalance(remaining, again?.balance);
+                    if (capped < remaining - 1e-8) {
+                        remaining = capped;
+                        console.log(`📎 再次同步后，剩余可卖调整为 ${remaining.toFixed(6)} 股\n`);
+                        retry = 0;
+                    }
+                }
 
                 if (retry < RETRY_LIMIT) {
                     console.log('🔄 重试中...\n');

@@ -34,7 +34,9 @@ console.log(`  ${colors.green}npm run check-proxy${colors.reset}       Check you
 console.log(`  ${colors.green}npm run check-both${colors.reset}        Check both your wallet and EOA`);
 console.log(`  ${colors.green}npm run check-allowance${colors.reset}   Verify USDC token allowance`);
 console.log(`  ${colors.green}npm run verify-allowance${colors.reset}   Detailed USDC allowance check`);
-console.log(`  ${colors.green}npm run set-token-allowance${colors.reset}  Set USDC spending approval`);
+console.log(
+    `  ${colors.green}npm run set-token-allowance${colors.reset}  CTF outcome tokens: approve Exchange + Neg-risk (selling)`
+);
 console.log('');
 
 console.log(`${colors.yellow}${colors.bright}📊 MONITORING & STATS${colors.reset}\n`);
@@ -46,6 +48,7 @@ console.log('');
 console.log(`${colors.yellow}${colors.bright}🎯 POSITION MANAGEMENT${colors.reset}\n`);
 console.log(`  ${colors.green}npm run manual-sell${colors.reset}       Manually sell a specific position`);
 console.log(`  ${colors.green}npm run sell-large${colors.reset}        Sell large positions (bulk action)`);
+console.log(`  ${colors.green}npm run sell-all${colors.reset}          Sell 100% of all positions (needs -- --yes)`);
 console.log(`  ${colors.green}npm run close-stale${colors.reset}       Close stale/old positions`);
 console.log(`  ${colors.green}npm run close-resolved${colors.reset}    Close resolved market positions`);
 console.log(`  ${colors.green}npm run redeem-resolved${colors.reset}   Redeem resolved positions for USDC`);

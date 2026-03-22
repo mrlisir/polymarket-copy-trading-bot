@@ -5,22 +5,6 @@ import { SignatureType } from '@polymarket/order-utils';
 import { ENV } from '../config/env';
 import Logger from './logger';
 
-/**
- * Determines if a wallet is a Gnosis Safe by checking if it has contract code
- */
-const isGnosisSafe = async (address: string): Promise<boolean> => {
-    try {
-        // Using ethers v5 syntax
-        const provider = new ethers.providers.JsonRpcProvider(ENV.RPC_URL);
-        const code = await provider.getCode(address);
-        // If code is not "0x", then it's a contract (likely Gnosis Safe)
-        return code !== '0x';
-    } catch (error) {
-        Logger.error(`检查钱包类型时出错: ${error}`);
-        return false;
-    }
-};
-
 /** 可选：Builder 凭证齐全时用于订单归因（与 Relayer 共用 POLY_BUILDER_* 签名体系） */
 const getOptionalBuilderConfig = (): BuilderConfig | undefined => {
     const key = ENV.POLY_BUILDER_API_KEY;
@@ -44,13 +28,21 @@ const getOptionalBuilderConfig = (): BuilderConfig | undefined => {
 const createClobClient = async (): Promise<ClobClient> => {
     const chainId = 137;
     const host = ENV.CLOB_HTTP_URL as string;
-    const wallet = new ethers.Wallet(ENV.PRIVATE_KEY as string);
+    const provider = new ethers.providers.JsonRpcProvider(ENV.RPC_URL as string);
+    const wallet = new ethers.Wallet(ENV.PRIVATE_KEY as string, provider);
 
-    // Polymarket uses POLY_PROXY signature type for trading
-    // This is required for proper signature validation
-    const signatureType = SignatureType.POLY_PROXY;
+    const walletAddr = (await wallet.getAddress()).toLowerCase();
+    const proxyAddr = (ENV.PROXY_WALLET as string).toLowerCase();
+    const sameAddress = walletAddr === proxyAddr;
 
-    Logger.info(`正在创建 CLOB 客户端，签名类型: POLY_PROXY`);
+    const signatureType = sameAddress ? SignatureType.EOA : SignatureType.POLY_PROXY;
+    const funderAddress = sameAddress ? undefined : (ENV.PROXY_WALLET as string);
+
+    Logger.info(
+        sameAddress
+            ? '正在创建 CLOB 客户端，签名类型: EOA（私钥地址与 PROXY_WALLET 相同）'
+            : '正在创建 CLOB 客户端，签名类型: POLY_PROXY'
+    );
 
     let clobClient = new ClobClient(
         host,
@@ -58,46 +50,49 @@ const createClobClient = async (): Promise<ClobClient> => {
         wallet,
         undefined,
         signatureType,
-        ENV.PROXY_WALLET as string
+        funderAddress
     );
 
-    // Suppress console output during API key creation
     const originalConsoleLog = console.log;
     const originalConsoleError = console.error;
-    console.log = function () {};
-    console.error = function () {};
 
-    let creds = await clobClient.createApiKey();
-    if (!creds.key) {
-        Logger.warning('创建 API 密钥失败，正在尝试派生...');
-        creds = await clobClient.deriveApiKey();
+    try {
+        console.log = function () {};
+        console.error = function () {};
+
+        let creds = await clobClient.createApiKey();
+        if (!creds.key) {
+            Logger.warning('创建 API 密钥失败，正在尝试派生...');
+            creds = await clobClient.deriveApiKey();
+        }
+
+        if (!creds.key) {
+            throw new Error(
+                'Failed to obtain Polymarket API credentials. Please check your private key and try again.'
+            );
+        }
+
+        Logger.info('API 凭证获取成功');
+
+        const builderConfig = getOptionalBuilderConfig();
+
+        clobClient = new ClobClient(
+            host,
+            chainId,
+            wallet,
+            creds,
+            signatureType,
+            funderAddress,
+            undefined,
+            false,
+            builderConfig
+        );
+
+        return clobClient;
+    } finally {
+        console.log = originalConsoleLog;
+        console.error = originalConsoleError;
     }
-
-    if (!creds.key) {
-        throw new Error('Failed to obtain Polymarket API credentials. Please check your private key and try again.');
-    }
-
-    Logger.info('API 凭证获取成功');
-
-    const builderConfig = getOptionalBuilderConfig();
-
-    clobClient = new ClobClient(
-        host,
-        chainId,
-        wallet,
-        creds,
-        signatureType,
-        ENV.PROXY_WALLET as string,
-        undefined,
-        false,
-        builderConfig
-    );
-
-    // Restore console functions
-    console.log = originalConsoleLog;
-    console.error = originalConsoleError;
-
-    return clobClient;
 };
 
 export default createClobClient;
