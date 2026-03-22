@@ -23,6 +23,18 @@ export enum CopyMode {
     REVERSE = 'REVERSE',
 }
 
+/** 控制台 / 日志用短标签 */
+export const copyModeLabelZhShort = (mode: CopyMode): string =>
+    mode === CopyMode.REVERSE ? '反买' : '正买';
+
+/** 完整说明（含英文枚举，便于与文档对照） */
+export const copyModeLabelZh = (mode: CopyMode): string =>
+    mode === CopyMode.REVERSE ? '反买 (REVERSE)' : '跟方向 / 正买 (FOLLOW)';
+
+/** 对应 .env 配置列名（便于混合跟单时自查） */
+export const copyModeEnvColumnHint = (mode: CopyMode): string =>
+    mode === CopyMode.REVERSE ? 'USER_ADDRESSES_REVERSE' : 'USER_ADDRESSES_FOLLOW';
+
 /**
  * Tier definition for tiered multipliers
  * Example: { min: 100, max: 500, multiplier: 0.2 }

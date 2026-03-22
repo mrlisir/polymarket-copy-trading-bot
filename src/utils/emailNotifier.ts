@@ -1,5 +1,6 @@
 import nodemailer from 'nodemailer';
 import { ENV } from '../config/env';
+import { CopyMode, copyModeEnvColumnHint } from '../config/copyStrategy';
 import Logger from './logger';
 
 export type NotifyParams = {
@@ -204,6 +205,8 @@ const sendPlainEmail = async ({ subject, text }: PlainMail): Promise<void> => {
 const buildOrderSuccessBody = (params: NotifyParams): string => {
     const now = new Date().toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai', hour12: false });
     const sideZh = params.side === 'BUY' ? '买入' : '卖出';
+    const modeEnum = params.copyMode === 'REVERSE' ? CopyMode.REVERSE : CopyMode.FOLLOW;
+    const envColumn = copyModeEnvColumnHint(modeEnum);
     const modeZh = params.copyMode === 'REVERSE' ? '反买 (REVERSE)' : '跟方向 (FOLLOW)';
     const notional =
         params.amountUsd != null && params.price != null
@@ -219,6 +222,7 @@ const buildOrderSuccessBody = (params: NotifyParams): string => {
         `• 时间(北京时间): ${now}`,
         `• 本笔订单方向: ${params.side}（${sideZh}）`,
         `• 跟单模式: ${modeZh}`,
+        `• 对应 .env 配置列: ${envColumn}（该地址只应出现在此列）`,
         ...(params.modeHint ? [`• 说明: ${params.modeHint}`] : []),
         `• 市场: ${params.title || '-'}`,
         `• 跟单交易员: ${mask(params.trader)}`,
@@ -228,6 +232,13 @@ const buildOrderSuccessBody = (params: NotifyParams): string => {
         `• 我方本笔成交结果方向: ${params.myOutcome ?? '—'}`,
         `• 说明: 「结果方向」指 Up/Down、Yes/No 等；反买模式下我方持有与交易员相反一侧的 outcome token。`,
         '',
+        ...(Object.values(ENV.TRADER_COPY_MODE_BY_ADDRESS).some((m) => m === CopyMode.REVERSE) &&
+        Object.values(ENV.TRADER_COPY_MODE_BY_ADDRESS).some((m) => m === CopyMode.FOLLOW)
+            ? [
+                  '• 提示: 当前为「正买 + 反买」混合跟单；不同交易员规则不同，请务必以本邮件中的「跟单模式」与「配置列」为准，勿与其它交易员成交混淆。',
+                  '',
+              ]
+            : []),
         '──────────────── 成交明细 ────────────────',
         notional,
         `• 成交价格(概率价): ${params.price != null ? `$${Number(params.price).toFixed(4)}` : '-'}`,
@@ -300,6 +311,9 @@ export const notifyCopyRiskStop = async (params: {
     consecutiveLosses: number;
     cumulativeLossUsd: number;
     mode: 'LIVE' | 'DRYRUN';
+    copyMode?: 'FOLLOW' | 'REVERSE';
+    /** 中文一行，含 .env 列名 */
+    copyModeDetailZh?: string;
 }): Promise<void> => {
     if (!isEnabled()) return;
     if (!looksLikeEmail(ENV.EMAIL_SMTP_USER)) return;
@@ -314,6 +328,7 @@ export const notifyCopyRiskStop = async (params: {
         `• 时间(北京时间): ${now}`,
         `• 运行模式: ${params.mode === 'LIVE' ? '实盘' : 'Dry Run 模拟'}`,
         `• 交易员地址: ${mask(params.trader)}`,
+        `• 跟单配置: ${params.copyModeDetailZh ?? (params.copyMode === 'REVERSE' ? '反买 (REVERSE) · USER_ADDRESSES_REVERSE' : '跟方向 (FOLLOW) · USER_ADDRESSES_FOLLOW')}`,
         `• 停止原因: ${params.reason}`,
         `• 连续亏损次数: ${params.consecutiveLosses}`,
         `• 累计亏损(USD): ${params.cumulativeLossUsd.toFixed(2)}`,

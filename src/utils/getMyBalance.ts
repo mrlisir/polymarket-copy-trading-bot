@@ -1,9 +1,6 @@
 import { ethers } from 'ethers';
 import { ENV } from '../config/env';
 
-const RPC_URL = ENV.RPC_URL;
-const USDC_CONTRACT_ADDRESS = ENV.USDC_CONTRACT_ADDRESS;
-
 const USDC_ABI = ['function balanceOf(address owner) view returns (uint256)'];
 
 // Exponential backoff delays: 3s, 5s, 10s, 20s, 30s (max), then cycle back
@@ -15,8 +12,8 @@ const RETRY_DELAYS = [3000, 5000, 10000, 20000, 30000];
  * After max delay, cycles back to 3s
  */
 const getMyBalance = async (address: string): Promise<number> => {
-    const rpcProvider = new ethers.providers.JsonRpcProvider(RPC_URL);
-    const usdcContract = new ethers.Contract(USDC_CONTRACT_ADDRESS, USDC_ABI, rpcProvider);
+    const rpcProvider = new ethers.providers.JsonRpcProvider(ENV.RPC_URL);
+    const usdcContract = new ethers.Contract(ENV.USDC_CONTRACT_ADDRESS, USDC_ABI, rpcProvider);
 
     let delayIndex = 0;
 

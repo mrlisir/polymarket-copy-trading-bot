@@ -1,4 +1,5 @@
 import * as dotenv from 'dotenv';
+import * as path from 'path';
 import { CopyStrategy, CopyStrategyConfig, CopyMode, parseTieredMultipliers } from './copyStrategy';
 dotenv.config();
 
@@ -14,7 +15,6 @@ const isValidEthereumAddress = (address: string): boolean => {
  */
 const validateRequiredEnv = (): void => {
     const required = [
-        'USER_ADDRESSES',
         'PROXY_WALLET',
         'PRIVATE_KEY',
         'CLOB_HTTP_URL',
@@ -29,6 +29,13 @@ const validateRequiredEnv = (): void => {
         if (!process.env[key]) {
             missing.push(key);
         }
+    }
+
+    const hasTraderList =
+        !!(process.env.USER_ADDRESSES_FOLLOW && String(process.env.USER_ADDRESSES_FOLLOW).trim()) ||
+        !!(process.env.USER_ADDRESSES_REVERSE && String(process.env.USER_ADDRESSES_REVERSE).trim());
+    if (!hasTraderList) {
+        missing.push('USER_ADDRESSES_FOLLOW / USER_ADDRESSES_REVERSE（至少填写其一，可为逗号或 JSON 数组）');
     }
 
     if (missing.length > 0) {
@@ -183,6 +190,13 @@ const validateNumericConfig = (): void => {
             `Invalid TRANSIENT_RESTART_SETTLE_MS: ${process.env.TRANSIENT_RESTART_SETTLE_MS}. Must be 0–120000.`
         );
     }
+
+    const envFileReloadMs = parseInt(process.env.ENV_FILE_RELOAD_INTERVAL_MS || '0', 10);
+    if (isNaN(envFileReloadMs) || envFileReloadMs < 0 || (envFileReloadMs > 0 && envFileReloadMs < 5000)) {
+        throw new Error(
+            `Invalid ENV_FILE_RELOAD_INTERVAL_MS: ${process.env.ENV_FILE_RELOAD_INTERVAL_MS}. 使用 0 关闭热重载，或设为 ≥5000（毫秒）。`
+        );
+    }
 };
 
 /**
@@ -244,71 +258,123 @@ validateAddresses();
 validateNumericConfig();
 validateUrls();
 
-// Parse USER_ADDRESSES: supports both comma-separated string and JSON array
-const parseUserAddresses = (input: string): string[] => {
+/**
+ * 解析跟单地址列表：支持逗号分隔或 JSON 数组；`fieldName` 用于报错文案。
+ */
+const parseTraderAddresses = (input: string, fieldName: string): string[] => {
     const trimmed = input.trim();
-    // Check if it's JSON array format
+    if (!trimmed) {
+        throw new Error(`${fieldName} 不能为空`);
+    }
     if (trimmed.startsWith('[') && trimmed.endsWith(']')) {
         try {
             const parsed = JSON.parse(trimmed);
             if (Array.isArray(parsed)) {
                 const addresses = parsed
-                    .map((addr) => addr.toLowerCase().trim())
+                    .map((addr) => String(addr).toLowerCase().trim())
                     .filter((addr) => addr.length > 0);
-                // Validate each address
                 for (const addr of addresses) {
                     if (!isValidEthereumAddress(addr)) {
-                        console.error('\n❌ USER_ADDRESSES 中存在无效的交易员地址\n');
+                        console.error(`\n❌ ${fieldName} 中存在无效的交易员地址\n`);
                         console.error(`无效地址: ${addr}`);
                         console.error('期望格式: 0x 开头，后跟 40 位十六进制字符\n');
                         console.error('💡 在哪里找到交易员地址:');
                         console.error('   • Polymarket 排行榜: https://polymarket.com/leaderboard');
                         console.error('   • Predictfolio: https://predictfolio.com\n');
-                        console.error('示例: USER_ADDRESSES=\'0x7c3db723f1d4d8cb9c550095203b686cb11e5c6b\'\n');
-                        throw new Error(`USER_ADDRESSES 中存在无效的以太坊地址: ${addr}`);
+                        throw new Error(`${fieldName} 中存在无效的以太坊地址: ${addr}`);
                     }
                 }
                 return addresses;
             }
         } catch (e) {
-            if (e instanceof Error && e.message.includes('Invalid Ethereum address')) {
+            if (e instanceof Error && e.message.includes('无效的以太坊地址')) {
                 throw e;
             }
             throw new Error(
-                `Invalid JSON format for USER_ADDRESSES: ${e instanceof Error ? e.message : String(e)}`
+                `Invalid JSON format for ${fieldName}: ${e instanceof Error ? e.message : String(e)}`
             );
         }
+        throw new Error(`${fieldName} 的 JSON 必须是地址数组`);
     }
-    // Otherwise treat as comma-separated
     const addresses = trimmed
         .split(',')
         .map((addr) => addr.toLowerCase().trim())
         .filter((addr) => addr.length > 0);
-    // Validate each address
     for (const addr of addresses) {
         if (!isValidEthereumAddress(addr)) {
-            console.error('\n❌ USER_ADDRESSES 中存在无效的交易员地址\n');
+            console.error(`\n❌ ${fieldName} 中存在无效的交易员地址\n`);
             console.error(`无效地址: ${addr}`);
             console.error('期望格式: 0x 开头，后跟 40 位十六进制字符\n');
-            console.error('💡 在哪里找到交易员地址:');
-            console.error('   • Polymarket 排行榜: https://polymarket.com/leaderboard');
-            console.error('   • Predictfolio: https://predictfolio.com\n');
-            console.error('示例: USER_ADDRESSES=\'0x7c3db723f1d4d8cb9c550095203b686cb11e5c6b\'\n');
-            throw new Error(`USER_ADDRESSES 中存在无效的以太坊地址: ${addr}`);
+            throw new Error(`${fieldName} 中存在无效的以太坊地址: ${addr}`);
         }
     }
     return addresses;
 };
 
-// Parse copy strategy configuration
-const parseCopyStrategy = (): CopyStrategyConfig => {
-    // Support legacy COPY_PERCENTAGE + TRADE_MULTIPLIER for backward compatibility
+const parseTraderAddressesOptional = (input: string | undefined, fieldName: string): string[] => {
+    if (!input || !String(input).trim()) return [];
+    return parseTraderAddresses(String(input).trim(), fieldName);
+};
+
+/** 从当前 process.env 解析跟单地址（启动与热重载共用） */
+export const parseCurrentTraderListsFromEnv = (): {
+    follow: string[];
+    reverse: string[];
+    merged: string[];
+    modeByAddress: Record<string, CopyMode>;
+} => {
+    const follow = parseTraderAddressesOptional(
+        process.env.USER_ADDRESSES_FOLLOW,
+        'USER_ADDRESSES_FOLLOW'
+    );
+    const reverse = parseTraderAddressesOptional(
+        process.env.USER_ADDRESSES_REVERSE,
+        'USER_ADDRESSES_REVERSE'
+    );
+    const followSet = new Set(follow);
+    for (const r of reverse) {
+        if (followSet.has(r)) {
+            throw new Error(
+                'USER_ADDRESSES_FOLLOW 与 USER_ADDRESSES_REVERSE 不能包含相同地址，请从其中一侧移除重复项'
+            );
+        }
+    }
+    const merged = [...follow, ...reverse];
+    const modeByAddress: Record<string, CopyMode> = {};
+    for (const a of follow) modeByAddress[a] = CopyMode.FOLLOW;
+    for (const a of reverse) modeByAddress[a] = CopyMode.REVERSE;
+    return { follow, reverse, merged, modeByAddress };
+};
+
+const initialTraderLists = parseCurrentTraderListsFromEnv();
+if (initialTraderLists.merged.length === 0) {
+    throw new Error(
+        '请在 USER_ADDRESSES_FOLLOW（正买）或 USER_ADDRESSES_REVERSE（反买）中至少配置一个有效地址'
+    );
+}
+
+const MERGED_USER_ADDRESSES: string[] = [];
+MERGED_USER_ADDRESSES.push(...initialTraderLists.merged);
+const TRADER_COPY_MODE_BY_ADDRESS: Record<string, CopyMode> = {};
+Object.assign(TRADER_COPY_MODE_BY_ADDRESS, initialTraderLists.modeByAddress);
+
+const traderListCountsForLog = (): { nf: number; nr: number } => ({
+    nf: parseTraderAddressesOptional(process.env.USER_ADDRESSES_FOLLOW, 'USER_ADDRESSES_FOLLOW').length,
+    nr: parseTraderAddressesOptional(process.env.USER_ADDRESSES_REVERSE, 'USER_ADDRESSES_REVERSE').length,
+});
+
+const parseCopyStrategy = (opts?: { silent?: boolean }): CopyStrategyConfig => {
+    const silent = !!opts?.silent;
+    const { nf, nr } = traderListCountsForLog();
+
     const hasLegacyConfig = process.env.COPY_PERCENTAGE && !process.env.COPY_STRATEGY;
 
     if (hasLegacyConfig) {
-        console.warn(
-            '⚠️  正在使用旧的 COPY_PERCENTAGE 配置，建议迁移到 COPY_STRATEGY。'
-        );
+        if (!silent) {
+            console.warn(
+                '⚠️  正在使用旧的 COPY_PERCENTAGE 配置，建议迁移到 COPY_STRATEGY。'
+            );
+        }
         const copyPercentage = parseFloat(process.env.COPY_PERCENTAGE || '10.0');
         const tradeMultiplier = parseFloat(process.env.TRADE_MULTIPLIER || '1.0');
         const effectivePercentage = copyPercentage * tradeMultiplier;
@@ -327,30 +393,35 @@ const parseCopyStrategy = (): CopyStrategyConfig => {
                 : undefined,
         };
 
-        // Parse tiered multipliers if configured (even for legacy mode)
         if (process.env.TIERED_MULTIPLIERS) {
             try {
                 config.tieredMultipliers = parseTieredMultipliers(process.env.TIERED_MULTIPLIERS);
-                console.log(`✓ 已加载 ${config.tieredMultipliers.length} 个分层乘数`);
+                if (!silent) {
+                    console.log(`✓ 已加载 ${config.tieredMultipliers.length} 个分层乘数`);
+                }
             } catch (error) {
                 throw new Error(`Failed to parse TIERED_MULTIPLIERS: ${error instanceof Error ? error.message : String(error)}`);
             }
         } else if (tradeMultiplier !== 1.0) {
-            // If using legacy single multiplier, store it
             config.tradeMultiplier = tradeMultiplier;
+        }
+
+        if (!silent) {
+            console.log(
+                `✓ 跟单地址: 正买 ${nf} 个 | 反买 ${nr} 个（旧版 COPY_PERCENTAGE 路径；方向仅由两列地址决定）`
+            );
         }
 
         return config;
     }
 
-    // Parse new copy strategy configuration
     const strategyStr = (process.env.COPY_STRATEGY || 'PERCENTAGE').toUpperCase();
     const strategy =
         CopyStrategy[strategyStr as keyof typeof CopyStrategy] || CopyStrategy.PERCENTAGE;
 
     const config: CopyStrategyConfig = {
         strategy,
-        copyMode: CopyMode[(process.env.COPY_MODE || 'FOLLOW').toUpperCase() as keyof typeof CopyMode] || CopyMode.FOLLOW,
+        copyMode: CopyMode.FOLLOW,
         copySize: parseFloat(process.env.COPY_SIZE || '10.0'),
         maxOrderSizeUSD: parseFloat(process.env.MAX_ORDER_SIZE_USD || '100.0'),
         minOrderSizeUSD: parseFloat(process.env.MIN_ORDER_SIZE_USD || '1.0'),
@@ -362,7 +433,6 @@ const parseCopyStrategy = (): CopyStrategyConfig => {
             : undefined,
     };
 
-    // Add adaptive strategy parameters if applicable
     if (strategy === CopyStrategy.ADAPTIVE) {
         config.adaptiveMinPercent = parseFloat(
             process.env.ADAPTIVE_MIN_PERCENT || config.copySize.toString()
@@ -373,22 +443,28 @@ const parseCopyStrategy = (): CopyStrategyConfig => {
         config.adaptiveThreshold = parseFloat(process.env.ADAPTIVE_THRESHOLD_USD || '500.0');
     }
 
-    console.log(`✓ 跟单模式: ${config.copyMode === CopyMode.REVERSE ? '反买 (REVERSE)' : '跟方向 (FOLLOW)'}`);
+    if (!silent) {
+        console.log(
+            `✓ 跟单地址: 正买 ${nf} 个 | 反买 ${nr} 个（方向由列名决定，无需 COPY_MODE）`
+        );
+    }
 
-    // Parse tiered multipliers if configured
     if (process.env.TIERED_MULTIPLIERS) {
-            try {
-                config.tieredMultipliers = parseTieredMultipliers(process.env.TIERED_MULTIPLIERS);
+        try {
+            config.tieredMultipliers = parseTieredMultipliers(process.env.TIERED_MULTIPLIERS);
+            if (!silent) {
                 console.log(`✓ 已加载 ${config.tieredMultipliers.length} 个分层乘数`);
+            }
         } catch (error) {
             throw new Error(`Failed to parse TIERED_MULTIPLIERS: ${error instanceof Error ? error.message : String(error)}`);
         }
     } else if (process.env.TRADE_MULTIPLIER) {
-        // Fall back to single multiplier if no tiers configured
         const singleMultiplier = parseFloat(process.env.TRADE_MULTIPLIER);
         if (singleMultiplier !== 1.0) {
             config.tradeMultiplier = singleMultiplier;
-            console.log(`✓ 使用单一交易乘数: ${singleMultiplier}x`);
+            if (!silent) {
+                console.log(`✓ 使用单一交易乘数: ${singleMultiplier}x`);
+            }
         }
     }
 
@@ -396,7 +472,10 @@ const parseCopyStrategy = (): CopyStrategyConfig => {
 };
 
 export const ENV = {
-    USER_ADDRESSES: parseUserAddresses(process.env.USER_ADDRESSES as string),
+    /** 合并后的跟单地址（先正买列、后反买列）；运行时仍用此字段，与旧代码兼容 */
+    USER_ADDRESSES: MERGED_USER_ADDRESSES,
+    /** 小写地址 -> FOLLOW / REVERSE，来自 USER_ADDRESSES_FOLLOW / USER_ADDRESSES_REVERSE */
+    TRADER_COPY_MODE_BY_ADDRESS,
     PROXY_WALLET: process.env.PROXY_WALLET as string,
     PRIVATE_KEY: process.env.PRIVATE_KEY as string,
     CLOB_HTTP_URL: process.env.CLOB_HTTP_URL as string,
@@ -515,6 +594,9 @@ export const ENV = {
     /** 停止子服务后等待多久再关库/重连（毫秒，0=不等待） */
     TRANSIENT_RESTART_SETTLE_MS: parseInt(process.env.TRANSIENT_RESTART_SETTLE_MS || '2000', 10),
 
+    /** 周期性重新读取项目根目录 `.env` 并更新内存中的 `ENV`（毫秒，0=关闭） */
+    ENV_FILE_RELOAD_INTERVAL_MS: parseInt(process.env.ENV_FILE_RELOAD_INTERVAL_MS || '0', 10),
+
     /**
      * 仓位对账周期（毫秒，0=关闭）。实盘（npm start / dev）与模拟（npm run dryrun）共用同一套变量。
      */
@@ -561,29 +643,245 @@ export const ENV = {
     POLY_BUILDER_PASSPHRASE: (process.env.POLY_BUILDER_PASSPHRASE || '').trim(),
 };
 
-if (ENV.HTTP_PROXY_ENABLED && ENV.HTTP_PROXY_HOST) {
-    const proxyUrl = `http://${ENV.HTTP_PROXY_HOST}:${ENV.HTTP_PROXY_PORT}`;
-    process.env.HTTP_PROXY = proxyUrl;
-    process.env.HTTPS_PROXY = proxyUrl;
+const mergeCopyStrategyConfig = (target: CopyStrategyConfig, next: CopyStrategyConfig): void => {
+    target.strategy = next.strategy;
+    target.copyMode = next.copyMode;
+    target.copySize = next.copySize;
+    target.maxOrderSizeUSD = next.maxOrderSizeUSD;
+    target.minOrderSizeUSD = next.minOrderSizeUSD;
+    target.maxPositionSizeUSD = next.maxPositionSizeUSD;
+    target.maxDailyVolumeUSD = next.maxDailyVolumeUSD;
+    if (next.adaptiveMinPercent !== undefined) {
+        target.adaptiveMinPercent = next.adaptiveMinPercent;
+    } else {
+        delete target.adaptiveMinPercent;
+    }
+    if (next.adaptiveMaxPercent !== undefined) {
+        target.adaptiveMaxPercent = next.adaptiveMaxPercent;
+    } else {
+        delete target.adaptiveMaxPercent;
+    }
+    if (next.adaptiveThreshold !== undefined) {
+        target.adaptiveThreshold = next.adaptiveThreshold;
+    } else {
+        delete target.adaptiveThreshold;
+    }
+    if (next.tieredMultipliers && next.tieredMultipliers.length > 0) {
+        target.tieredMultipliers = [...next.tieredMultipliers];
+    } else {
+        delete target.tieredMultipliers;
+    }
+    if (next.tradeMultiplier !== undefined && next.tradeMultiplier !== 1.0) {
+        target.tradeMultiplier = next.tradeMultiplier;
+    } else {
+        delete target.tradeMultiplier;
+    }
+};
 
-    if (ENV.HTTP_PROXY_BYPASS_RPC) {
-        // Keep RPC traffic direct when proxy is enabled.
-        try {
-            const rpcHost = new URL(ENV.RPC_URL).hostname;
-            const noProxySet = new Set(
-                (process.env.NO_PROXY || process.env.no_proxy || '')
-                    .split(',')
-                    .map((item) => item.trim())
-                    .filter(Boolean)
-            );
-            noProxySet.add('localhost');
-            noProxySet.add('127.0.0.1');
-            noProxySet.add(rpcHost);
-            const noProxy = Array.from(noProxySet).join(',');
-            process.env.NO_PROXY = noProxy;
-            process.env.no_proxy = noProxy;
-        } catch {
-            // Ignore malformed RPC_URL here; URL validity is validated above.
+/** 将 .env 中的可热更项写回运行时 `ENV`（热重载用；连接类配置保持启动时值） */
+const applyReloadableProcessEnvToRuntimeEnv = (): void => {
+    ENV.PROXY_WALLET = process.env.PROXY_WALLET as string;
+    ENV.PRIVATE_KEY = process.env.PRIVATE_KEY as string;
+    ENV.CLOB_HTTP_URL = process.env.CLOB_HTTP_URL as string;
+    ENV.CLOB_WS_URL = process.env.CLOB_WS_URL as string;
+    ENV.FETCH_INTERVAL = parseInt(process.env.FETCH_INTERVAL || '1', 10);
+    ENV.TOO_OLD_TIMESTAMP = parseFloat(process.env.TOO_OLD_TIMESTAMP || '24');
+    ENV.RETRY_LIMIT = parseInt(process.env.RETRY_LIMIT || '3', 10);
+    ENV.TRADE_MULTIPLIER = parseFloat(process.env.TRADE_MULTIPLIER || '1.0');
+    ENV.COPY_PERCENTAGE = parseFloat(process.env.COPY_PERCENTAGE || '10.0');
+    ENV.REQUEST_TIMEOUT_MS = parseInt(process.env.REQUEST_TIMEOUT_MS || '10000', 10);
+    ENV.NETWORK_RETRY_LIMIT = parseInt(process.env.NETWORK_RETRY_LIMIT || '3', 10);
+    ENV.HTTP_PROXY_ENABLED = process.env.HTTP_PROXY_ENABLED === 'true';
+    ENV.HTTP_PROXY_HOST = (process.env.HTTP_PROXY_HOST || '127.0.0.1').trim();
+    ENV.HTTP_PROXY_PORT = parseInt(process.env.HTTP_PROXY_PORT || '7890', 10);
+    ENV.HTTP_PROXY_BYPASS_RPC = process.env.HTTP_PROXY_BYPASS_RPC !== 'false';
+    ENV.TRADE_AGGREGATION_ENABLED = process.env.TRADE_AGGREGATION_ENABLED === 'true';
+    ENV.TRADE_AGGREGATION_WINDOW_SECONDS = parseInt(
+        process.env.TRADE_AGGREGATION_WINDOW_SECONDS || '300',
+        10
+    );
+    // 数据库 / 链 RPC 连接串保持启动时值，不因热重载改写
+    ENV.USDC_CONTRACT_ADDRESS = process.env.USDC_CONTRACT_ADDRESS as string;
+    ENV.DRY_INITIAL_BALANCE = parseFloat(process.env.DRY_INITIAL_BALANCE || '1000.0');
+    ENV.DRY_HISTORY_HOURS = parseFloat(process.env.DRY_HISTORY_HOURS || '24');
+    ENV.DRY_REPLAY_SPEED = parseFloat(process.env.DRY_REPLAY_SPEED || '1000');
+    ENV.DRY_REALTIME = process.env.DRY_REALTIME === 'true';
+    ENV.DRY_START_FROM_REAL = process.env.DRY_START_FROM_REAL !== 'false';
+    ENV.DRY_MAX_TRADES_PER_RUN = parseInt(process.env.DRY_MAX_TRADES_PER_RUN || '20', 10);
+    ENV.ORDERBOOK_CACHE_TTL_MS = parseInt(process.env.ORDERBOOK_CACHE_TTL_MS || '30000', 10);
+    ENV.ORDERBOOK_CACHE_MAX_ENTRIES = parseInt(process.env.ORDERBOOK_CACHE_MAX_ENTRIES || '500', 10);
+    ENV.ORDERBOOK_MISSING_LOG_THROTTLE_MS = parseInt(
+        process.env.ORDERBOOK_MISSING_LOG_THROTTLE_MS || '60000',
+        10
+    );
+    ENV.ORDER_PRICE_SLIPPAGE_USD = parseFloat(process.env.ORDER_PRICE_SLIPPAGE_USD || '0.05');
+    ENV.CUR_PRICE_CACHE_TTL_MS = parseInt(process.env.CUR_PRICE_CACHE_TTL_MS || '15000', 10);
+    ENV.DATA_API_POSITIONS_CACHE_TTL_MS = parseInt(
+        process.env.DATA_API_POSITIONS_CACHE_TTL_MS || '10000',
+        10
+    );
+    ENV.CLOB_LIGHT_PRICE_CACHE_TTL_MS = parseInt(
+        process.env.CLOB_LIGHT_PRICE_CACHE_TTL_MS || '15000',
+        10
+    );
+    ENV.MARK_CUR_VS_BOOK_DIVERGENCE = parseFloat(process.env.MARK_CUR_VS_BOOK_DIVERGENCE || '0.12');
+    ENV.DRY_POSITIONS_SNAPSHOT_INTERVAL_MS = parseInt(
+        process.env.DRY_POSITIONS_SNAPSHOT_INTERVAL_MS || '30000',
+        10
+    );
+    ENV.LIVE_PORTFOLIO_CURPRICE_LOG_INTERVAL_MS = parseInt(
+        process.env.LIVE_PORTFOLIO_CURPRICE_LOG_INTERVAL_MS || '0',
+        10
+    );
+    ENV.COPY_DOUBLE_SIDE_GUARD_MODE = (
+        process.env.COPY_DOUBLE_SIDE_GUARD_MODE || 'GLOBAL'
+    )
+        .trim()
+        .toUpperCase();
+    ENV.COPY_DOUBLE_SIDE_GUARD_LOCK_TTL_MS = parseInt(
+        process.env.COPY_DOUBLE_SIDE_GUARD_LOCK_TTL_MS || '600000',
+        10
+    );
+    ENV.COPY_STOP_ON_LOSS_ENABLED = process.env.COPY_STOP_ON_LOSS_ENABLED !== 'false';
+    ENV.COPY_STOP_LOSS_STREAK = parseInt(process.env.COPY_STOP_LOSS_STREAK || '10', 10);
+    ENV.COPY_STOP_LOSS_USD = parseFloat(process.env.COPY_STOP_LOSS_USD || '50');
+    ENV.TRANSIENT_RETRY_BASE_MS = parseInt(process.env.TRANSIENT_RETRY_BASE_MS || '2000', 10);
+    ENV.TRANSIENT_RETRY_MAX_MS = parseInt(process.env.TRANSIENT_RETRY_MAX_MS || '120000', 10);
+    ENV.TRANSIENT_BACKOFF_MAX_EXPONENT = parseInt(
+        process.env.TRANSIENT_BACKOFF_MAX_EXPONENT || '16',
+        10
+    );
+    ENV.CLOB_INIT_MAX_ATTEMPTS = parseInt(process.env.CLOB_INIT_MAX_ATTEMPTS || '12', 10);
+    ENV.TRANSIENT_RESTART_SETTLE_MS = parseInt(process.env.TRANSIENT_RESTART_SETTLE_MS || '2000', 10);
+    ENV.ENV_FILE_RELOAD_INTERVAL_MS = parseInt(process.env.ENV_FILE_RELOAD_INTERVAL_MS || '0', 10);
+    ENV.POSITION_RECONCILE_INTERVAL_MS = parseInt(process.env.POSITION_RECONCILE_INTERVAL_MS || '0', 10);
+    ENV.POSITION_RECONCILE_MAX_PER_RUN = parseInt(process.env.POSITION_RECONCILE_MAX_PER_RUN || '5', 10);
+    ENV.POSITION_RECONCILE_COOLDOWN_MS = parseInt(process.env.POSITION_RECONCILE_COOLDOWN_MS || '120000', 10);
+    ENV.POSITION_RECONCILE_ON_TRADER_EXIT = process.env.POSITION_RECONCILE_ON_TRADER_EXIT !== 'false';
+    ENV.POSITION_RECONCILE_ON_RESOLVED = process.env.POSITION_RECONCILE_ON_RESOLVED !== 'false';
+    ENV.POSITION_RECONCILE_AUTO_REDEEM = process.env.POSITION_RECONCILE_AUTO_REDEEM === 'true';
+    ENV.EMAIL_NOTIFY_ENABLED = process.env.EMAIL_NOTIFY_ENABLED === 'true';
+    ENV.EMAIL_SMTP_HOST = (process.env.EMAIL_SMTP_HOST || 'smtp.qq.com').trim();
+    ENV.EMAIL_SMTP_PORT = parseInt(process.env.EMAIL_SMTP_PORT || '465', 10);
+    ENV.EMAIL_SMTP_SECURE = process.env.EMAIL_SMTP_SECURE !== 'false';
+    ENV.EMAIL_SMTP_USER = (process.env.EMAIL_SMTP_USER || '').trim();
+    ENV.EMAIL_SMTP_PASS = (process.env.EMAIL_SMTP_PASS || '').trim();
+    ENV.EMAIL_FROM = (process.env.EMAIL_FROM || '').trim();
+    ENV.EMAIL_NOTIFY_TO = (process.env.EMAIL_NOTIFY_TO || '').trim();
+    ENV.EMAIL_HTTP_FALLBACK_ENABLED = process.env.EMAIL_HTTP_FALLBACK_ENABLED === 'true';
+    ENV.EMAIL_HTTP_PROVIDER = (process.env.EMAIL_HTTP_PROVIDER || 'AUTO').trim().toUpperCase();
+    ENV.EMAIL_HTTP_FROM = (process.env.EMAIL_HTTP_FROM || '').trim();
+    ENV.RESEND_API_KEY = (process.env.RESEND_API_KEY || '').trim();
+    ENV.POLY_BUILDER_API_KEY = (process.env.POLY_BUILDER_API_KEY || '').trim();
+    ENV.POLY_BUILDER_SECRET = (process.env.POLY_BUILDER_SECRET || '').trim();
+    ENV.POLY_BUILDER_PASSPHRASE = (process.env.POLY_BUILDER_PASSPHRASE || '').trim();
+};
+
+const syncHttpProxySideEffects = (): void => {
+    if (ENV.HTTP_PROXY_ENABLED && ENV.HTTP_PROXY_HOST) {
+        const proxyUrl = `http://${ENV.HTTP_PROXY_HOST}:${ENV.HTTP_PROXY_PORT}`;
+        process.env.HTTP_PROXY = proxyUrl;
+        process.env.HTTPS_PROXY = proxyUrl;
+
+        if (ENV.HTTP_PROXY_BYPASS_RPC) {
+            try {
+                const rpcHost = new URL(ENV.RPC_URL).hostname;
+                const noProxySet = new Set(
+                    (process.env.NO_PROXY || process.env.no_proxy || '')
+                        .split(',')
+                        .map((item) => item.trim())
+                        .filter(Boolean)
+                );
+                noProxySet.add('localhost');
+                noProxySet.add('127.0.0.1');
+                noProxySet.add(rpcHost);
+                const noProxy = Array.from(noProxySet).join(',');
+                process.env.NO_PROXY = noProxy;
+                process.env.no_proxy = noProxy;
+            } catch {
+                // ignore
+            }
+        }
+    } else {
+        delete process.env.HTTP_PROXY;
+        delete process.env.HTTPS_PROXY;
+    }
+};
+
+export type EnvReloadResult =
+    | { ok: true; message: string }
+    | { ok: false; error: string };
+
+/** 重新读取 `.env` 并更新 `ENV`。失败时返回 ok:false，不修改当前内存配置。 */
+export const reloadEnvFromDisk = (): EnvReloadResult => {
+    try {
+        dotenv.config({ path: path.join(process.cwd(), '.env'), override: true });
+    } catch (e) {
+        return { ok: false, error: e instanceof Error ? e.message : String(e) };
+    }
+    try {
+        validateRequiredEnv();
+        validateAddresses();
+        validateNumericConfig();
+        validateUrls();
+    } catch (e) {
+        return { ok: false, error: e instanceof Error ? e.message : String(e) };
+    }
+
+    let lists: ReturnType<typeof parseCurrentTraderListsFromEnv>;
+    try {
+        lists = parseCurrentTraderListsFromEnv();
+    } catch (e) {
+        return { ok: false, error: e instanceof Error ? e.message : String(e) };
+    }
+    if (lists.merged.length === 0) {
+        return { ok: false, error: '跟单地址列表为空' };
+    }
+
+    ENV.USER_ADDRESSES.length = 0;
+    ENV.USER_ADDRESSES.push(...lists.merged);
+    for (const k of Object.keys(ENV.TRADER_COPY_MODE_BY_ADDRESS)) {
+        delete ENV.TRADER_COPY_MODE_BY_ADDRESS[k];
+    }
+    Object.assign(ENV.TRADER_COPY_MODE_BY_ADDRESS, lists.modeByAddress);
+
+    try {
+        mergeCopyStrategyConfig(ENV.COPY_STRATEGY_CONFIG, parseCopyStrategy({ silent: true }));
+    } catch (e) {
+        return { ok: false, error: e instanceof Error ? e.message : String(e) };
+    }
+
+    applyReloadableProcessEnvToRuntimeEnv();
+    syncHttpProxySideEffects();
+
+    return { ok: true, message: '已从 .env 热更新配置' };
+};
+
+/** 按交易员地址解析跟单方向（由 USER_ADDRESSES_FOLLOW / USER_ADDRESSES_REVERSE 决定） */
+export const getCopyModeForTrader = (address: string): CopyMode => {
+    const key = address.toLowerCase();
+    const explicit = ENV.TRADER_COPY_MODE_BY_ADDRESS[key];
+    return explicit !== undefined ? explicit : ENV.COPY_STRATEGY_CONFIG.copyMode;
+};
+
+/** 启动时打印：是否混合正买/反买及各列人数 */
+export const buildCopyModeStartupSummary = (): string => {
+    let nFollow = 0;
+    let nReverse = 0;
+    for (const addr of ENV.USER_ADDRESSES) {
+        if (getCopyModeForTrader(addr) === CopyMode.REVERSE) {
+            nReverse += 1;
+        } else {
+            nFollow += 1;
         }
     }
-}
+    if (nReverse === 0) {
+        return `跟单模式: 均为正买列（USER_ADDRESSES_FOLLOW），共 ${nFollow} 位`;
+    }
+    if (nFollow === 0) {
+        return `跟单模式: 均为反买列（USER_ADDRESSES_REVERSE），共 ${nReverse} 位`;
+    }
+    return `跟单模式: 混合 — 正买 ${nFollow} 位（FOLLOW 列）· 反买 ${nReverse} 位（REVERSE 列）；每笔成交以日志/邮件中的「跟单配置」为准`;
+};
+
+syncHttpProxySideEffects();

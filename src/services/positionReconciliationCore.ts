@@ -1,5 +1,5 @@
 import { CopyMode } from '../config/copyStrategy';
-import { ENV } from '../config/env';
+import { ENV, getCopyModeForTrader } from '../config/env';
 import { UserPositionInterface } from '../interfaces/User';
 import { getUserActivityModel } from '../models/userHistory';
 import { fetchPositionsForUser } from '../utils/dataApiCache';
@@ -13,6 +13,25 @@ export const TRADER_MIRROR_MIN = 0.25;
 
 export const positionKey = (conditionId: string, asset: string): string =>
     `${conditionId}:${asset}`;
+
+/**
+ * 同一 condition 上多个跟单交易员时的镜像腿模式：
+ * 若同时存在正买与反买，降级为 FOLLOW（调用方应打日志）。
+ */
+export const copyModeForReconcileTraders = (
+    traders: Set<string>
+): { mode: CopyMode; mixedFollowAndReverse: boolean } => {
+    let anyReverse = false;
+    let anyFollow = false;
+    for (const addr of traders) {
+        const m = getCopyModeForTrader(addr);
+        if (m === CopyMode.REVERSE) anyReverse = true;
+        else anyFollow = true;
+    }
+    const mixed = anyReverse && anyFollow;
+    const mode = mixed ? CopyMode.FOLLOW : anyReverse ? CopyMode.REVERSE : CopyMode.FOLLOW;
+    return { mode, mixedFollowAndReverse: mixed };
+};
 
 /**
  * conditionId -> 在 Mongo 中有过 TRADE 且 bot 认领的跟单地址

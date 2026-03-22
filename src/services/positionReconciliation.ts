@@ -9,6 +9,7 @@ import { redeemPolymarketCondition } from '../utils/ctfRedeem';
 import {
     RECONCILE_MIN_SELL_TOKENS,
     anyTraderStillInMirror,
+    copyModeForReconcileTraders,
     getMirrorAssetForReconcile,
     isMarketResolved,
     loadCopiedConditionTraders,
@@ -110,7 +111,12 @@ export const runPositionReconciliation = async (
         const lastAt = lastReconcileActionAt.get(pkey) || 0;
         if (now - lastAt < cooldownMs) continue;
 
-        const copyMode = ENV.COPY_STRATEGY_CONFIG.copyMode;
+        const { mode: copyMode, mixedFollowAndReverse } = copyModeForReconcileTraders(involved);
+        if (mixedFollowAndReverse) {
+            Logger.warning(
+                '[对账] 同一 condition 上的跟单交易员同时含正买与反买，镜像腿判定按 FOLLOW 处理'
+            );
+        }
         const mirrorAsset = getMirrorAssetForReconcile(
             copyMode,
             pos.asset,

@@ -3,7 +3,8 @@ dotenv.config();
 
 import connectDB, { closeDB } from '../config/db';
 import { performHealthCheck, logHealthCheck } from '../utils/healthCheck';
-import { ENV } from '../config/env';
+import { ENV, buildCopyModeStartupSummary, getCopyModeForTrader } from '../config/env';
+import { copyModeLabelZhShort, copyModeEnvColumnHint } from '../config/copyStrategy';
 
 const colors = {
     reset: '\x1b[0m',
@@ -81,8 +82,12 @@ function printConfiguration() {
     console.log(`${colors.cyan}📊 配置摘要:${colors.reset}\n`);
     console.log(`   交易钱包: ${ENV.PROXY_WALLET.slice(0, 6)}...${ENV.PROXY_WALLET.slice(-4)}`);
     console.log(`   正在跟踪 ${ENV.USER_ADDRESSES.length} 位交易员:`);
+    console.log(`   ${buildCopyModeStartupSummary()}`);
     ENV.USER_ADDRESSES.forEach((addr, idx) => {
-        console.log(`      ${idx + 1}. ${addr.slice(0, 6)}...${addr.slice(-4)}`);
+        const m = getCopyModeForTrader(addr);
+        console.log(
+            `      ${idx + 1}. ${addr.slice(0, 6)}...${addr.slice(-4)}  [${copyModeLabelZhShort(m)} · ${copyModeEnvColumnHint(m)}]`
+        );
     });
     console.log(`   检查间隔: ${ENV.FETCH_INTERVAL}秒`);
     console.log(`   交易乘数: ${ENV.TRADE_MULTIPLIER}x`);

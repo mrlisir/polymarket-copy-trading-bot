@@ -2,9 +2,8 @@ import mongoose from 'mongoose';
 import { ENV } from './env';
 import chalk from 'chalk';
 
-const uri = ENV.MONGO_URI || 'mongodb://localhost:27017/polymarket_copytrading';
-
 const connectDB = async () => {
+    const uri = ENV.MONGO_URI || 'mongodb://localhost:27017/polymarket_copytrading';
     await mongoose.connect(uri);
     console.log(chalk.green('✓'), 'MongoDB 已连接');
 };

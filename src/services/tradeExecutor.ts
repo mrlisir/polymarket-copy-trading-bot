@@ -1,7 +1,14 @@
 import { ClobClient } from '@polymarket/clob-client';
 import { UserActivityInterface, UserPositionInterface } from '../interfaces/User';
-import { ENV } from '../config/env';
-import { getTradeMultiplier, getActualSide, CopyMode } from '../config/copyStrategy';
+import { ENV, getCopyModeForTrader } from '../config/env';
+import {
+    getTradeMultiplier,
+    getActualSide,
+    CopyMode,
+    copyModeLabelZh,
+    copyModeLabelZhShort,
+    copyModeEnvColumnHint,
+} from '../config/copyStrategy';
 import { getUserActivityModel } from '../models/userHistory';
 import { resolveReverseAssetForCondition } from '../utils/conditionTokens';
 import { fetchPositionsForUser } from '../utils/dataApiCache';
@@ -15,17 +22,7 @@ import { notifyCopyRiskStop } from '../utils/emailNotifier';
 import { runPositionReconciliation } from './positionReconciliation';
 import { isRetryableTransientError, transientBackoffMs, sleep } from '../utils/transientErrors';
 
-const USER_ADDRESSES = ENV.USER_ADDRESSES;
-const RETRY_LIMIT = ENV.RETRY_LIMIT;
-const PROXY_WALLET = ENV.PROXY_WALLET;
-const TRADE_AGGREGATION_ENABLED = ENV.TRADE_AGGREGATION_ENABLED;
-const TRADE_AGGREGATION_WINDOW_SECONDS = ENV.TRADE_AGGREGATION_WINDOW_SECONDS;
 const TRADE_AGGREGATION_MIN_TOTAL_USD = 1.0; // Polymarket minimum
-const DOUBLE_SIDE_GUARD_MODE = ENV.COPY_DOUBLE_SIDE_GUARD_MODE;
-const DOUBLE_SIDE_GUARD_LOCK_TTL_MS = ENV.COPY_DOUBLE_SIDE_GUARD_LOCK_TTL_MS;
-const COPY_STOP_ON_LOSS_ENABLED = ENV.COPY_STOP_ON_LOSS_ENABLED;
-const COPY_STOP_LOSS_STREAK = ENV.COPY_STOP_LOSS_STREAK;
-const COPY_STOP_LOSS_USD = ENV.COPY_STOP_LOSS_USD;
 
 let lastPortfolioCurPriceLogAt = 0;
 /** 防止同一笔交易在短时间内被重复执行（API 抖动 / DB 重复记录） */
@@ -65,7 +62,7 @@ const doubleSideBuyLocks = new Map<string, DoubleSideBuyLockEntry>();
 const pruneDoubleSideBuyLocks = (): void => {
     const now = Date.now();
     for (const [conditionId, entry] of doubleSideBuyLocks) {
-        if (now - entry.at >= DOUBLE_SIDE_GUARD_LOCK_TTL_MS) {
+        if (now - entry.at >= ENV.COPY_DOUBLE_SIDE_GUARD_LOCK_TTL_MS) {
             doubleSideBuyLocks.delete(conditionId);
         }
     }
@@ -74,7 +71,7 @@ const pruneDoubleSideBuyLocks = (): void => {
 const getLockedAsset = (conditionId: string): string | undefined => {
     const lock = doubleSideBuyLocks.get(conditionId);
     if (!lock) return undefined;
-    if (Date.now() - lock.at >= DOUBLE_SIDE_GUARD_LOCK_TTL_MS) {
+    if (Date.now() - lock.at >= ENV.COPY_DOUBLE_SIDE_GUARD_LOCK_TTL_MS) {
         doubleSideBuyLocks.delete(conditionId);
         return undefined;
     }
@@ -103,11 +100,11 @@ const maybeLogLivePortfolioCurPrice = async (clobClient: ClobClient): Promise<vo
     }
 };
 
-// Create activity models for each user
-const userActivityModels = USER_ADDRESSES.map((address) => ({
-    address,
-    model: getUserActivityModel(address),
-}));
+const buildUserActivityModels = () =>
+    ENV.USER_ADDRESSES.map((address) => ({
+        address,
+        model: getUserActivityModel(address),
+    }));
 
 interface TradeWithUser extends UserActivityInterface {
     userAddress: string;
@@ -149,13 +146,13 @@ const getTraderRiskState = (userAddress: string): TraderRiskState => {
 };
 
 const isTraderStopped = (userAddress: string): boolean =>
-    COPY_STOP_ON_LOSS_ENABLED && getTraderRiskState(userAddress).stopped;
+    ENV.COPY_STOP_ON_LOSS_ENABLED && getTraderRiskState(userAddress).stopped;
 
 const handleTraderRiskAfterSell = async (
     userAddress: string,
     realizedPnlUsd: number
 ): Promise<void> => {
-    if (!COPY_STOP_ON_LOSS_ENABLED) return;
+    if (!ENV.COPY_STOP_ON_LOSS_ENABLED) return;
     const state = getTraderRiskState(userAddress);
     if (state.stopped) return;
 
@@ -166,17 +163,18 @@ const handleTraderRiskAfterSell = async (
         state.consecutiveLosses = 0;
     }
 
-    const hitStreak = state.consecutiveLosses >= COPY_STOP_LOSS_STREAK;
-    const hitAmount = state.cumulativeLossUsd >= COPY_STOP_LOSS_USD;
+    const hitStreak = state.consecutiveLosses >= ENV.COPY_STOP_LOSS_STREAK;
+    const hitAmount = state.cumulativeLossUsd >= ENV.COPY_STOP_LOSS_USD;
     if (!hitStreak && !hitAmount) return;
 
     state.stopped = true;
     state.reason = hitStreak
-        ? `连续亏损达到 ${state.consecutiveLosses} 次（阈值 ${COPY_STOP_LOSS_STREAK}）`
-        : `累计亏损达到 $${state.cumulativeLossUsd.toFixed(2)}（阈值 $${COPY_STOP_LOSS_USD.toFixed(2)}）`;
+        ? `连续亏损达到 ${state.consecutiveLosses} 次（阈值 ${ENV.COPY_STOP_LOSS_STREAK}）`
+        : `累计亏损达到 $${state.cumulativeLossUsd.toFixed(2)}（阈值 $${ENV.COPY_STOP_LOSS_USD.toFixed(2)}）`;
 
+    const riskMode = getCopyModeForTrader(userAddress);
     Logger.warning(
-        `🛑 已停止跟单交易员 ${userAddress.slice(0, 6)}...${userAddress.slice(-4)}：${state.reason}`
+        `🛑 已停止跟单交易员 ${userAddress.slice(0, 6)}...${userAddress.slice(-4)} [${copyModeLabelZhShort(riskMode)} / ${copyModeEnvColumnHint(riskMode)}]：${state.reason}`
     );
     await notifyCopyRiskStop({
         trader: userAddress,
@@ -184,6 +182,8 @@ const handleTraderRiskAfterSell = async (
         consecutiveLosses: state.consecutiveLosses,
         cumulativeLossUsd: state.cumulativeLossUsd,
         mode: 'LIVE',
+        copyMode: riskMode === CopyMode.REVERSE ? 'REVERSE' : 'FOLLOW',
+        copyModeDetailZh: `${copyModeLabelZh(riskMode)} · .env 列 ${copyModeEnvColumnHint(riskMode)}`,
     });
 };
 
@@ -201,7 +201,7 @@ let tradeExecutorStartTimestamp = 0;
 const readTempTrades = async (): Promise<TradeWithUser[]> => {
     const allTrades: TradeWithUser[] = [];
 
-    for (const { address, model } of userActivityModels) {
+    for (const { address, model } of buildUserActivityModels()) {
         // Only get trades that have been claimed by the monitor (bot: true AND botExcutedTime: 0)
         // The monitor sets bot: true when it first sees a new trade, preventing duplicate detection
         const trades = await model
@@ -290,7 +290,7 @@ const addToAggregationBuffer = (trade: TradeWithUser): void => {
 const getReadyAggregatedTrades = (): AggregatedTrade[] => {
     const ready: AggregatedTrade[] = [];
     const now = Date.now();
-    const windowMs = TRADE_AGGREGATION_WINDOW_SECONDS * 1000;
+    const windowMs = ENV.TRADE_AGGREGATION_WINDOW_SECONDS * 1000;
 
     for (const [key, agg] of tradeAggregationBuffer.entries()) {
         const timeElapsed = now - agg.firstTradeTime;
@@ -352,13 +352,15 @@ const doTrading = async (clobClient: ClobClient, trades: TradeWithUser[]) => {
             continue;
         }
 
-        const my_positions = (await fetchPositionsForUser(PROXY_WALLET)) as UserPositionInterface[];
+        const copyMode = getCopyModeForTrader(trade.userAddress);
+
+        const my_positions = (await fetchPositionsForUser(ENV.PROXY_WALLET)) as UserPositionInterface[];
         const user_positions = (await fetchPositionsForUser(trade.userAddress)) as UserPositionInterface[];
 
         // REVERSE mode safety:
         // If oppositeAsset is missing/invalid, resolve it from trader's positions we already fetched.
         // This makes `npm run dev` support REVERSE reliably even when monitor hasn't persisted oppositeAsset yet.
-        if (ENV.COPY_STRATEGY_CONFIG.copyMode === CopyMode.REVERSE) {
+        if (copyMode === CopyMode.REVERSE) {
             const validated = await resolveReverseAssetForCondition(
                 trade.conditionId,
                 trade.asset,
@@ -399,7 +401,7 @@ const doTrading = async (clobClient: ClobClient, trades: TradeWithUser[]) => {
             }
         }
 
-        if (ENV.COPY_STRATEGY_CONFIG.copyMode === CopyMode.REVERSE) {
+        if (copyMode === CopyMode.REVERSE) {
             if (!trade.oppositeAsset || trade.oppositeAsset === trade.asset) {
                 Logger.warning(
                     '⚠️ 反买模式: 缺少有效 oppositeAsset，本笔已跳过（避免按错误代币下单）'
@@ -416,27 +418,27 @@ const doTrading = async (clobClient: ClobClient, trades: TradeWithUser[]) => {
         await UserActivity.updateOne({ _id: trade._id }, { $set: { botExcutedTime: 1 } });
         touchRecentKey(dedupKey);
 
-        const actualSide = getActualSide(trade.side || 'BUY', ENV.COPY_STRATEGY_CONFIG.copyMode);
+        const actualSide = getActualSide(trade.side || 'BUY', copyMode);
         const buyTargetAsset =
             actualSide === 'BUY'
                 ? (
-                      ENV.COPY_STRATEGY_CONFIG.copyMode === CopyMode.REVERSE
+                      copyMode === CopyMode.REVERSE
                           ? (trade.oppositeAsset || trade.asset)
                           : trade.asset
                   )
                 : undefined;
         const tradedAsset =
-            ENV.COPY_STRATEGY_CONFIG.copyMode === CopyMode.REVERSE
+            copyMode === CopyMode.REVERSE
                 ? (trade.oppositeAsset || trade.asset)
                 : trade.asset;
         const posUsdKey = positionUsdKey(trade.conditionId, tradedAsset);
         const outcomeLabels = resolveCopyOutcomeLabels(
-            ENV.COPY_STRATEGY_CONFIG.copyMode,
+            copyMode,
             trade,
             user_positions
         );
 
-        if (ENV.COPY_STRATEGY_CONFIG.copyMode === CopyMode.REVERSE) {
+        if (copyMode === CopyMode.REVERSE) {
             const ourAsset = trade.oppositeAsset || trade.asset;
             Logger.info(`🔄 反买模式: 交易员 ${trade.side} ${trade.asset.slice(0, 12)}... → 我 ${actualSide} ${ourAsset.slice(0, 12)}...`);
         }
@@ -453,12 +455,13 @@ const doTrading = async (clobClient: ClobClient, trades: TradeWithUser[]) => {
             traderOutcome: outcomeLabels.traderOutcome,
             myOutcome: outcomeLabels.myOutcome,
             outcomeModeHint: outcomeLabels.modeHint,
+            copyModeLabel: `${copyModeLabelZh(copyMode)} · ${copyModeEnvColumnHint(copyMode)}`,
         });
 
         // In REVERSE mode, find position on opposite side (we hold opposite tokens to trader)
         // In FOLLOW mode, find position on same side as trader
         let my_position = my_positions.find((position: UserPositionInterface) => {
-            if (ENV.COPY_STRATEGY_CONFIG.copyMode === CopyMode.REVERSE) {
+            if (copyMode === CopyMode.REVERSE) {
                 // REVERSE: match oppositeAsset to our position asset
                 return position.conditionId === trade.conditionId && position.asset === trade.oppositeAsset;
             }
@@ -470,7 +473,7 @@ const doTrading = async (clobClient: ClobClient, trades: TradeWithUser[]) => {
         );
 
         // Get USDC balance
-        const my_balance = await getMyBalance(PROXY_WALLET);
+        const my_balance = await getMyBalance(ENV.PROXY_WALLET);
 
         // Calculate trader's total portfolio value from positions
         const user_balance = user_positions.reduce((total, pos) => {
@@ -493,7 +496,7 @@ const doTrading = async (clobClient: ClobClient, trades: TradeWithUser[]) => {
             const targetAsset = buyTargetAsset as string;
             const lockedAsset = getLockedAsset(trade.conditionId);
             if (
-                DOUBLE_SIDE_GUARD_MODE !== 'OFF' &&
+                ENV.COPY_DOUBLE_SIDE_GUARD_MODE !== 'OFF' &&
                 lockedAsset &&
                 lockedAsset !== targetAsset
             ) {
@@ -514,8 +517,8 @@ const doTrading = async (clobClient: ClobClient, trades: TradeWithUser[]) => {
                     (p.size || 0) > 0.0001
             );
             let shouldBlock = false;
-            if (DOUBLE_SIDE_GUARD_MODE !== 'OFF' && oppositeHeld) {
-                if (DOUBLE_SIDE_GUARD_MODE === 'TRADER_ONLY') {
+            if (ENV.COPY_DOUBLE_SIDE_GUARD_MODE !== 'OFF' && oppositeHeld) {
+                if (ENV.COPY_DOUBLE_SIDE_GUARD_MODE === 'TRADER_ONLY') {
                     const oppositeBoughtBySameTrader = await UserActivity.exists({
                         conditionId: trade.conditionId,
                         type: 'TRADE',
@@ -531,7 +534,7 @@ const doTrading = async (clobClient: ClobClient, trades: TradeWithUser[]) => {
             }
             if (shouldBlock && oppositeHeld) {
                 Logger.warning(
-                    `⏭ 跳过两头买(${DOUBLE_SIDE_GUARD_MODE}): 条件 ${trade.conditionId.slice(0, 12)}... 已持有另一侧仓位 (${oppositeHeld.outcome || oppositeHeld.asset.slice(0, 12)}...)`
+                    `⏭ 跳过两头买(${ENV.COPY_DOUBLE_SIDE_GUARD_MODE}): 条件 ${trade.conditionId.slice(0, 12)}... 已持有另一侧仓位 (${oppositeHeld.outcome || oppositeHeld.asset.slice(0, 12)}...)`
                 );
                 await UserActivity.updateOne(
                     { _id: trade._id },
@@ -609,12 +612,16 @@ const doAggregatedTrading = async (clobClient: ClobClient, aggregatedTrades: Agg
         Logger.info(`总金额: $${agg.totalUsdcSize.toFixed(2)}`);
         Logger.info(`平均价格: $${agg.averagePrice.toFixed(4)}`);
 
-        const my_positions = (await fetchPositionsForUser(PROXY_WALLET)) as UserPositionInterface[];
+        const my_positions = (await fetchPositionsForUser(ENV.PROXY_WALLET)) as UserPositionInterface[];
         const user_positions = (await fetchPositionsForUser(agg.userAddress)) as UserPositionInterface[];
+        const copyMode = getCopyModeForTrader(agg.userAddress);
+        Logger.info(
+            `跟单配置: ${copyModeLabelZh(copyMode)} · .env 列 ${copyModeEnvColumnHint(copyMode)} · 交易员 ${agg.userAddress.slice(0, 6)}...${agg.userAddress.slice(-4)}`
+        );
 
         // REVERSE mode safety for aggregated trades:
         // Ensure oppositeAsset is persisted/resolved before selecting our matching position.
-        if (ENV.COPY_STRATEGY_CONFIG.copyMode === CopyMode.REVERSE) {
+        if (copyMode === CopyMode.REVERSE) {
             const templateTrade = agg.trades[0];
             const validated = await resolveReverseAssetForCondition(
                 agg.conditionId,
@@ -663,7 +670,7 @@ const doAggregatedTrading = async (clobClient: ClobClient, aggregatedTrades: Agg
             }
         }
 
-        if (ENV.COPY_STRATEGY_CONFIG.copyMode === CopyMode.REVERSE) {
+        if (copyMode === CopyMode.REVERSE) {
             const t0 = agg.trades[0];
             if (!t0.oppositeAsset || t0.oppositeAsset === t0.asset) {
                 Logger.warning(
@@ -688,7 +695,7 @@ const doAggregatedTrading = async (clobClient: ClobClient, aggregatedTrades: Agg
 
         const templateTrade = agg.trades[0];
         const aggOutcomeLabels = resolveCopyOutcomeLabels(
-            ENV.COPY_STRATEGY_CONFIG.copyMode,
+            copyMode,
             templateTrade,
             user_positions
         );
@@ -700,7 +707,7 @@ const doAggregatedTrading = async (clobClient: ClobClient, aggregatedTrades: Agg
         // In REVERSE mode, find position on opposite side (we hold opposite tokens to trader)
         // In FOLLOW mode, find position on same side as trader
         let my_position = my_positions.find((position: UserPositionInterface) => {
-            if (ENV.COPY_STRATEGY_CONFIG.copyMode === CopyMode.REVERSE) {
+            if (copyMode === CopyMode.REVERSE) {
                 // REVERSE: match oppositeAsset to our position asset
                 return (
                     position.conditionId === agg.conditionId &&
@@ -715,7 +722,7 @@ const doAggregatedTrading = async (clobClient: ClobClient, aggregatedTrades: Agg
         );
 
         // Get USDC balance
-        const my_balance = await getMyBalance(PROXY_WALLET);
+        const my_balance = await getMyBalance(ENV.PROXY_WALLET);
 
         // Calculate trader's total portfolio value from positions
         const user_balance = user_positions.reduce((total, pos) => {
@@ -734,17 +741,17 @@ const doAggregatedTrading = async (clobClient: ClobClient, aggregatedTrades: Agg
         }
 
         // Create a synthetic trade object for postOrder using aggregated values
-        const actualSide = getActualSide(agg.side as string, ENV.COPY_STRATEGY_CONFIG.copyMode);
+        const actualSide = getActualSide(agg.side as string, copyMode);
         const buyTargetAsset =
             actualSide === 'BUY'
                 ? (
-                      ENV.COPY_STRATEGY_CONFIG.copyMode === CopyMode.REVERSE
+                      copyMode === CopyMode.REVERSE
                           ? (agg.trades[0].oppositeAsset || agg.asset)
                           : agg.asset
                   )
                 : undefined;
         const tradedAsset =
-            ENV.COPY_STRATEGY_CONFIG.copyMode === CopyMode.REVERSE
+            copyMode === CopyMode.REVERSE
                 ? (agg.trades[0].oppositeAsset || agg.asset)
                 : agg.asset;
         const posUsdKey = positionUsdKey(agg.conditionId, tradedAsset);
@@ -755,7 +762,7 @@ const doAggregatedTrading = async (clobClient: ClobClient, aggregatedTrades: Agg
             side: agg.side as 'BUY' | 'SELL', // Market-side direction for history queries
         };
 
-        if (ENV.COPY_STRATEGY_CONFIG.copyMode === CopyMode.REVERSE) {
+        if (copyMode === CopyMode.REVERSE) {
             const ourAsset = (agg.trades[0].oppositeAsset || agg.asset).slice(0, 12);
             Logger.info(`🔄 反买模式: 交易员 ${agg.side} ${agg.asset.slice(0, 12)}... → 我 ${actualSide} ${ourAsset}...`);
         }
@@ -765,7 +772,7 @@ const doAggregatedTrading = async (clobClient: ClobClient, aggregatedTrades: Agg
             const targetAsset = buyTargetAsset as string;
             const lockedAsset = getLockedAsset(agg.conditionId);
             if (
-                DOUBLE_SIDE_GUARD_MODE !== 'OFF' &&
+                ENV.COPY_DOUBLE_SIDE_GUARD_MODE !== 'OFF' &&
                 lockedAsset &&
                 lockedAsset !== targetAsset
             ) {
@@ -789,8 +796,8 @@ const doAggregatedTrading = async (clobClient: ClobClient, aggregatedTrades: Agg
                     (p.size || 0) > 0.0001
             );
             let shouldBlock = false;
-            if (DOUBLE_SIDE_GUARD_MODE !== 'OFF' && oppositeHeld) {
-                if (DOUBLE_SIDE_GUARD_MODE === 'TRADER_ONLY') {
+            if (ENV.COPY_DOUBLE_SIDE_GUARD_MODE !== 'OFF' && oppositeHeld) {
+                if (ENV.COPY_DOUBLE_SIDE_GUARD_MODE === 'TRADER_ONLY') {
                     const UA0 = getUserActivityModel(agg.userAddress);
                     const oppositeBoughtBySameTrader = await UA0.exists({
                         conditionId: agg.conditionId,
@@ -807,7 +814,7 @@ const doAggregatedTrading = async (clobClient: ClobClient, aggregatedTrades: Agg
             }
             if (shouldBlock && oppositeHeld) {
                 Logger.warning(
-                    `⏭ 跳过两头买(聚合, ${DOUBLE_SIDE_GUARD_MODE}): 条件 ${agg.conditionId.slice(0, 12)}... 已持有另一侧仓位 (${oppositeHeld.outcome || oppositeHeld.asset.slice(0, 12)}...)`
+                    `⏭ 跳过两头买(聚合, ${ENV.COPY_DOUBLE_SIDE_GUARD_MODE}): 条件 ${agg.conditionId.slice(0, 12)}... 已持有另一侧仓位 (${oppositeHeld.outcome || oppositeHeld.asset.slice(0, 12)}...)`
                 );
                 for (const tr of agg.trades) {
                     const UA = getUserActivityModel(tr.userAddress);
@@ -929,13 +936,13 @@ export const stopTradeExecutor = () => {
 const tradeExecutor = async (clobClient: ClobClient) => {
     initDailyVolumeTracking();
     tradeExecutorStartTimestamp = Math.floor(Date.now() / 1000);
-    Logger.success(`交易执行器就绪，正在监控 ${USER_ADDRESSES.length} 位交易员`);
+    Logger.success(`交易执行器就绪，正在监控 ${ENV.USER_ADDRESSES.length} 位交易员`);
     Logger.info(
         `只执行启动后检测到的待执行单 (启动时间: ${formatBeijingDateTime(new Date(tradeExecutorStartTimestamp * 1000))})`
     );
-    if (TRADE_AGGREGATION_ENABLED) {
+    if (ENV.TRADE_AGGREGATION_ENABLED) {
         Logger.info(
-            `交易聚合已启用: ${TRADE_AGGREGATION_WINDOW_SECONDS} 秒窗口，最低 $${TRADE_AGGREGATION_MIN_TOTAL_USD}`
+            `交易聚合已启用: ${ENV.TRADE_AGGREGATION_WINDOW_SECONDS} 秒窗口，最低 $${TRADE_AGGREGATION_MIN_TOTAL_USD}`
         );
     }
 
@@ -952,7 +959,7 @@ const tradeExecutor = async (clobClient: ClobClient) => {
         try {
         const trades = await readTempTrades();
 
-        if (TRADE_AGGREGATION_ENABLED) {
+        if (ENV.TRADE_AGGREGATION_ENABLED) {
             // Process with aggregation logic
             if (trades.length > 0) {
                 Logger.clearLine();
@@ -993,11 +1000,11 @@ const tradeExecutor = async (clobClient: ClobClient) => {
                     const bufferedCount = tradeAggregationBuffer.size;
                     if (bufferedCount > 0) {
                         Logger.waiting(
-                            USER_ADDRESSES.length,
+                            ENV.USER_ADDRESSES.length,
                             `${bufferedCount} 个交易组待处理`
                         );
                     } else {
-                        Logger.waiting(USER_ADDRESSES.length);
+                        Logger.waiting(ENV.USER_ADDRESSES.length);
                     }
                     lastCheck = Date.now();
                 }
@@ -1012,7 +1019,7 @@ const tradeExecutor = async (clobClient: ClobClient) => {
                 lastCheck = Date.now();
             } else {
                 if (Date.now() - lastCheck > 300) {
-                    Logger.waiting(USER_ADDRESSES.length);
+                    Logger.waiting(ENV.USER_ADDRESSES.length);
                     lastCheck = Date.now();
                 }
             }

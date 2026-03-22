@@ -1,4 +1,5 @@
-import { ENV } from '../config/env';
+import { ENV, getCopyModeForTrader } from '../config/env';
+import { copyModeLabelZhShort } from '../config/copyStrategy';
 import { CopyMode } from '../config/copyStrategy';
 import { getUserActivityModel, getUserPositionModel } from '../models/userHistory';
 import { resolveReverseAssetForCondition } from '../utils/conditionTokens';
@@ -159,31 +160,32 @@ const fetchOppositeAsset = async (conditionId: string, currentAsset: string): Pr
     return '';
 };
 
-const USER_ADDRESSES = ENV.USER_ADDRESSES;
-const FETCH_INTERVAL = ENV.FETCH_INTERVAL;
-
 // Only track trades AFTER bot starts (not historical trades)
 const BOT_START_TIME = Math.floor(Date.now() / 1000);
 
-if (!USER_ADDRESSES || USER_ADDRESSES.length === 0) {
-    throw new Error('USER_ADDRESSES is not defined or empty');
-}
-
-// Create activity and position models for each user
-const userModels = USER_ADDRESSES.map((address) => ({
-    address,
-    UserActivity: getUserActivityModel(address),
-    UserPosition: getUserPositionModel(address),
-}));
+const buildUserModels = () => {
+    const addrs = ENV.USER_ADDRESSES;
+    if (!addrs || addrs.length === 0) {
+        throw new Error('跟单地址为空：请配置 USER_ADDRESSES_FOLLOW 和/或 USER_ADDRESSES_REVERSE');
+    }
+    return addrs.map((address) => ({
+        address,
+        UserActivity: getUserActivityModel(address),
+        UserPosition: getUserPositionModel(address),
+    }));
+};
 
 const init = async () => {
+    const userModels = buildUserModels();
+    const userAddresses = ENV.USER_ADDRESSES;
     const counts: number[] = [];
     for (const { address, UserActivity } of userModels) {
         const count = await UserActivity.countDocuments();
         counts.push(count);
     }
     Logger.clearLine();
-    Logger.dbConnection(USER_ADDRESSES, counts);
+    const copyModeTag = (a: string) => copyModeLabelZhShort(getCopyModeForTrader(a));
+    Logger.dbConnection(userAddresses, counts, { copyModeTag });
 
     // Show your own positions first
     try {
@@ -259,10 +261,13 @@ const init = async () => {
         positionDetails.push(topPositions);
     }
     Logger.clearLine();
-    Logger.tradersPositions(USER_ADDRESSES, positionCounts, positionDetails, profitabilities);
+    Logger.tradersPositions(userAddresses, positionCounts, positionDetails, profitabilities, {
+        copyModeTag,
+    });
 };
 
 const fetchTradeData = async () => {
+    const userModels = buildUserModels();
     const proxyPositionsRows = await fetchPositionsForUser(ENV.PROXY_WALLET);
     const proxyPositionsArr = (Array.isArray(proxyPositionsRows) ? proxyPositionsRows : []) as any[];
 
@@ -358,7 +363,7 @@ const fetchTradeData = async () => {
                     );
                     if (checked.valid && checked.oppositeAsset) {
                         newActivity.oppositeAsset = checked.oppositeAsset;
-                    } else if (ENV.COPY_STRATEGY_CONFIG.copyMode === CopyMode.REVERSE) {
+                    } else if (getCopyModeForTrader(address) === CopyMode.REVERSE) {
                         Logger.warning(
                             `[监控] oppositeAsset 未通过 condition 白名单校验: tx=${String(activity.transactionHash || '').slice(0, 12)}...`
                         );
@@ -370,8 +375,9 @@ const fetchTradeData = async () => {
                     activity.outcome && String(activity.outcome).trim()
                         ? ` | Outcome: ${String(activity.outcome).trim()}`
                         : '';
+                const monMode = getCopyModeForTrader(address);
                 Logger.info(
-                    `检测到 ${address.slice(0, 6)}...${address.slice(-4)} 的新交易${oc}`
+                    `检测到 ${address.slice(0, 6)}...${address.slice(-4)} [${copyModeLabelZhShort(monMode)}] 的新交易${oc}`
                 );
             }
 
@@ -459,7 +465,9 @@ const tradeMonitor = async () => {
         return;
     }
 
-    Logger.success(`正在监控 ${USER_ADDRESSES.length} 位交易员，每 ${FETCH_INTERVAL} 秒检查一次`);
+    Logger.success(
+        `正在监控 ${ENV.USER_ADDRESSES.length} 位交易员，每 ${ENV.FETCH_INTERVAL} 秒检查一次`
+    );
     Logger.separator();
     Logger.info(
         `⏱ 仅跟踪 bot 启动后的新交易 (启动时间: ${formatBeijingDateTime(new Date(BOT_START_TIME * 1000))})`
@@ -485,7 +493,7 @@ const tradeMonitor = async () => {
             Logger.error(`fetchTradeData 出错: ${e}`);
         }
         if (!isRunning) break;
-        await new Promise((resolve) => setTimeout(resolve, FETCH_INTERVAL * 1000));
+        await new Promise((resolve) => setTimeout(resolve, ENV.FETCH_INTERVAL * 1000));
     }
 
     Logger.info('交易监控已停止');

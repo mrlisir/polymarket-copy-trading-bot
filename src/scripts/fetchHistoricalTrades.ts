@@ -141,7 +141,7 @@ const chunk = <T>(array: T[], size: number): T[][] => {
 
 const main = async () => {
     if (USER_ADDRESSES.length === 0) {
-        console.log('USER_ADDRESSES is empty. Check .env');
+        console.log('USER_ADDRESSES_FOLLOW / USER_ADDRESSES_REVERSE 合并后为空，请检查 .env');
         return;
     }
 

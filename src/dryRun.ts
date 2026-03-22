@@ -8,11 +8,11 @@
  * - 启动 tradeMonitor 检测跟单钱包的新交易（写 MongoDB）
  * - dryRunExecutor 读取新交易，按订单簿模拟成交
  * - 维护模拟余额和持仓，跟踪实时盈亏
- * - 所有策略配置(COPY_STRATEGY/COPY_MODE/分层倍数)全部生效
+ * - 所有策略配置(COPY_STRATEGY/分层倍数)与跟单地址列(USER_ADDRESSES_FOLLOW/REVERSE)全部生效
  */
 
 import connectDB, { closeDB } from './config/db';
-import { ENV } from './config/env';
+import { ENV, reloadEnvFromDisk } from './config/env';
 import createClobClient from './utils/createClobClient';
 import tradeMonitor, { stopTradeMonitor } from './services/tradeMonitor';
 import dryRunExecutor, { stopDryRunExecutor } from './services/dryRunExecutor';
@@ -20,6 +20,8 @@ import Logger from './utils/logger';
 import { isRetryableTransientError, transientBackoffMs, sleep } from './utils/transientErrors';
 
 let isShuttingDown = false;
+let envReloadTimer: ReturnType<typeof setInterval> | undefined;
+let lastEnvReloadAt = 0;
 
 const gracefulShutdown = async (signal: string) => {
     if (isShuttingDown) {
@@ -28,6 +30,10 @@ const gracefulShutdown = async (signal: string) => {
     isShuttingDown = true;
     Logger.separator();
     Logger.info(`收到关闭信号 ${signal}，正在关闭...`);
+    if (envReloadTimer) {
+        clearInterval(envReloadTimer);
+        envReloadTimer = undefined;
+    }
     stopTradeMonitor();
     stopDryRunExecutor();
     if (ENV.TRANSIENT_RESTART_SETTLE_MS > 0) {
@@ -80,7 +86,26 @@ const main = async () => {
             const clobClient = await createClobClientWithRetry();
             Logger.success('CLOB 客户端就绪');
 
+            lastEnvReloadAt = 0;
+            envReloadTimer = setInterval(() => {
+                const ms = ENV.ENV_FILE_RELOAD_INTERVAL_MS;
+                if (!ms || ms <= 0) return;
+                const now = Date.now();
+                if (now - lastEnvReloadAt < ms) return;
+                lastEnvReloadAt = now;
+                const r = reloadEnvFromDisk();
+                if (r.ok) {
+                    Logger.success(r.message);
+                } else {
+                    Logger.warning(`.env 热更新失败，沿用原配置: ${r.error}`);
+                }
+            }, 1000);
+
             await Promise.all([tradeMonitor(), dryRunExecutor(clobClient)]);
+            if (envReloadTimer) {
+                clearInterval(envReloadTimer);
+                envReloadTimer = undefined;
+            }
             break;
         } catch (error) {
             if (isShuttingDown) break;

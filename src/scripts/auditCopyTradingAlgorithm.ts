@@ -126,34 +126,36 @@ const AUDIT_STARTING_CAPITAL = parseFloat(process.env.AUDIT_STARTING_CAPITAL || 
 const MIN_ORDER_SIZE = parseFloat(process.env.SIM_MIN_ORDER_USD || '1.0');
 const MAX_TRADES_LIMIT = parseInt(process.env.SIM_MAX_TRADES || '3000');
 
-// Parse trader addresses from env
+// Parse trader addresses from env（默认用 .env 里合并后的跟单列表；可单独用 AUDIT_ADDRESSES 覆盖）
 function parseTraderAddresses(): string[] {
-    const envAddresses = process.env.AUDIT_ADDRESSES || process.env.USER_ADDRESSES || '';
-
-    if (!envAddresses) {
-        console.log(colors.yellow('⚠️  No AUDIT_ADDRESSES or USER_ADDRESSES found in environment'));
-        console.log(colors.yellow('    Using default test addresses...\n'));
-        return [
-            '0x7c3db723f1d4d8cb9c550095203b686cb11e5c6b',
-            '0x6bab41a0dc40d6dd4c1a915b8c01969479fd1292',
-        ];
-    }
-
-    // Try JSON array format
-    if (envAddresses.trim().startsWith('[')) {
-        try {
-            const parsed = JSON.parse(envAddresses);
-            return parsed.map((addr: string) => addr.toLowerCase().trim());
-        } catch (e) {
-            console.log(colors.yellow('⚠️  Failed to parse JSON array, trying comma-separated...'));
+    const auditOverride = process.env.AUDIT_ADDRESSES?.trim();
+    if (auditOverride) {
+        if (auditOverride.startsWith('[')) {
+            try {
+                const parsed = JSON.parse(auditOverride);
+                return parsed.map((addr: string) => addr.toLowerCase().trim());
+            } catch {
+                console.log(colors.yellow('⚠️  Failed to parse AUDIT_ADDRESSES JSON, trying comma-separated...'));
+            }
         }
+        return auditOverride
+            .split(',')
+            .map((addr) => addr.toLowerCase().trim())
+            .filter((addr) => addr.length > 0);
     }
 
-    // Try comma-separated format
-    return envAddresses
-        .split(',')
-        .map((addr) => addr.toLowerCase().trim())
-        .filter((addr) => addr.length > 0);
+    if (ENV.USER_ADDRESSES.length > 0) {
+        return [...ENV.USER_ADDRESSES];
+    }
+
+    console.log(
+        colors.yellow('⚠️  No AUDIT_ADDRESSES and no USER_ADDRESSES_FOLLOW / USER_ADDRESSES_REVERSE in environment')
+    );
+    console.log(colors.yellow('    Using default test addresses...\n'));
+    return [
+        '0x7c3db723f1d4d8cb9c550095203b686cb11e5c6b',
+        '0x6bab41a0dc40d6dd4c1a915b8c01969479fd1292',
+    ];
 }
 
 async function fetchBatch(

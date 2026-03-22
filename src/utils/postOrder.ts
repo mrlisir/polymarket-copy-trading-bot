@@ -1,5 +1,6 @@
 import { ClobClient, OrderType, Side } from '@polymarket/clob-client';
-import { ENV } from '../config/env';
+import { ENV, getCopyModeForTrader } from '../config/env';
+import { copyModeLabelZhShort, copyModeEnvColumnHint } from '../config/copyStrategy';
 import { UserActivityInterface, UserPositionInterface } from '../interfaces/User';
 import { getUserActivityModel } from '../models/userHistory';
 import Logger from './logger';
@@ -13,14 +14,7 @@ import { notifyOrderSuccess } from './emailNotifier';
 import { fetchPositionsForUser } from './dataApiCache';
 import { resolveCopyOutcomeLabels } from './copyOutcomeLabels';
 
-const RETRY_LIMIT = ENV.RETRY_LIMIT;
-const COPY_STRATEGY_CONFIG = ENV.COPY_STRATEGY_CONFIG;
-
-// Orderbook caching (reduce getOrderBook API load & 404 spam)
-const ORDERBOOK_CACHE_TTL_MS = ENV.ORDERBOOK_CACHE_TTL_MS;
-const ORDERBOOK_CACHE_MAX_ENTRIES = ENV.ORDERBOOK_CACHE_MAX_ENTRIES;
-const ORDERBOOK_MISSING_LOG_THROTTLE_MS = ENV.ORDERBOOK_MISSING_LOG_THROTTLE_MS;
-const ORDER_PRICE_SLIPPAGE_USD = ENV.ORDER_PRICE_SLIPPAGE_USD;
+// Orderbook caching (reduce getOrderBook API load & 404 spam) — 读 ENV.* 以支持 .env 热更新
 
 /** 邮件：跟单模式 + outcome 文案（依赖交易员 positions，失败时降级） */
 const buildEmailNotifyExtras = async (
@@ -37,9 +31,10 @@ const buildEmailNotifyExtras = async (
     try {
         const traderPos = (await fetchPositionsForUser(userAddress)) as UserPositionInterface[];
         const list = Array.isArray(traderPos) ? traderPos : [];
-        const labels = resolveCopyOutcomeLabels(COPY_STRATEGY_CONFIG.copyMode, trade, list);
+        const mode = getCopyModeForTrader(userAddress);
+        const labels = resolveCopyOutcomeLabels(mode, trade, list);
         return {
-            copyMode: COPY_STRATEGY_CONFIG.copyMode,
+            copyMode: mode,
             traderOutcome: labels.traderOutcome,
             myOutcome: labels.myOutcome,
             modeHint: labels.modeHint,
@@ -48,7 +43,7 @@ const buildEmailNotifyExtras = async (
         };
     } catch {
         return {
-            copyMode: COPY_STRATEGY_CONFIG.copyMode,
+            copyMode: getCopyModeForTrader(userAddress),
             slug: trade.slug,
             eventSlug: trade.eventSlug,
         };
@@ -71,7 +66,7 @@ const orderBookCache: Map<string, CachedOrderBook> = new Map();
 const orderBookMissingLastLoggedAt: Map<string, number> = new Map();
 
 const trimOrderBookCache = () => {
-    while (orderBookCache.size > ORDERBOOK_CACHE_MAX_ENTRIES) {
+    while (orderBookCache.size > ENV.ORDERBOOK_CACHE_MAX_ENTRIES) {
         const firstKey = orderBookCache.keys().next().value;
         if (!firstKey) break;
         orderBookCache.delete(firstKey);
@@ -85,7 +80,7 @@ export const fetchOrderBookCached = async (
 ): Promise<any | null> => {
     const now = Date.now();
     const cached = orderBookCache.get(tokenId);
-    if (cached && now - cached.fetchedAt <= ORDERBOOK_CACHE_TTL_MS) {
+    if (cached && now - cached.fetchedAt <= ENV.ORDERBOOK_CACHE_TTL_MS) {
         return cached.value;
     }
 
@@ -101,7 +96,7 @@ export const fetchOrderBookCached = async (
             trimOrderBookCache();
 
             const lastLoggedAt = orderBookMissingLastLoggedAt.get(tokenId) || 0;
-            if (now - lastLoggedAt >= ORDERBOOK_MISSING_LOG_THROTTLE_MS) {
+            if (now - lastLoggedAt >= ENV.ORDERBOOK_MISSING_LOG_THROTTLE_MS) {
                 orderBookMissingLastLoggedAt.set(tokenId, now);
                 Logger.warning(
                     `⚠️  订单簿不存在 (404): token ${tokenId.slice(0, 12)}...（已限流）`
@@ -114,23 +109,19 @@ export const fetchOrderBookCached = async (
     }
 };
 
-// Legacy parameters (for backward compatibility in SELL logic)
-const TRADE_MULTIPLIER = ENV.TRADE_MULTIPLIER;
-const COPY_PERCENTAGE = ENV.COPY_PERCENTAGE;
-
 // Polymarket minimum order sizes
 const MIN_ORDER_SIZE_USD = 1.0; // Minimum order size in USD for BUY orders
 const MIN_ORDER_SIZE_TOKENS = 1.0; // Minimum order size in tokens for SELL/MERGE orders
 
-// Check if reverse mode is enabled
-const isReverseMode = (): boolean => COPY_STRATEGY_CONFIG.copyMode === CopyMode.REVERSE;
+const isReverseForUser = (userAddress: string): boolean =>
+    getCopyModeForTrader(userAddress) === CopyMode.REVERSE;
 
 // Get the correct position to check for reverse trading
 // In reverse mode, we trade the OPPOSITE asset as the trader
 // - Trader BUY YES → we BUY NO (oppositeAsset)
 // - Trader SELL YES → we SELL NO (oppositeAsset)
-const getPositionAsset = (trade: UserActivityInterface): string => {
-    if (isReverseMode()) {
+const getPositionAsset = (trade: UserActivityInterface, userAddress: string): string => {
+    if (isReverseForUser(userAddress)) {
         if (trade.oppositeAsset) {
             Logger.info(`🔄 反买模式: 交易员交易 ${trade.asset} → 我反向交易 ${trade.oppositeAsset}`);
             return trade.oppositeAsset;
@@ -229,13 +220,13 @@ const postOrder = async (
 
         let retry = 0;
         let abortDueToFunds = false;
-        while (remaining > 0 && retry < RETRY_LIMIT) {
+        while (remaining > 0 && retry < ENV.RETRY_LIMIT) {
             let orderBook;
             try {
                 orderBook = await fetchOrderBookCached(clobClient, trade.asset);
             } catch (orderBookError: unknown) {
                 retry += 1;
-                Logger.warning(`订单簿查询失败 (${retry}/${RETRY_LIMIT}): ${orderBookError}`);
+                Logger.warning(`订单簿查询失败 (${retry}/${ENV.RETRY_LIMIT}): ${orderBookError}`);
                 continue;
             }
 
@@ -300,18 +291,18 @@ const postOrder = async (
                 }
                 retry += 1;
                 Logger.warning(
-                    `订单失败 (第 ${retry}/${RETRY_LIMIT} 次尝试)${errorMessage ? ` - ${errorMessage}` : ''}`
+                    `订单失败 (第 ${retry}/${ENV.RETRY_LIMIT} 次尝试)${errorMessage ? ` - ${errorMessage}` : ''}`
                 );
             }
         }
         if (abortDueToFunds) {
             await UserActivity.updateOne(
                 { _id: trade._id },
-                { bot: true, botExcutedTime: RETRY_LIMIT }
+                { bot: true, botExcutedTime: ENV.RETRY_LIMIT }
             );
             return 0;
         }
-        if (retry >= RETRY_LIMIT) {
+        if (retry >= ENV.RETRY_LIMIT) {
             await UserActivity.updateOne({ _id: trade._id }, { bot: true, botExcutedTime: retry });
         } else {
             await UserActivity.updateOne({ _id: trade._id }, { bot: true });
@@ -320,7 +311,7 @@ const postOrder = async (
     } else if (condition === 'buy') {
         //Buy strategy
         // In REVERSE mode, 'buy' means trader sold → we buy opposite side
-        if (isReverseMode() && trade.conditionId) {
+        if (isReverseForUser(userAddress) && trade.conditionId) {
             const resolved = await resolveReverseAssetForCondition(
                 trade.conditionId,
                 trade.asset,
@@ -330,8 +321,8 @@ const postOrder = async (
                 trade.oppositeAsset = resolved.oppositeAsset;
             }
         }
-        const tradeAsset = getPositionAsset(trade);
-        if (isReverseMode()) {
+        const tradeAsset = getPositionAsset(trade, userAddress);
+        if (isReverseForUser(userAddress)) {
             Logger.info(`🔄 反买模式: 交易员 ${trade.side} → 我买入反向资产 ${tradeAsset}`);
             Logger.info(`   原始订单: ${trade.side} $${trade.usdcSize.toFixed(2)} @ $${trade.price}`);
             const leg =
@@ -339,19 +330,19 @@ const postOrder = async (
                     ? String(trade.outcome).trim()
                     : '交易员该笔合约腿';
             Logger.info(
-                `📌 反买说明：你在 Polymarket 上买到的是「对侧 outcome」合约（与 activity 里 ${leg} 相反），不是跟交易员同方向；若要同向买 ${leg}，请把 COPY_MODE 设为 FOLLOW。`
+                `📌 反买说明：你在 Polymarket 上买到的是「对侧 outcome」合约（与 activity 里 ${leg} 相反），不是跟交易员同方向；若要同向买 ${leg}，请将该交易员改到 USER_ADDRESSES_FOLLOW。`
             );
         }
         // Safety: in REVERSE mode we must buy the OPPOSITE token.
         // If oppositeAsset is missing/invalid, do not fall back to the same asset.
-        if (isReverseMode() && (!trade.oppositeAsset || trade.oppositeAsset === trade.asset)) {
+        if (isReverseForUser(userAddress) && (!trade.oppositeAsset || trade.oppositeAsset === trade.asset)) {
             Logger.warning('⚠️ 反买模式缺少有效 oppositeAsset（或与原 asset 相同），本笔跳过，避免执行成跟随单');
             await UserActivity.updateOne({ _id: trade._id }, { bot: true });
             return 0;
         }
 
         // Gamma 核对：二元市场以 clobTokenIds 为准，避免 UI 与 Data API 标反时误以为「同腿」
-        if (isReverseMode() && trade.conditionId) {
+        if (isReverseForUser(userAddress) && trade.conditionId) {
             try {
                 const meta = await getConditionTokensMetaCached(trade.conditionId);
                 const traderLeg = outcomeLabelForAsset(meta.tokenIds, meta.outcomes, trade.asset);
@@ -376,7 +367,7 @@ const postOrder = async (
         );
 
         // Show daily volume status if limit is configured
-        const dailyLimit = COPY_STRATEGY_CONFIG.maxDailyVolumeUSD;
+        const dailyLimit = ENV.COPY_STRATEGY_CONFIG.maxDailyVolumeUSD;
         if (dailyLimit) {
             const dailyUsed = currentDailyVolume;
             const dailyRemaining = Math.max(0, dailyLimit - dailyUsed);
@@ -387,7 +378,7 @@ const postOrder = async (
 
         // Use new copy strategy system
         const orderCalc = calculateOrderSize(
-            COPY_STRATEGY_CONFIG,
+            ENV.COPY_STRATEGY_CONFIG,
             trade.usdcSize,
             my_balance,
             currentPositionValue,
@@ -426,14 +417,14 @@ const postOrder = async (
         let totalBoughtTokens = 0; // Track total tokens bought for this trade
         let totalSpentUsdc = 0; // Track total USDC spent for this trade
 
-        while (remaining > 0 && retry < RETRY_LIMIT) {
+        while (remaining > 0 && retry < ENV.RETRY_LIMIT) {
             let orderBook;
             try {
                 orderBook = await fetchOrderBookCached(clobClient, tradeAsset);
             } catch (orderBookError: unknown) {
                 retry += 1;
                 Logger.warning(
-                    `订单簿查询失败 (第 ${retry}/${RETRY_LIMIT} 次): ${orderBookError}`
+                    `订单簿查询失败 (第 ${retry}/${ENV.RETRY_LIMIT} 次): ${orderBookError}`
                 );
                 continue;
             }
@@ -457,7 +448,7 @@ const postOrder = async (
             );
 
             Logger.info(`最优卖价: ${minPriceAsk.size} @ $${minPriceAsk.price}`);
-            if (parseFloat(minPriceAsk.price) - ORDER_PRICE_SLIPPAGE_USD > trade.price) {
+            if (parseFloat(minPriceAsk.price) - ENV.ORDER_PRICE_SLIPPAGE_USD > trade.price) {
                 Logger.warning('价格滑点过大 — 跳过此次交易');
                 await UserActivity.updateOne({ _id: trade._id }, { bot: true });
                 break;
@@ -516,6 +507,10 @@ const postOrder = async (
                     `买入成功: $${order_arges.amount.toFixed(2)} @ $${order_arges.price} (${tokensBought.toFixed(2)} 个代币)`
                 );
                 const emailExtras = await buildEmailNotifyExtras(trade, userAddress);
+                const cm = getCopyModeForTrader(userAddress);
+                Logger.info(
+                    `📎 本笔成交跟单配置: ${copyModeLabelZhShort(cm)} · .env 列 ${copyModeEnvColumnHint(cm)}`
+                );
                 await notifyOrderSuccess({
                     side: 'BUY',
                     amountUsd: order_arges.amount,
@@ -543,18 +538,18 @@ const postOrder = async (
                 }
                 retry += 1;
                 Logger.warning(
-                    `订单失败 (第 ${retry}/${RETRY_LIMIT} 次尝试)${errorMessage ? ` - ${errorMessage}` : ''}`
+                    `订单失败 (第 ${retry}/${ENV.RETRY_LIMIT} 次尝试)${errorMessage ? ` - ${errorMessage}` : ''}`
                 );
             }
         }
         if (abortDueToFunds) {
             await UserActivity.updateOne(
                 { _id: trade._id },
-                { bot: true, botExcutedTime: RETRY_LIMIT, myBoughtSize: totalBoughtTokens }
+                { bot: true, botExcutedTime: ENV.RETRY_LIMIT, myBoughtSize: totalBoughtTokens }
             );
             return 0;
         }
-        if (retry >= RETRY_LIMIT) {
+        if (retry >= ENV.RETRY_LIMIT) {
             await UserActivity.updateOne(
                 { _id: trade._id },
                 { bot: true, botExcutedTime: retry, myBoughtSize: totalBoughtTokens }
@@ -584,7 +579,7 @@ const postOrder = async (
             return 0;
         }
 
-        if (isReverseMode() && trade.conditionId) {
+        if (isReverseForUser(userAddress) && trade.conditionId) {
             const resolved = await resolveReverseAssetForCondition(
                 trade.conditionId,
                 trade.asset,
@@ -598,9 +593,11 @@ const postOrder = async (
         // Determine which asset we're selling
         // In REVERSE mode: we sell oppositeAsset (we hold the opposite tokens)
         // In FOLLOW mode: we sell the same asset as trader
-        const sellAsset = isReverseMode() ? (trade.oppositeAsset || trade.asset) : trade.asset;
+        const sellAsset = isReverseForUser(userAddress)
+            ? (trade.oppositeAsset || trade.asset)
+            : trade.asset;
         // Safety: in REVERSE mode we must sell the OPPOSITE token.
-        if (isReverseMode() && (!trade.oppositeAsset || trade.oppositeAsset === trade.asset)) {
+        if (isReverseForUser(userAddress) && (!trade.oppositeAsset || trade.oppositeAsset === trade.asset)) {
             Logger.warning('⚠️ 反买模式缺少有效 oppositeAsset（或与原 asset 相同），本笔跳过，避免执行成跟随单');
             await UserActivity.updateOne({ _id: trade._id }, { bot: true });
             return 0;
@@ -661,7 +658,7 @@ const postOrder = async (
             }
 
             // Apply tiered or single multiplier based on trader's order size (symmetrical with BUY logic)
-            const multiplier = getTradeMultiplier(COPY_STRATEGY_CONFIG, trade.usdcSize);
+            const multiplier = getTradeMultiplier(ENV.COPY_STRATEGY_CONFIG, trade.usdcSize);
             remaining = baseSellSize * multiplier;
 
             if (multiplier !== 1.0) {
@@ -695,7 +692,7 @@ const postOrder = async (
         let totalSoldTokens = 0; // Track total tokens sold
         let totalSoldUsdc = 0; // Track total USDC proceeds
 
-        while (remaining > 0 && retry < RETRY_LIMIT) {
+        while (remaining > 0 && retry < ENV.RETRY_LIMIT) {
             let orderBook;
             try {
                 // In REVERSE mode, sellAsset is the opposite token — fetch its orderbook
@@ -703,7 +700,7 @@ const postOrder = async (
                 orderBook = await fetchOrderBookCached(clobClient, sellAsset);
             } catch (orderBookError: unknown) {
                 retry += 1;
-                Logger.warning(`订单簿查询失败 (${retry}/${RETRY_LIMIT}): ${orderBookError}`);
+                Logger.warning(`订单簿查询失败 (${retry}/${ENV.RETRY_LIMIT}): ${orderBookError}`);
                 continue;
             }
 
@@ -763,6 +760,10 @@ const postOrder = async (
                     `卖出成功: ${order_arges.amount} 个代币 @ $${order_arges.price}`
                 );
                 const emailExtrasSell = await buildEmailNotifyExtras(trade, userAddress);
+                const cmSell = getCopyModeForTrader(userAddress);
+                Logger.info(
+                    `📎 本笔成交跟单配置: ${copyModeLabelZhShort(cmSell)} · .env 列 ${copyModeEnvColumnHint(cmSell)}`
+                );
                 await notifyOrderSuccess({
                     side: 'SELL',
                     amountUsd: order_arges.amount * order_arges.price,
@@ -790,7 +791,7 @@ const postOrder = async (
                 }
                 retry += 1;
                 Logger.warning(
-                    `订单失败 (第 ${retry}/${RETRY_LIMIT} 次尝试)${errorMessage ? ` - ${errorMessage}` : ''}`
+                    `订单失败 (第 ${retry}/${ENV.RETRY_LIMIT} 次尝试)${errorMessage ? ` - ${errorMessage}` : ''}`
                 );
             }
         }
@@ -832,11 +833,11 @@ const postOrder = async (
         if (abortDueToFunds) {
             await UserActivity.updateOne(
                 { _id: trade._id },
-                { bot: true, botExcutedTime: RETRY_LIMIT }
+                { bot: true, botExcutedTime: ENV.RETRY_LIMIT }
             );
             return 0;
         }
-        if (retry >= RETRY_LIMIT) {
+        if (retry >= ENV.RETRY_LIMIT) {
             await UserActivity.updateOne({ _id: trade._id }, { bot: true, botExcutedTime: retry });
         } else {
             await UserActivity.updateOne({ _id: trade._id }, { bot: true });
@@ -871,14 +872,14 @@ export const marketSellTokensFOK = async (
     let soldTokens = 0;
     let retry = 0;
 
-    while (remaining >= MIN_ORDER_SIZE_TOKENS && retry < RETRY_LIMIT) {
+    while (remaining >= MIN_ORDER_SIZE_TOKENS && retry < ENV.RETRY_LIMIT) {
         let orderBook;
         try {
             orderBook = await fetchOrderBookCached(clobClient, tokenId);
         } catch (orderBookError: unknown) {
             retry += 1;
             Logger.warning(
-                `[marketSell] 订单簿查询失败 (${retry}/${RETRY_LIMIT}): ${orderBookError}`
+                `[marketSell] 订单簿查询失败 (${retry}/${ENV.RETRY_LIMIT}): ${orderBookError}`
             );
             continue;
         }
@@ -929,7 +930,7 @@ export const marketSellTokensFOK = async (
             }
             retry += 1;
             Logger.warning(
-                `[marketSell] 订单失败 (${retry}/${RETRY_LIMIT})${errorMessage ? ` - ${errorMessage}` : ''}`
+                `[marketSell] 订单失败 (${retry}/${ENV.RETRY_LIMIT})${errorMessage ? ` - ${errorMessage}` : ''}`
             );
         }
     }

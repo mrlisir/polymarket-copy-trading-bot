@@ -1,7 +1,15 @@
 import { ClobClient } from '@polymarket/clob-client';
-import { ENV } from '../config/env';
+import { ENV, buildCopyModeStartupSummary, getCopyModeForTrader } from '../config/env';
 import { getUserActivityModel } from '../models/userHistory';
-import { CopyMode, getActualSide, calculateOrderSize, getTradeMultiplier } from '../config/copyStrategy';
+import {
+    CopyMode,
+    getActualSide,
+    calculateOrderSize,
+    getTradeMultiplier,
+    copyModeLabelZh,
+    copyModeLabelZhShort,
+    copyModeEnvColumnHint,
+} from '../config/copyStrategy';
 import { UserPositionInterface } from '../interfaces/User';
 import { fetchPositionsForUser, fetchPositionsForUserForce } from '../utils/dataApiCache';
 import fetchData from '../utils/fetchData';
@@ -14,6 +22,7 @@ import {
     RESOLVED_HIGH,
     RESOLVED_LOW,
     anyTraderStillInMirror,
+    copyModeForReconcileTraders,
     getMirrorAssetForReconcile,
     isMarketResolved,
     loadCopiedConditionTraders,
@@ -25,15 +34,6 @@ import { formatBeijingDateTime } from '../utils/time';
 import { notifyCopyRiskStop } from '../utils/emailNotifier';
 import { isRetryableTransientError, transientBackoffMs, sleep } from '../utils/transientErrors';
 
-const USER_ADDRESSES = ENV.USER_ADDRESSES;
-const RETRY_LIMIT = ENV.RETRY_LIMIT;
-const DRY_INITIAL_BALANCE = ENV.DRY_INITIAL_BALANCE;
-const DRY_START_FROM_REAL = ENV.DRY_START_FROM_REAL;
-const DOUBLE_SIDE_GUARD_MODE = ENV.COPY_DOUBLE_SIDE_GUARD_MODE;
-const DOUBLE_SIDE_GUARD_LOCK_TTL_MS = ENV.COPY_DOUBLE_SIDE_GUARD_LOCK_TTL_MS;
-const COPY_STOP_ON_LOSS_ENABLED = ENV.COPY_STOP_ON_LOSS_ENABLED;
-const COPY_STOP_LOSS_STREAK = ENV.COPY_STOP_LOSS_STREAK;
-const COPY_STOP_LOSS_USD = ENV.COPY_STOP_LOSS_USD;
 // Match postOrder.ts: minimum sell size in outcome tokens
 const MIN_ORDER_SIZE_TOKENS = 1.0;
 
@@ -116,10 +116,11 @@ const fetchOppositeAssetDryRun = async (conditionId: string, currentAsset: strin
     return '';
 };
 
-const userActivityModels = USER_ADDRESSES.map((address) => ({
-    address,
-    model: getUserActivityModel(address),
-}));
+const buildUserActivityModels = () =>
+    ENV.USER_ADDRESSES.map((address) => ({
+        address,
+        model: getUserActivityModel(address),
+    }));
 
 type TraderRiskState = {
     consecutiveLosses: number;
@@ -142,10 +143,10 @@ const getDryRiskState = (userAddress: string): TraderRiskState => {
 };
 
 const isDryTraderStopped = (userAddress: string): boolean =>
-    COPY_STOP_ON_LOSS_ENABLED && getDryRiskState(userAddress).stopped;
+    ENV.COPY_STOP_ON_LOSS_ENABLED && getDryRiskState(userAddress).stopped;
 
 const handleDryRiskAfterSell = async (userAddress: string, realizedPnlUsd: number): Promise<void> => {
-    if (!COPY_STOP_ON_LOSS_ENABLED) return;
+    if (!ENV.COPY_STOP_ON_LOSS_ENABLED) return;
     const state = getDryRiskState(userAddress);
     if (state.stopped) return;
 
@@ -156,17 +157,18 @@ const handleDryRiskAfterSell = async (userAddress: string, realizedPnlUsd: numbe
         state.consecutiveLosses = 0;
     }
 
-    const hitStreak = state.consecutiveLosses >= COPY_STOP_LOSS_STREAK;
-    const hitAmount = state.cumulativeLossUsd >= COPY_STOP_LOSS_USD;
+    const hitStreak = state.consecutiveLosses >= ENV.COPY_STOP_LOSS_STREAK;
+    const hitAmount = state.cumulativeLossUsd >= ENV.COPY_STOP_LOSS_USD;
     if (!hitStreak && !hitAmount) return;
 
     state.stopped = true;
     state.reason = hitStreak
-        ? `连续亏损达到 ${state.consecutiveLosses} 次（阈值 ${COPY_STOP_LOSS_STREAK}）`
-        : `累计亏损达到 $${state.cumulativeLossUsd.toFixed(2)}（阈值 $${COPY_STOP_LOSS_USD.toFixed(2)}）`;
+        ? `连续亏损达到 ${state.consecutiveLosses} 次（阈值 ${ENV.COPY_STOP_LOSS_STREAK}）`
+        : `累计亏损达到 $${state.cumulativeLossUsd.toFixed(2)}（阈值 $${ENV.COPY_STOP_LOSS_USD.toFixed(2)}）`;
 
+    const riskMode = getCopyModeForTrader(userAddress);
     Logger.warning(
-        `🛑 [模拟] 已停止跟单交易员 ${userAddress.slice(0, 6)}...${userAddress.slice(-4)}：${state.reason}`
+        `🛑 [模拟] 已停止跟单交易员 ${userAddress.slice(0, 6)}...${userAddress.slice(-4)} [${copyModeLabelZhShort(riskMode)} / ${copyModeEnvColumnHint(riskMode)}]：${state.reason}`
     );
     await notifyCopyRiskStop({
         trader: userAddress,
@@ -174,6 +176,8 @@ const handleDryRiskAfterSell = async (userAddress: string, realizedPnlUsd: numbe
         consecutiveLosses: state.consecutiveLosses,
         cumulativeLossUsd: state.cumulativeLossUsd,
         mode: 'DRYRUN',
+        copyMode: riskMode === CopyMode.REVERSE ? 'REVERSE' : 'FOLLOW',
+        copyModeDetailZh: `${copyModeLabelZh(riskMode)} · .env 列 ${copyModeEnvColumnHint(riskMode)}`,
     });
 };
 
@@ -210,7 +214,7 @@ interface OrderBookEntry {
 // ============================================================
 // Simulated account state (in-memory, reset on restart)
 // ============================================================
-let simulatedBalance = DRY_INITIAL_BALANCE;
+let simulatedBalance = ENV.DRY_INITIAL_BALANCE;
 const simulatedPositions: Map<string, SimulatedPosition> = new Map();
 
 // Historical positions loaded from Polymarket at dry-run start.
@@ -240,7 +244,7 @@ const dryDoubleSideBuyLocks = new Map<string, { asset: string; at: number }>();
 const getDryLockedAsset = (conditionId: string): string | undefined => {
     const lock = dryDoubleSideBuyLocks.get(conditionId);
     if (!lock) return undefined;
-    if (Date.now() - lock.at >= DOUBLE_SIDE_GUARD_LOCK_TTL_MS) {
+    if (Date.now() - lock.at >= ENV.COPY_DOUBLE_SIDE_GUARD_LOCK_TTL_MS) {
         dryDoubleSideBuyLocks.delete(conditionId);
         return undefined;
     }
@@ -252,7 +256,7 @@ const setDryConditionBuyLock = (conditionId: string, asset: string): void => {
     if (dryDoubleSideBuyLocks.size > 2000) {
         const now = Date.now();
         for (const [cid, entry] of dryDoubleSideBuyLocks) {
-            if (now - entry.at >= DOUBLE_SIDE_GUARD_LOCK_TTL_MS) {
+            if (now - entry.at >= ENV.COPY_DOUBLE_SIDE_GUARD_LOCK_TTL_MS) {
                 dryDoubleSideBuyLocks.delete(cid);
             }
         }
@@ -348,7 +352,7 @@ const simulateFillSell = (
 
 const readPendingTrades = async () => {
     const allTrades: any[] = [];
-    for (const { address, model } of userActivityModels) {
+    for (const { address, model } of buildUserActivityModels()) {
         const trades = await model
             .find({
                 $and: [
@@ -380,9 +384,9 @@ const readPendingTrades = async () => {
 // ============================================================
 
 const initSimulatedAccount = async () => {
-    console.log(`  模拟初始余额: $${DRY_INITIAL_BALANCE.toFixed(2)}`);
+    console.log(`  模拟初始余额: $${ENV.DRY_INITIAL_BALANCE.toFixed(2)}`);
 
-    if (DRY_START_FROM_REAL) {
+    if (ENV.DRY_START_FROM_REAL) {
         try {
         // Load real positions from Polymarket API
             const myPositions: any[] = (await fetchPositionsForUserForce(ENV.PROXY_WALLET)) as any[];
@@ -425,7 +429,7 @@ const doDryTrading = async (
     if (processedIds.has(tradeId)) return;
     processedIds.add(tradeId);
 
-    const copyMode = ENV.COPY_STRATEGY_CONFIG.copyMode;
+    const copyMode = getCopyModeForTrader(trade.userAddress);
     const actualSide = getActualSide(trade.side || 'BUY', copyMode);
     const isReversed = copyMode === CopyMode.REVERSE;
 
@@ -444,6 +448,9 @@ const doDryTrading = async (
     console.log(`  📊 ${time}`);
     console.log(`  市场: ${marketName}`);
     console.log(`  交易员: ${trade.userAddress?.slice(0, 6)}...${trade.userAddress?.slice(-4)}`);
+    console.log(
+        `  跟单配置: ${copyModeLabelZh(copyMode)} · .env 列 ${copyModeEnvColumnHint(copyMode)}`
+    );
     console.log(`  原始订单: ${trade.side} $${trade.usdcSize.toFixed(2)} @ $${trade.price}`);
 
     // Resolve token we trade (must be before BUY sizing — position limit uses this key)
@@ -490,7 +497,7 @@ const doDryTrading = async (
     if (actualSide === 'BUY') {
         const lockedAsset = getDryLockedAsset(trade.conditionId);
         if (
-            DOUBLE_SIDE_GUARD_MODE !== 'OFF' &&
+            ENV.COPY_DOUBLE_SIDE_GUARD_MODE !== 'OFF' &&
             lockedAsset &&
             lockedAsset !== tradeAsset
         ) {
@@ -507,9 +514,9 @@ const doDryTrading = async (
                 p.size > 0.0001
         );
         const shouldBlock =
-            DOUBLE_SIDE_GUARD_MODE !== 'OFF' &&
+            ENV.COPY_DOUBLE_SIDE_GUARD_MODE !== 'OFF' &&
             !!oppositeHeld &&
-            (DOUBLE_SIDE_GUARD_MODE !== 'TRADER_ONLY' ||
+            (ENV.COPY_DOUBLE_SIDE_GUARD_MODE !== 'TRADER_ONLY' ||
                 !!(oppositeHeld.openedBy && oppositeHeld.openedBy === trade.userAddress));
         if (shouldBlock && oppositeHeld) {
             console.log(
@@ -892,8 +899,6 @@ const runDryRunPositionReconciliation = async (clobClient: ClobClient): Promise<
     const redeemHintLogged = new Set<string>();
     let actions = 0;
     const now = Date.now();
-    const copyMode = ENV.COPY_STRATEGY_CONFIG.copyMode;
-
     const entries = [...simulatedPositions.entries()];
     for (const [mapKey, pos] of entries) {
         if (actions >= maxPerRun) break;
@@ -905,6 +910,13 @@ const runDryRunPositionReconciliation = async (clobClient: ClobClient): Promise<
         const pkey = positionKey(pos.conditionId, pos.asset);
         const lastAt = dryReconcileLastAt.get(pkey) || 0;
         if (now - lastAt < cooldownMs) continue;
+
+        const { mode: copyMode, mixedFollowAndReverse } = copyModeForReconcileTraders(involved);
+        if (mixedFollowAndReverse) {
+            Logger.warning(
+                '[模拟对账] 同一 condition 上的跟单交易员同时含正买与反买，镜像腿判定按 FOLLOW 处理'
+            );
+        }
 
         let oppositeForMirror: string | undefined;
         if (copyMode === CopyMode.REVERSE) {
@@ -1082,14 +1094,23 @@ const dryRunExecutor = async (clobClient: ClobClient) => {
     console.log('\x1b[33m' + '                    模拟跟单 · 实时监控 · 不执行真实交易\n');
 
     console.log('  ⚙️  模拟配置:');
-    console.log(`    跟单模式:     ${ENV.COPY_STRATEGY_CONFIG.copyMode === CopyMode.REVERSE ? '反买 (REVERSE)' : '跟方向 (FOLLOW)'}`);
+    console.log(
+        `    跟单地址:     正买 ${Object.values(ENV.TRADER_COPY_MODE_BY_ADDRESS).filter((m) => m === CopyMode.FOLLOW).length} 个 | 反买 ${Object.values(ENV.TRADER_COPY_MODE_BY_ADDRESS).filter((m) => m === CopyMode.REVERSE).length} 个`
+    );
+    console.log(`    ${buildCopyModeStartupSummary()}`);
+    ENV.USER_ADDRESSES.forEach((addr, i) => {
+        const m = getCopyModeForTrader(addr);
+        console.log(
+            `      ${i + 1}. ${addr.slice(0, 6)}...${addr.slice(-4)}  [${copyModeLabelZhShort(m)} · ${copyModeEnvColumnHint(m)}]`
+        );
+    });
     console.log(`    跟单策略:     ${ENV.COPY_STRATEGY_CONFIG.strategy}`);
     console.log(`    跟单比例:     ${ENV.COPY_STRATEGY_CONFIG.copySize}%`);
     console.log(`    最大单笔:     $${ENV.COPY_STRATEGY_CONFIG.maxOrderSizeUSD}`);
     console.log(`    最小单笔:     $${ENV.COPY_STRATEGY_CONFIG.minOrderSizeUSD}`);
-    console.log(`    初始模拟余额: $${DRY_INITIAL_BALANCE.toFixed(2)}`);
-    console.log(`    从真实持仓开始: ${DRY_START_FROM_REAL ? '是' : '否'}`);
-    console.log(`    监控交易员:   ${USER_ADDRESSES.length} 个`);
+    console.log(`    初始模拟余额: $${ENV.DRY_INITIAL_BALANCE.toFixed(2)}`);
+    console.log(`    从真实持仓开始: ${ENV.DRY_START_FROM_REAL ? '是' : '否'}`);
+    console.log(`    监控交易员:   ${ENV.USER_ADDRESSES.length} 个`);
     if (ENV.POSITION_RECONCILE_INTERVAL_MS > 0) {
         console.log(
             `    仓位对账:     已启用（每 ${ENV.POSITION_RECONCILE_INTERVAL_MS}ms，与实盘同一套 POSITION_RECONCILE_*）`
@@ -1099,7 +1120,7 @@ const dryRunExecutor = async (clobClient: ClobClient) => {
     }
     console.log('');
 
-    simulatedBalance = DRY_INITIAL_BALANCE;
+    simulatedBalance = ENV.DRY_INITIAL_BALANCE;
     simulatedPositions.clear();
     baselinePositions.clear();
     processedIds.clear();
@@ -1147,7 +1168,7 @@ const dryRunExecutor = async (clobClient: ClobClient) => {
                             ? `（约每 ${snapshotIntervalMs / 1000}s 打印持仓明细）`
                             : '';
                     Logger.waiting(
-                        USER_ADDRESSES.length,
+                        ENV.USER_ADDRESSES.length,
                         `余额 $${simulatedBalance.toFixed(2)} | 模拟持仓 ${simulatedPositions.size} 个${snapHint}`
                     );
                     if (

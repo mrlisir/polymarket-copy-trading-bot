@@ -73,6 +73,13 @@ class Logger {
         console.log('\n' + chalk.magenta('─'.repeat(70)));
         console.log(chalk.magenta.bold('📊 检测到新交易'));
         console.log(chalk.gray(`交易员: ${this.formatAddress(traderAddress)}`));
+        if (details.copyModeLabel) {
+            console.log(
+                chalk.gray(
+                    `跟单配置: ${chalk.yellow.bold(String(details.copyModeLabel))}`
+                )
+            );
+        }
         console.log(chalk.gray(`操作: ${chalk.white.bold(action)}`));
         if (details.asset) {
             console.log(chalk.gray(`资产:  ${this.formatAddress(details.asset)}`));
@@ -116,6 +123,7 @@ class Logger {
         console.log(chalk.magenta('─'.repeat(70)) + '\n');
 
         let tradeLog = `TRADE: ${this.formatAddress(traderAddress)} - ${action}`;
+        if (details.copyModeLabel) tradeLog += ` | CopyMode: ${details.copyModeLabel}`;
         if (details.side) tradeLog += ` | Side: ${details.side}`;
         if (details.amount) tradeLog += ` | Amount: $${details.amount}`;
         if (details.price) tradeLog += ` | Price: ${details.price}`;
@@ -157,7 +165,11 @@ class Logger {
         );
     }
 
-    static startup(traders: string[], myWallet: string) {
+    static startup(
+        traders: string[],
+        myWallet: string,
+        opts?: { copyModeSummary?: string; copyModeTag?: (address: string) => string }
+    ) {
         console.log('\n');
         console.log(chalk.cyan('  ____       _        ____                 '));
         console.log(chalk.cyan(' |  _ \\ ___ | |_   _ / ___|___  _ __  _   _ '));
@@ -169,18 +181,33 @@ class Logger {
 
         console.log(chalk.cyan('━'.repeat(70)));
         console.log(chalk.cyan('📊 正在跟踪的交易员:'));
+        if (opts?.copyModeSummary) {
+            console.log(chalk.yellow(`   ${opts.copyModeSummary}`));
+            this.writeToFile(`STARTUP: ${opts.copyModeSummary}`);
+        }
         traders.forEach((address, index) => {
-            console.log(chalk.gray(`   ${index + 1}. ${address}`));
+            const tag = opts?.copyModeTag?.(address);
+            const tagStr = tag ? chalk.yellow(`  [${tag}]`) : '';
+            console.log(chalk.gray(`   ${index + 1}. ${address}`) + tagStr);
         });
         console.log(chalk.cyan(`\n💼 您的钱包:`));
         console.log(chalk.gray(`   ${this.maskAddress(myWallet)}\n`));
     }
 
-    static dbConnection(traders: string[], counts: number[]) {
+    static dbConnection(
+        traders: string[],
+        counts: number[],
+        opts?: { copyModeTag?: (address: string) => string }
+    ) {
         console.log('\n' + chalk.cyan('📦 数据库状态:'));
         traders.forEach((address, index) => {
+            const tag = opts?.copyModeTag?.(address);
+            const tagStr = tag ? chalk.yellow(` [${tag}]`) : '';
             const countStr = chalk.yellow(`${counts[index]} 条交易记录`);
-            console.log(chalk.gray(`   ${this.formatAddress(address)}: ${countStr}`));
+            console.log(chalk.gray(`   ${this.formatAddress(address)}:`) + tagStr + chalk.gray(` ${countStr}`));
+            this.writeToFile(
+                `DB: ${this.formatAddress(address)}${tag ? ` [${tag}]` : ''} — ${counts[index]} trades`
+            );
         });
         console.log('');
     }
@@ -276,10 +303,13 @@ class Logger {
         traders: string[],
         positionCounts: number[],
         positionDetails?: any[][],
-        profitabilities?: number[]
+        profitabilities?: number[],
+        opts?: { copyModeTag?: (address: string) => string }
     ) {
         console.log('\n' + chalk.cyan('📈 正在跟单的交易员'));
         traders.forEach((address, index) => {
+            const tag = opts?.copyModeTag?.(address);
+            const tagStr = tag ? chalk.yellow(` [${tag}]`) : '';
             const count = positionCounts[index];
             const countStr =
                 count > 0
@@ -294,7 +324,14 @@ class Logger {
                 profitStr = ` | ${pnlColor.bold(`${pnlSign}${pnl.toFixed(1)}%`)}`;
             }
 
-            console.log(chalk.gray(`   ${this.formatAddress(address)}: ${countStr}${profitStr}`));
+            console.log(
+                chalk.gray(`   ${this.formatAddress(address)}:`) +
+                    tagStr +
+                    chalk.gray(` ${countStr}${profitStr}`)
+            );
+            this.writeToFile(
+                `POSITIONS trader ${this.formatAddress(address)}${tag ? ` [${tag}]` : ''}: ${count} positions`
+            );
 
             if (positionDetails && positionDetails[index] && positionDetails[index].length > 0) {
                 positionDetails[index].forEach((pos: any) => {

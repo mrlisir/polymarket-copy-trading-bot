@@ -1,5 +1,11 @@
 import connectDB, { closeDB } from './config/db';
-import { ENV } from './config/env';
+import {
+    ENV,
+    buildCopyModeStartupSummary,
+    getCopyModeForTrader,
+    reloadEnvFromDisk,
+} from './config/env';
+import { copyModeLabelZhShort } from './config/copyStrategy';
 import createClobClient from './utils/createClobClient';
 import tradeExecutor, { stopTradeExecutor } from './services/tradeExecutor';
 import tradeMonitor, { stopTradeMonitor } from './services/tradeMonitor';
@@ -8,11 +14,10 @@ import { performHealthCheck, logHealthCheck } from './utils/healthCheck';
 import { closeStalePositionsIfAny } from './scripts/closeStalePositions';
 import { isRetryableTransientError, transientBackoffMs, sleep } from './utils/transientErrors';
 
-const USER_ADDRESSES = ENV.USER_ADDRESSES;
-const PROXY_WALLET = ENV.PROXY_WALLET;
-
 // Graceful shutdown handler
 let isShuttingDown = false;
+let envReloadTimer: ReturnType<typeof setInterval> | undefined;
+let lastEnvReloadAt = 0;
 
 // Parse CLI flags
 const parseCliFlags = () => {
@@ -33,6 +38,10 @@ const gracefulShutdown = async (signal: string) => {
     Logger.info(`收到关闭信号 ${signal}，正在执行优雅关闭...`);
 
     try {
+        if (envReloadTimer) {
+            clearInterval(envReloadTimer);
+            envReloadTimer = undefined;
+        }
         // Stop services
         stopTradeMonitor();
         stopTradeExecutor();
@@ -113,7 +122,10 @@ export const main = async () => {
         try {
             await connectDB();
             supervisorStreak = 0;
-            Logger.startup(USER_ADDRESSES, PROXY_WALLET);
+            Logger.startup(ENV.USER_ADDRESSES, ENV.PROXY_WALLET, {
+                copyModeSummary: buildCopyModeStartupSummary(),
+                copyModeTag: (a) => copyModeLabelZhShort(getCopyModeForTrader(a)),
+            });
 
             Logger.info('正在执行初始健康检查...');
             const healthResult = await performHealthCheck();
@@ -143,7 +155,27 @@ export const main = async () => {
 
             Logger.separator();
             Logger.info('正在启动交易监控和交易执行器...');
+
+            lastEnvReloadAt = 0;
+            envReloadTimer = setInterval(() => {
+                const ms = ENV.ENV_FILE_RELOAD_INTERVAL_MS;
+                if (!ms || ms <= 0) return;
+                const now = Date.now();
+                if (now - lastEnvReloadAt < ms) return;
+                lastEnvReloadAt = now;
+                const r = reloadEnvFromDisk();
+                if (r.ok) {
+                    Logger.success(r.message);
+                } else {
+                    Logger.warning(`.env 热更新失败，沿用原配置: ${r.error}`);
+                }
+            }, 1000);
+
             await Promise.all([tradeMonitor(), tradeExecutor(clobClient)]);
+            if (envReloadTimer) {
+                clearInterval(envReloadTimer);
+                envReloadTimer = undefined;
+            }
 
             break;
         } catch (error) {
