@@ -139,6 +139,12 @@ export const fetchOrderBookCached = async (
 const MIN_ORDER_SIZE_USD = 1.0; // Minimum order size in USD for BUY orders
 const MIN_ORDER_SIZE_TOKENS = 1.0; // Minimum order size in tokens for SELL/MERGE orders
 
+// CLOB price guard rails (prevents runtime "invalid price" rejections).
+// The CLOB API typically enforces 0.01 <= price <= 0.99 for conditional tokens.
+const CLOB_MIN_PRICE = 0.01;
+const CLOB_MAX_PRICE = 0.99;
+const isValidClobPrice = (p: number): boolean => Number.isFinite(p) && p >= CLOB_MIN_PRICE && p <= CLOB_MAX_PRICE;
+
 const isReverseForUser = (userAddress: string): boolean =>
     getCopyModeForTrader(userAddress) === CopyMode.REVERSE;
 
@@ -286,7 +292,17 @@ const postOrder = async (
                 bids[0]
             );
 
+            const rawBidPx = parseFloat(maxPriceBid.price);
             Logger.info(`最优买价: ${maxPriceBid.size} @ $${maxPriceBid.price}`);
+
+            // Guard rails: avoid CLOB rejecting invalid price like 0.001 (min: 0.01).
+            if (!isValidClobPrice(rawBidPx)) {
+                Logger.warning(
+                    `⚠️ 跳过 SELL：orderbook bid price=${maxPriceBid.price} 超出 CLOB 允许范围 [${CLOB_MIN_PRICE}, ${CLOB_MAX_PRICE}]`
+                );
+                await UserActivity.updateOne({ _id: trade._id }, { bot: true });
+                break;
+            }
             let order_arges;
             if (remaining <= parseFloat(maxPriceBid.size)) {
                 order_arges = {
@@ -514,9 +530,20 @@ const postOrder = async (
                 asks[0]
             );
 
+            const rawAskPx = parseFloat(minPriceAsk.price);
             Logger.info(`最优卖价: ${minPriceAsk.size} @ $${minPriceAsk.price}`);
+
+            // Guard rails: avoid CLOB rejecting invalid price like 0.001 (min: 0.01).
+            // If we see an out-of-range price in orderbook, skip this trade gracefully.
+            if (!isValidClobPrice(rawAskPx)) {
+                Logger.warning(
+                    `⚠️ 跳过 BUY：orderbook ask price=${minPriceAsk.price} 超出 CLOB 允许范围 [${CLOB_MIN_PRICE}, ${CLOB_MAX_PRICE}]`
+                );
+                await UserActivity.updateOne({ _id: trade._id }, { bot: true });
+                break;
+            }
             const slipRef = buySlippageReferencePrice(trade, userAddress);
-            if (parseFloat(minPriceAsk.price) - ENV.ORDER_PRICE_SLIPPAGE_USD > slipRef) {
+            if (rawAskPx - ENV.ORDER_PRICE_SLIPPAGE_USD > slipRef) {
                 Logger.warning('价格滑点过大 — 跳过此次交易');
                 await UserActivity.updateOne({ _id: trade._id }, { bot: true });
                 break;
@@ -555,11 +582,11 @@ const postOrder = async (
                 side: Side.BUY,
                 tokenID: tradeAsset,
                 amount: orderSize,
-                price: parseFloat(minPriceAsk.price),
+                price: rawAskPx,
             };
 
             Logger.info(
-                `正在下单: $${orderSize.toFixed(2)} @ $${minPriceAsk.price} (余额: $${my_balance.toFixed(2)})`
+                `正在下单: $${orderSize.toFixed(2)} @ $${rawAskPx} (余额: $${my_balance.toFixed(2)})`
             );
             // Order args logged internally
             const signedOrder = await clobClient.createMarketOrder(order_arges);
@@ -701,8 +728,8 @@ const postOrder = async (
         // In REVERSE mode: query by sellAsset (the opposite token we bought)
         // In FOLLOW mode: query by trade.asset (the same token as trader)
         const previousBuys = await UserActivity.find({
-            asset: sellAsset,
             conditionId: trade.conditionId,
+            $or: [{ asset: sellAsset }, { oppositeAsset: sellAsset }],
             side: 'BUY',
             bot: true,
             myBoughtSize: { $exists: true, $gt: 0 },
@@ -816,7 +843,17 @@ const postOrder = async (
                 bids[0]
             );
 
+            const rawBidPx = parseFloat(maxPriceBid.price);
             Logger.info(`最优买价: ${maxPriceBid.size} @ $${maxPriceBid.price}`);
+
+            // Guard rails: avoid CLOB rejecting invalid price like 0.001 (min: 0.01).
+            if (!isValidClobPrice(rawBidPx)) {
+                Logger.warning(
+                    `⚠️ 跳过 SELL：orderbook bid price=${maxPriceBid.price} 超出 CLOB 允许范围 [${CLOB_MIN_PRICE}, ${CLOB_MAX_PRICE}]`
+                );
+                await UserActivity.updateOne({ _id: trade._id }, { bot: true });
+                break;
+            }
 
             if (remaining < MIN_ORDER_SIZE_TOKENS) {
                 Logger.info(
@@ -840,7 +877,7 @@ const postOrder = async (
                 side: Side.SELL,
                 tokenID: sellAsset,
                 amount: sellAmount,
-                price: parseFloat(maxPriceBid.price),
+                price: rawBidPx,
             };
             // Order args logged internally
             const signedOrder = await clobClient.createMarketOrder(order_arges);
@@ -898,8 +935,8 @@ const postOrder = async (
                 // Sold essentially all tracked tokens - clear tracking
                 await UserActivity.updateMany(
                     {
-                        asset: sellAsset,
                         conditionId: trade.conditionId,
+                        $or: [{ asset: sellAsset }, { oppositeAsset: sellAsset }],
                         side: 'BUY',
                         bot: true,
                         myBoughtSize: { $exists: true, $gt: 0 },
@@ -1014,43 +1051,70 @@ export const marketSellTokensFOK = async (
         }
 
         const bids = orderBook.bids as OrderBookEntry[];
-        const maxPriceBid = bids.reduce(
-            (max: OrderBookEntry, bid: OrderBookEntry) =>
-                parseFloat(bid.price) > parseFloat(max.price) ? bid : max,
-            bids[0]
-        );
+        // Walk multiple bid levels from high -> low, instead of only the top bid.
+        // This helps when the top-of-book size is too thin for a full exit.
+        const levels = bids
+            .map((b) => ({ price: parseFloat(b.price), size: parseFloat(b.size) }))
+            .filter(
+                (x) => isFinite(x.price) && isValidClobPrice(x.price) && isFinite(x.size) && x.size > 0
+            )
+            .sort((a, b) => b.price - a.price);
 
-        const sellAmount = Math.min(remaining, parseFloat(maxPriceBid.size));
-        if (sellAmount < MIN_ORDER_SIZE_TOKENS) {
+        if (levels.length === 0) {
+            Logger.warning(
+                `[marketSell] 订单簿 bids 无可用价格（均不在 CLOB 范围 [${CLOB_MIN_PRICE}, ${CLOB_MAX_PRICE}]），停止卖出。`
+            );
             break;
         }
 
-        const order_arges = {
-            side: Side.SELL,
-            tokenID: tokenId,
-            amount: sellAmount,
-            price: parseFloat(maxPriceBid.price),
-        };
+        let filledThisRound = false;
 
-        const signedOrder = await clobClient.createMarketOrder(order_arges);
-        const resp = await clobClient.postOrder(signedOrder, OrderType.FOK);
-        if (resp.success === true) {
-            retry = 0;
-            soldTokens += order_arges.amount;
-            proceedsUsd += order_arges.amount * order_arges.price;
-            remaining -= order_arges.amount;
-        } else {
-            const errorMessage = extractOrderError(resp);
-            if (isInsufficientBalanceOrAllowanceError(errorMessage)) {
+        // Sell in the same direction as we sorted: high -> low.
+        for (const level of levels) {
+            if (remaining < MIN_ORDER_SIZE_TOKENS) break;
+
+            const sellAmount = Math.min(remaining, level.size);
+            if (sellAmount < MIN_ORDER_SIZE_TOKENS) continue;
+
+            const order_arges = {
+                side: Side.SELL,
+                tokenID: tokenId,
+                amount: sellAmount,
+                price: level.price,
+            };
+
+            const signedOrder = await clobClient.createMarketOrder(order_arges);
+            const resp = await clobClient.postOrder(signedOrder, OrderType.FOK);
+            if (resp.success === true) {
+                filledThisRound = true;
+                retry = 0;
+                soldTokens += order_arges.amount;
+                proceedsUsd += order_arges.amount * order_arges.price;
+                remaining -= order_arges.amount;
+            } else {
+                const errorMessage = extractOrderError(resp);
+                if (isInsufficientBalanceOrAllowanceError(errorMessage)) {
+                    Logger.warning(`[marketSell] 订单被拒绝: ${errorMessage || '余额或授权不足'}`);
+                    return { proceedsUsd, soldTokens };
+                }
+
+                retry += 1;
                 Logger.warning(
-                    `[marketSell] 订单被拒绝: ${errorMessage || '余额或授权不足'}`
+                    `[marketSell] 订单失败 (${retry}/${ENV.RETRY_LIMIT}) - token=${tokenId.slice(
+                        0,
+                        12
+                    )}... price≈${level.price.toFixed(4)} amount=${sellAmount.toFixed(
+                        4
+                    )}${errorMessage ? ` - ${errorMessage}` : ''}`
                 );
-                break;
+
+                if (retry >= ENV.RETRY_LIMIT) break;
+            // Continue to lower bid levels in case the top level is too thin.
             }
+        }
+
+        if (!filledThisRound) {
             retry += 1;
-            Logger.warning(
-                `[marketSell] 订单失败 (${retry}/${ENV.RETRY_LIMIT})${errorMessage ? ` - ${errorMessage}` : ''}`
-            );
         }
     }
 

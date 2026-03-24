@@ -53,6 +53,11 @@ console.log(`  ${colors.green}npm run close-stale${colors.reset}       Close sta
 console.log(`  ${colors.green}npm run close-resolved${colors.reset}    Close resolved market positions`);
 console.log(`  ${colors.green}npm run redeem-resolved${colors.reset}   Redeem resolved positions for USDC`);
 console.log('');
+console.log(`${colors.yellow}${colors.bright}⚡ AUTO EXIT${colors.reset}\n`);
+console.log(
+    `  ${colors.green}Auto exit${colors.reset}            Buy 后 percentPnl >= take-profit 或 <= -stop-loss 时自动全仓平仓（配置见 .env.example）`
+);
+console.log('');
 
 console.log(`${colors.yellow}${colors.bright}🔍 TRADER RESEARCH${colors.reset}\n`);
 console.log(`  ${colors.green}npm run find-traders${colors.reset}      Find best performing traders`);

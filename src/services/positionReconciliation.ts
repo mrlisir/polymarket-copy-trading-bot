@@ -17,6 +17,9 @@ import {
 } from './positionReconciliationCore';
 
 const lastReconcileActionAt = new Map<string, number>();
+// For some resolved/redeemable positions, CLOB orderbook may disappear or contain no bids.
+// Retrying forever is wasteful, so we stop flattening for these pkeys within the process lifetime.
+const nonSellablePositionKeys = new Set<string>();
 
 export interface PositionReconcileCallbacks {
     /** Optional: count sold notional toward daily volume (same as live fills). */
@@ -29,7 +32,7 @@ const clearBuyTrackingForAsset = async (conditionId: string, asset: string): Pro
         await Model.updateMany(
             {
                 conditionId,
-                asset,
+                $or: [{ asset }, { oppositeAsset: asset }],
                 side: 'BUY',
                 bot: true,
                 myBoughtSize: { $exists: true, $gt: 0 },
@@ -108,6 +111,9 @@ export const runPositionReconciliation = async (
         if (!involved || involved.size === 0) continue;
 
         const pkey = positionKey(pos.conditionId, pos.asset);
+        if (nonSellablePositionKeys.has(pkey)) {
+            continue;
+        }
         const lastAt = lastReconcileActionAt.get(pkey) || 0;
         if (now - lastAt < cooldownMs) continue;
 
@@ -157,6 +163,20 @@ export const runPositionReconciliation = async (
             const clobNotFullyFilled =
                 flattenResult.initialTokens > 0 &&
                 flattenResult.soldTokens < flattenResult.initialTokens * 0.95;
+
+            // If we cannot sell any tokens due to missing orderbook / no bids (404/empty book),
+            // assume it's non-recoverable (often expired redeem path) and stop monitoring.
+            if (flattenResult.soldTokens <= 0.0000001 && flattenResult.proceedsUsd <= 0.0000001) {
+                nonSellablePositionKeys.add(pkey);
+                await clearBuyTrackingForAsset(pos.conditionId, pos.asset);
+                Logger.warning(
+                    `🛑 [对账] 检测到无流动性/订单簿不可用（sold≈${flattenResult.soldTokens.toFixed(
+                        4
+                    )} proceeds≈$${flattenResult.proceedsUsd.toFixed(
+                        2
+                    )}）：停止后续对账平仓 condition=${pos.conditionId.slice(0, 10)}...`
+                );
+            }
 
             if (
                 autoRedeem &&

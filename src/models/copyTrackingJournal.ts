@@ -34,6 +34,9 @@ const entrySchema = new Schema(
         traderTxHash: { type: String },
         activityObjectId: { type: String },
         realizedPnlUsd: { type: Number },
+        autoExitType: { type: String },
+        autoExitReason: { type: String },
+        autoExitPercentPnl: { type: Number },
     },
     { collection: 'copy_tracking_entries' }
 );

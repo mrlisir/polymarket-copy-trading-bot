@@ -77,7 +77,7 @@ const fetchTradesForTrader = async (address: string): Promise<TradeApiResponse[]
     const sinceTimestamp = Math.floor((Date.now() - HISTORY_DAYS * 24 * 60 * 60 * 1000) / 1000);
 
     let offset = 0;
-    let allTrades: TradeApiResponse[] = [];
+    const allTrades: TradeApiResponse[] = [];
     let hasMore = true;
 
     while (hasMore && allTrades.length < MAX_TRADES_PER_TRADER) {

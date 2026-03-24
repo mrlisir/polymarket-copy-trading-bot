@@ -77,6 +77,9 @@ export type RecordCopyTrackingFillParams = {
     traderTxHash?: string;
     activityObjectId?: string;
     realizedPnlUsd?: number;
+    autoExitType?: string;
+    autoExitReason?: string;
+    autoExitPercentPnl?: number;
 };
 
 /** 成交后写入流水（无活跃会话时静默跳过） */
@@ -105,6 +108,9 @@ export async function recordCopyTrackingFill(p: RecordCopyTrackingFillParams): P
             traderTxHash: p.traderTxHash,
             activityObjectId: p.activityObjectId,
             realizedPnlUsd: p.realizedPnlUsd,
+            autoExitType: p.autoExitType,
+            autoExitReason: p.autoExitReason,
+            autoExitPercentPnl: p.autoExitPercentPnl,
         });
     } catch (e) {
         console.warn('[copyTracking] 写入成交流水失败:', e);

@@ -125,9 +125,8 @@ const fetchOppositeAsset = async (conditionId: string, currentAsset: string): Pr
     try {
         const pageSize = 100;
         let offset = 0;
-        let found = false;
 
-        while (!found) {
+        while (true) {
             const response = await fetchData(
                 `https://gamma-api.polymarket.com/markets?active=true&closed=false&limit=${pageSize}&offset=${offset}`
             );

@@ -41,6 +41,9 @@ type EntryDoc = {
     traderTxHash?: string;
     activityObjectId?: string;
     realizedPnlUsd?: number;
+    autoExitType?: string;
+    autoExitReason?: string;
+    autoExitPercentPnl?: number;
 };
 
 const winLoseFromPx = (px: number | undefined): string => {
@@ -158,6 +161,9 @@ async function main(): Promise<void> {
         { header: '我跟单侧结果', key: 'resMy', width: 14 },
         { header: '反买复盘说明', key: 'reverseNote', width: 36 },
         { header: 'txHash', key: 'traderTxHash', width: 22 },
+        { header: '自动平仓类型', key: 'autoExitType', width: 16 },
+        { header: '自动平仓原因', key: 'autoExitReason', width: 26 },
+        { header: '自动平仓触发Pnl%', key: 'autoExitPercentPnl', width: 18 },
     ];
 
     for (const e of entries) {
@@ -209,6 +215,12 @@ async function main(): Promise<void> {
             resMy,
             reverseNote,
             traderTxHash: e.traderTxHash || '',
+            autoExitType: e.autoExitType || '',
+            autoExitReason: e.autoExitReason || '',
+            autoExitPercentPnl:
+                e.autoExitPercentPnl !== undefined && e.autoExitPercentPnl !== null
+                    ? Number(e.autoExitPercentPnl.toFixed(2))
+                    : '',
         });
     }
     ws1.getRow(1).font = { bold: true };

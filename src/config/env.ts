@@ -582,6 +582,14 @@ export const ENV = {
     COPY_STOP_ON_LOSS_ENABLED: process.env.COPY_STOP_ON_LOSS_ENABLED !== 'false',
     COPY_STOP_LOSS_STREAK: parseInt(process.env.COPY_STOP_LOSS_STREAK || '10', 10),
     COPY_STOP_LOSS_USD: parseFloat(process.env.COPY_STOP_LOSS_USD || '50'),
+    /**
+     * 跟单前：如果市场 endDate 距离当前不足 N 分钟，则跳过该条 BUY 跟单
+     * - 0 或负数：关闭此跳过逻辑
+     */
+    COPY_SKIP_FOLLOW_IF_ENDS_WITHIN_MINUTES: parseInt(
+        process.env.COPY_SKIP_FOLLOW_IF_ENDS_WITHIN_MINUTES || '5',
+        10
+    ),
 
     /**
      * Mongo/CLOB/网络临时故障时的指数退避（实盘、dryrun、tradeMonitor/Executor 共用）。
@@ -615,6 +623,38 @@ export const ENV = {
     POSITION_RECONCILE_ON_RESOLVED: process.env.POSITION_RECONCILE_ON_RESOLVED !== 'false',
     /** If true, after CLOB sell attempt, call on-chain redeemPositions for redeemable conditions (Polygon gas). */
     POSITION_RECONCILE_AUTO_REDEEM: process.env.POSITION_RECONCILE_AUTO_REDEEM === 'true',
+
+    /**
+     * 自动止盈/止损退出（对「机器人买入后的同一 condition+asset 仓位」执行全仓平仓）
+     * - take-profit：percentPnl >= N（N<=0 表示关闭止盈，避免 TP=0 变成「任意非负即卖」）
+     * - stop-loss：percentPnl <= -S（S<=0 表示关闭止损，避免 SL=0 变成「任意浮亏即卖」）
+     * percentPnl 单位：百分比（例如 80 表示 80%）
+     */
+    AUTO_PROFIT_EXIT_ENABLED: process.env.AUTO_PROFIT_EXIT_ENABLED === 'true',
+    AUTO_PROFIT_EXIT_TAKE_PROFIT_PCT: parseFloat(process.env.AUTO_PROFIT_EXIT_TAKE_PROFIT_PCT || '80'),
+    /**
+     * 仅 TAKE_PROFIT 使用：按订单簿可成交深度预估的执行 PnL% 必须 >= 该阈值，才允许止盈卖出。
+     * 默认 0：至少保本才执行止盈，避免“触发 TP 但实际成交亏损”。
+     */
+    AUTO_PROFIT_EXIT_TAKE_PROFIT_MIN_EXEC_PNL_PCT: parseFloat(
+        process.env.AUTO_PROFIT_EXIT_TAKE_PROFIT_MIN_EXEC_PNL_PCT || '0'
+    ),
+    AUTO_PROFIT_EXIT_STOP_LOSS_PCT: parseFloat(process.env.AUTO_PROFIT_EXIT_STOP_LOSS_PCT || '25'),
+    AUTO_PROFIT_EXIT_CHECK_INTERVAL_MS: parseInt(
+        process.env.AUTO_PROFIT_EXIT_CHECK_INTERVAL_MS || '3000',
+        10
+    ),
+    AUTO_PROFIT_EXIT_RETRY_COOLDOWN_MS: parseInt(
+        process.env.AUTO_PROFIT_EXIT_RETRY_COOLDOWN_MS || '30000',
+        10
+    ),
+    /**
+     * 退出后若剩余碎股小于此阈值，视为“不再持仓”，并清理 tracked 购买追踪。
+     * 单位：token 股数（与仓位 size 一致，最小可卖通常 1.0）
+     */
+    AUTO_PROFIT_EXIT_CLEAR_WHEN_REMAINING_LT_TOKENS: parseFloat(
+        process.env.AUTO_PROFIT_EXIT_CLEAR_WHEN_REMAINING_LT_TOKENS || '1.0'
+    ),
 
     /**
      * 邮件通知（QQ 邮箱 SMTP）：
@@ -751,6 +791,10 @@ const applyReloadableProcessEnvToRuntimeEnv = (): void => {
     ENV.COPY_STOP_ON_LOSS_ENABLED = process.env.COPY_STOP_ON_LOSS_ENABLED !== 'false';
     ENV.COPY_STOP_LOSS_STREAK = parseInt(process.env.COPY_STOP_LOSS_STREAK || '10', 10);
     ENV.COPY_STOP_LOSS_USD = parseFloat(process.env.COPY_STOP_LOSS_USD || '50');
+    ENV.COPY_SKIP_FOLLOW_IF_ENDS_WITHIN_MINUTES = parseInt(
+        process.env.COPY_SKIP_FOLLOW_IF_ENDS_WITHIN_MINUTES || '5',
+        10
+    );
     ENV.TRANSIENT_RETRY_BASE_MS = parseInt(process.env.TRANSIENT_RETRY_BASE_MS || '2000', 10);
     ENV.TRANSIENT_RETRY_MAX_MS = parseInt(process.env.TRANSIENT_RETRY_MAX_MS || '120000', 10);
     ENV.TRANSIENT_BACKOFF_MAX_EXPONENT = parseInt(

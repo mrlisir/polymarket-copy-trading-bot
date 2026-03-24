@@ -35,6 +35,15 @@ import { formatTraderDisplayName, recordCopyTrackingFill } from './copyTrackingS
 import { formatBeijingDateTime } from '../utils/time';
 import { notifyCopyRiskStop } from '../utils/emailNotifier';
 import { isRetryableTransientError, transientBackoffMs, sleep } from '../utils/transientErrors';
+import {
+    estimateSellProceedsFromBids,
+    estimateSellPnlPctFromBids,
+    formatTpSlThresholdsZh,
+    getPercentPnlFromAvgAndPx,
+    makePositionKey,
+    resolveRefAvgPriceForExit,
+    shouldTriggerProfitExit,
+} from '../utils/profitExit';
 
 // Match postOrder.ts: minimum sell size in outcome tokens
 const MIN_ORDER_SIZE_TOKENS = 1.0;
@@ -203,6 +212,11 @@ interface SimulatedPosition {
     slug?: string;
     eventSlug?: string;
     openedBy?: string;
+
+    // Dry-run 里偶尔需要参考“是否可赎回/可合并”来决定是否继续跟踪。
+    // 实盘 positions API 存在这些字段；模拟仓位可能没有，因此这里保持可选。
+    redeemable?: boolean;
+    mergeable?: boolean;
 }
 
 // Simulated position key: "conditionId:asset" to handle YES + NO sides independently
@@ -222,6 +236,308 @@ const simulatedPositions: Map<string, SimulatedPosition> = new Map();
 // Historical positions loaded from Polymarket at dry-run start.
 // They are used only as baseline for reporting, NOT for sell availability during this run.
 const baselinePositions: Map<string, SimulatedPosition> = new Map();
+
+type DryProfitExitWatch = {
+    positionKey: string; // lowercased "conditionId:asset"
+    conditionId: string;
+    asset: string;
+    marketTitle: string;
+    txHashes: Set<string>;
+    trackedCostBasisUsd: number;
+    registeredAt: number;
+    lastMissingLogAt: number;
+    lastExitAttemptAt: number;
+};
+
+const dryProfitExitWatchesByPositionKey: Map<string, DryProfitExitWatch> = new Map();
+let lastDryProfitExitCheckAt = 0;
+
+const registerDryProfitExitWatch = (
+    txHash: string | undefined,
+    conditionId: string,
+    asset: string,
+    marketTitle: string,
+    executedUsdc: number
+): void => {
+    if (!ENV.AUTO_PROFIT_EXIT_ENABLED) return;
+    if (!txHash) return;
+    const positionKey = makePositionKey(conditionId, asset);
+
+    const existing = dryProfitExitWatchesByPositionKey.get(positionKey);
+    if (existing) {
+        const isNewTx = !existing.txHashes.has(txHash);
+        existing.txHashes.add(txHash);
+        if (isNewTx && Number.isFinite(executedUsdc) && executedUsdc > 0) {
+            existing.trackedCostBasisUsd += executedUsdc;
+        }
+        if (!existing.marketTitle && marketTitle) existing.marketTitle = marketTitle;
+        return;
+    }
+
+    Logger.info(
+        `🧷 [AUTO EXIT DRYRUN] watch registered: condition=${conditionId.slice(
+            0,
+            14
+        )}... asset=${asset.slice(0, 12)}... tx=${txHash.slice(0, 6)}...${txHash.slice(-4)} | TP=${ENV.AUTO_PROFIT_EXIT_TAKE_PROFIT_PCT}% SL=${ENV.AUTO_PROFIT_EXIT_STOP_LOSS_PCT}%`
+    );
+    dryProfitExitWatchesByPositionKey.set(positionKey, {
+        positionKey,
+        conditionId,
+        asset,
+        marketTitle,
+        txHashes: new Set([txHash]),
+        trackedCostBasisUsd: Number.isFinite(executedUsdc) && executedUsdc > 0 ? executedUsdc : 0,
+        registeredAt: Date.now(),
+        lastMissingLogAt: 0,
+        lastExitAttemptAt: 0,
+    });
+};
+
+const hasAnyTrackedBuy = async (conditionId: string, asset: string): Promise<boolean> => {
+    for (const traderAddr of ENV.USER_ADDRESSES) {
+        const Model = getUserActivityModel(traderAddr);
+        const doc = await Model.findOne(
+            {
+                conditionId,
+                $or: [{ asset }, { oppositeAsset: asset }],
+                side: 'BUY',
+                bot: true,
+                myBoughtSize: { $exists: true, $gt: 0 },
+            },
+            { _id: 1 }
+        )
+            .lean()
+            .exec();
+        if (doc) return true;
+    }
+    return false;
+};
+
+const maybeAutoProfitExitDryRun = async (clobClient: ClobClient): Promise<void> => {
+    if (!ENV.AUTO_PROFIT_EXIT_ENABLED) return;
+    const interval = ENV.AUTO_PROFIT_EXIT_CHECK_INTERVAL_MS;
+    if (!interval || interval <= 0) return;
+    if (dryProfitExitWatchesByPositionKey.size === 0) return;
+
+    const now = Date.now();
+    if (now - lastDryProfitExitCheckAt < interval) return;
+    lastDryProfitExitCheckAt = now;
+
+    const simulatedByKey = new Map<string, SimulatedPosition>();
+    for (const [k, v] of simulatedPositions.entries()) {
+        simulatedByKey.set(k.toLowerCase(), v);
+    }
+
+    for (const [positionKey, watch] of dryProfitExitWatchesByPositionKey.entries()) {
+        const pos = simulatedByKey.get(positionKey);
+        const size = pos?.size || 0;
+
+        if (!pos || size <= 0) {
+            if (now - watch.lastMissingLogAt > 5000) {
+                watch.lastMissingLogAt = now;
+                Logger.info(
+                    `⏳ [AUTO EXIT DRYRUN] waiting positions reflect new buy: market=${
+                        watch.marketTitle || ''
+                    } | condition=${watch.conditionId.slice(0, 14)}... asset=${watch.asset.slice(
+                        0,
+                        12
+                    )}... watchAge=${((now - watch.registeredAt) / 1000).toFixed(1)}s`
+                );
+            }
+
+            // Grace period: avoid race where tracked BUY isn't written yet.
+            const trackingGraceMs = Math.max(5000, ENV.AUTO_PROFIT_EXIT_CHECK_INTERVAL_MS * 5);
+            if (now - watch.registeredAt >= trackingGraceMs) {
+                try {
+                    const trackedStillExists = await hasAnyTrackedBuy(watch.conditionId, watch.asset);
+                    if (!trackedStillExists) {
+                        Logger.warning(
+                            `🛑 [AUTO EXIT DRYRUN] positions 已不在且 tracked BUY 已清零：停止跟踪 market=${
+                                watch.marketTitle || ''
+                            } | condition=${watch.conditionId.slice(0, 10)}... asset=${watch.asset.slice(
+                                0,
+                                12
+                            )}...`
+                        );
+                        dryProfitExitWatchesByPositionKey.delete(positionKey);
+                    }
+                } catch {
+                    // keep watch
+                }
+            }
+            continue;
+        }
+
+        const pxUsedRaw = await getValuationPriceUsd(pos.asset, clobClient, pos.conditionId);
+        const pxUsed = pxUsedRaw > 0 ? pxUsedRaw : pos.avgPrice;
+        const percentPnl = getPercentPnlFromAvgAndPx(pos.avgPrice, pxUsed);
+        if (percentPnl == null) continue;
+
+        const { triggered, reason } = shouldTriggerProfitExit({
+            percentPnl,
+            takeProfitPct: ENV.AUTO_PROFIT_EXIT_TAKE_PROFIT_PCT,
+            stopLossPct: ENV.AUTO_PROFIT_EXIT_STOP_LOSS_PCT,
+        });
+        if (!triggered) continue;
+
+        if (now - watch.lastExitAttemptAt < ENV.AUTO_PROFIT_EXIT_RETRY_COOLDOWN_MS) {
+            continue;
+        }
+        watch.lastExitAttemptAt = now;
+
+        const takeProfitPct = ENV.AUTO_PROFIT_EXIT_TAKE_PROFIT_PCT;
+        const stopLossPct = ENV.AUTO_PROFIT_EXIT_STOP_LOSS_PCT;
+        const isTakeProfit = takeProfitPct > 0 && percentPnl >= takeProfitPct;
+        const txHashArr = Array.from(watch.txHashes);
+        const txLog = `${txHashArr
+            .slice(0, 3)
+            .map((h) => `${h.slice(0, 6)}...${h.slice(-4)}`)
+            .join(',')}${txHashArr.length > 3 ? ` +${txHashArr.length - 3} more` : ''}`;
+
+        const refAvgPrice = resolveRefAvgPriceForExit({
+            posAvgPrice: pos.avgPrice,
+            trackedCostBasisUsd: watch.trackedCostBasisUsd,
+            size,
+        });
+
+        if (isTakeProfit && refAvgPrice <= 0) {
+            Logger.warning(
+                `⏭️ [AUTO EXIT DRYRUN] 跳过止盈：无法估算成本均价（avg 无效且本地无有效投入记录）| market=${
+                    watch.marketTitle || ''
+                } | condition=${watch.conditionId.slice(0, 10)}... asset=${watch.asset.slice(0, 12)}...`
+            );
+            continue;
+        }
+
+        let preloadedOrderBook: { bids?: OrderBookEntry[] } | null = null;
+        if (isTakeProfit && refAvgPrice > 0) {
+            preloadedOrderBook = await fetchOrderBook(clobClient, pos.asset);
+            const bids = preloadedOrderBook?.bids || [];
+            if (watch.trackedCostBasisUsd > 0) {
+                const estimate = estimateSellProceedsFromBids({ size, bids });
+                const requiredProceeds = watch.trackedCostBasisUsd * (1 + takeProfitPct / 100);
+                if (!estimate || estimate.proceeds < requiredProceeds) {
+                    Logger.warning(
+                        `⏭️ [AUTO EXIT DRYRUN] 跳过止盈执行：预估可成交额≈$${estimate ? estimate.proceeds.toFixed(2) : 'n/a'} < 目标止盈额≈$${requiredProceeds.toFixed(
+                            2
+                        )}（投入≈$${watch.trackedCostBasisUsd.toFixed(2)}，TP=${takeProfitPct.toFixed(2)}%） | market=${watch.marketTitle || ''} | condition=${watch.conditionId.slice(
+                            0,
+                            10
+                        )}... asset=${watch.asset.slice(0, 12)}...`
+                    );
+                    continue;
+                }
+            }
+            const execPnlPct = estimateSellPnlPctFromBids({
+                avgPrice: refAvgPrice,
+                size,
+                bids,
+            });
+            const minExecPnlPct = ENV.AUTO_PROFIT_EXIT_TAKE_PROFIT_MIN_EXEC_PNL_PCT;
+            if (execPnlPct == null || execPnlPct < minExecPnlPct) {
+                Logger.warning(
+                    `⏭️ [AUTO EXIT DRYRUN] 跳过止盈执行：预估可成交Pnl=${execPnlPct != null ? execPnlPct.toFixed(2) + '%' : 'n/a'} < 最低执行阈值=${minExecPnlPct.toFixed(
+                        2
+                    )}% | market=${watch.marketTitle || ''} | condition=${watch.conditionId.slice(0, 10)}... asset=${watch.asset.slice(
+                        0,
+                        12
+                    )}...`
+                );
+                continue;
+            }
+        }
+
+        const avgLog =
+            refAvgPrice > 0
+                ? refAvgPrice.toFixed(4)
+                : Number.isFinite(pos.avgPrice)
+                  ? (pos.avgPrice as number).toFixed(4)
+                  : 'n/a';
+        Logger.warning(
+            `⚡ [AUTO EXIT DRYRUN] 触发${isTakeProfit ? '止盈' : '止损'}：${reason} | 市场=${
+                watch.marketTitle || ''
+            } | 当前收益率=${percentPnl.toFixed(2)}% | 阈值=${formatTpSlThresholdsZh(
+                takeProfitPct,
+                stopLossPct
+            )} | 持仓=${size.toFixed(4)} | 参考均价=${avgLog} 估值价=${pxUsed.toFixed(
+                4
+            )} 本地投入≈$${watch.trackedCostBasisUsd.toFixed(2)} | tx=${txLog}`
+        );
+
+        // Try to simulate a "market sell FOK-like" full exit using orderbook bids.
+        const orderBook = preloadedOrderBook || (await fetchOrderBook(clobClient, pos.asset));
+        if (orderBook?.bids && orderBook.bids.length > 0) {
+            const sellTokens = pos.size;
+            const result = simulateFillSell(sellTokens, orderBook.bids);
+            const sold = result.tokens;
+            const proceeds = result.proceeds;
+
+            simulatedBalance += proceeds;
+            const remaining = Math.max(0, pos.size - sold);
+
+            // Remove position when effectively flat.
+            if (
+                remaining < ENV.AUTO_PROFIT_EXIT_CLEAR_WHEN_REMAINING_LT_TOKENS ||
+                sold >= pos.size * 0.95
+            ) {
+                // 记录一次“自动止盈止损平仓”到成交流水，方便在 copy-tracking-export 做复盘
+                const avgPrice = pos.avgPrice;
+                const realizedPnlUsd =
+                    Number.isFinite(avgPrice) && avgPrice !== undefined
+                        ? proceeds - sold * (avgPrice as number)
+                        : undefined;
+                const autoExitType =
+                    percentPnl >= ENV.AUTO_PROFIT_EXIT_TAKE_PROFIT_PCT ? 'TAKE_PROFIT' : 'STOP_LOSS';
+                const traderTxHash = Array.from(watch.txHashes)[0];
+                await recordCopyTrackingFill({
+                    runMode: 'dryrun',
+                    traderAddress: 'auto_profit_exit',
+                    traderDisplayName: 'AUTO_PROFIT_EXIT',
+                    marketTitle: watch.marketTitle || '',
+                    slug: '',
+                    conditionId: watch.conditionId,
+                    copyMode: CopyMode.FOLLOW,
+                    traderSide: 'BUY',
+                    mySide: 'SELL',
+                    traderAsset: watch.asset,
+                    myTradedAsset: watch.asset,
+                    executedUsdc: proceeds,
+                    myTokenDelta: -sold,
+                    traderTxHash,
+                    realizedPnlUsd,
+                    autoExitType,
+                    autoExitReason: reason,
+                    autoExitPercentPnl: percentPnl,
+                });
+                simulatedPositions.delete(posKey(pos.conditionId, pos.asset));
+                dryProfitExitWatchesByPositionKey.delete(positionKey);
+            } else {
+                const updated = simulatedPositions.get(posKey(pos.conditionId, pos.asset));
+                if (updated) {
+                    updated.size = updated.size - sold;
+                }
+            }
+        } else {
+            // No orderbook/bids: mimic live behavior.
+            // - redeemable/mergeable: likely cannot sell, so clear tracking.
+            // - normal positions: keep watch so it can retry when bids recover.
+            const isProbablyNotSellable = !!(pos?.redeemable || pos?.mergeable);
+            if (isProbablyNotSellable) {
+                const proceeds = pos.size * pxUsed;
+                simulatedBalance += proceeds;
+                simulatedPositions.delete(posKey(pos.conditionId, pos.asset));
+                dryProfitExitWatchesByPositionKey.delete(positionKey);
+            } else {
+                Logger.warning(
+                    `🔁 [AUTO EXIT DRYRUN] 订单簿短暂缺失，保留跟踪以便冷却后重试：market=${watch.marketTitle || ''} | condition=${watch.conditionId.slice(
+                        0,
+                        10
+                    )}... asset=${watch.asset.slice(0, 12)}...`
+                );
+            }
+        }
+    }
+};
 
 // Baseline net value at dry-run start. Used to show incremental PnL.
 let initialNetValue: number | null = null;
@@ -332,12 +648,17 @@ const simulateFillSell = (
     let remaining = amount;
     let totalProceeds = 0;
     let totalTokens = 0;
-    for (const bid of bids) {
+
+    // Match live sell behavior: walk bid levels from high -> low.
+    const levels = (bids || [])
+        .map((bid) => ({ price: parseFloat(bid.price), size: parseFloat(bid.size) }))
+        .filter((x) => isFinite(x.price) && x.price > 0 && isFinite(x.size) && x.size > 0)
+        .sort((a, b) => b.price - a.price);
+
+    for (const level of levels) {
         if (remaining <= 0) break;
-        const price = parseFloat(bid.price);
-        const size = parseFloat(bid.size);
-        const fill = Math.min(remaining, size);
-        totalProceeds += fill * price;
+        const fill = Math.min(remaining, level.size);
+        totalProceeds += fill * level.price;
         totalTokens += fill;
         remaining -= fill;
     }
@@ -497,6 +818,44 @@ const doDryTrading = async (
 
     // 风控：同一 condition 只跟一边。若已有另一侧持仓，则忽略后续另一边 BUY，避免两头买。
     if (actualSide === 'BUY') {
+        const traderTargetPosition =
+            userPosList.find((p) => p.conditionId === trade.conditionId && p.asset === tradeAsset) ||
+            userPosList.find((p) => p.conditionId === trade.conditionId);
+        const targetCurPrice = traderTargetPosition?.curPrice;
+        const resolvedByCurPrice =
+            Number.isFinite(targetCurPrice) &&
+            ((targetCurPrice as number) >= RESOLVED_HIGH || (targetCurPrice as number) <= RESOLVED_LOW);
+        if (traderTargetPosition?.redeemable || resolvedByCurPrice) {
+            console.log(
+                `  ⏭ 跳过跟单：目标仓位已接近结算（redeemable=${traderTargetPosition?.redeemable ? 'true' : 'false'} curPrice=${
+                    Number.isFinite(targetCurPrice) ? (targetCurPrice as number).toFixed(4) : 'n/a'
+                }）`
+            );
+            console.log('─'.repeat(70));
+            return;
+        }
+
+        // 避免临近结束（endDate）买入：市场快结算后流动性经常消失
+        const skipMins = ENV.COPY_SKIP_FOLLOW_IF_ENDS_WITHIN_MINUTES;
+        if (skipMins > 0) {
+            const endTs = traderTargetPosition?.endDate ? Date.parse(traderTargetPosition.endDate) : NaN;
+            if (Number.isFinite(endTs)) {
+                const minutesLeft = (endTs - Date.now()) / 60000;
+                if (minutesLeft >= 0 && minutesLeft < skipMins) {
+                    console.log(
+                        `  ⏭ 跳过跟单：市场即将结束（距离结束 ${minutesLeft.toFixed(
+                            1
+                        )} 分钟 < 阈值 ${skipMins} 分钟）| market=${trade.title || trade.slug || ''} | condition=${trade.conditionId.slice(
+                            0,
+                            10
+                        )}...`
+                    );
+                    console.log('─'.repeat(70));
+                    return;
+                }
+            }
+        }
+
         const lockedAsset = getDryLockedAsset(trade.conditionId);
         if (
             ENV.COPY_DOUBLE_SIDE_GUARD_MODE !== 'OFF' &&
@@ -645,6 +1004,16 @@ const doDryTrading = async (
             );
         }
         setDryConditionBuyLock(trade.conditionId, tradeAsset);
+
+        if (ENV.AUTO_PROFIT_EXIT_ENABLED) {
+            registerDryProfitExitWatch(
+                trade.transactionHash,
+                trade.conditionId,
+                tradeAsset,
+                trade.title || trade.slug || '',
+                result.spent
+            );
+        }
 
         if (ENV.COPY_TRACKING_ENABLED && result.spent > 0) {
             await recordCopyTrackingFill({
@@ -1130,10 +1499,17 @@ const printSimulatedPositionsSnapshot = async (clobClient: ClobClient) => {
 // ============================================================
 
 let isRunning = true;
+// Non-blocking auto profit exit loop (runs in background timer)
+let autoProfitExitDryRunTimer: ReturnType<typeof setInterval> | undefined;
+let autoProfitExitDryRunInFlight = false;
 
 export const stopDryRunExecutor = () => {
     isRunning = false;
     Logger.info('模拟跟单已请求关闭...');
+    if (autoProfitExitDryRunTimer) {
+        clearInterval(autoProfitExitDryRunTimer);
+        autoProfitExitDryRunTimer = undefined;
+    }
 };
 
 const dryRunExecutor = async (clobClient: ClobClient) => {
@@ -1164,6 +1540,18 @@ const dryRunExecutor = async (clobClient: ClobClient) => {
     console.log(`    初始模拟余额: $${ENV.DRY_INITIAL_BALANCE.toFixed(2)}`);
     console.log(`    从真实持仓开始: ${ENV.DRY_START_FROM_REAL ? '是' : '否'}`);
     console.log(`    监控交易员:   ${ENV.USER_ADDRESSES.length} 个`);
+    console.log(
+        `    自动止盈止损: ${ENV.AUTO_PROFIT_EXIT_ENABLED ? '启用' : '关闭'} | TP=${ENV.AUTO_PROFIT_EXIT_TAKE_PROFIT_PCT}% | SL=${ENV.AUTO_PROFIT_EXIT_STOP_LOSS_PCT}% | ` +
+            `检查=${ENV.AUTO_PROFIT_EXIT_CHECK_INTERVAL_MS}ms | 冷却=${ENV.AUTO_PROFIT_EXIT_RETRY_COOLDOWN_MS}ms | ` +
+            `清理阈值 < ${ENV.AUTO_PROFIT_EXIT_CLEAR_WHEN_REMAINING_LT_TOKENS} tokens`
+    );
+    Logger.info(
+        `⚙️ 自动止盈止损(ProfitExit)配置: ${ENV.AUTO_PROFIT_EXIT_ENABLED ? '启用' : '关闭'} | ` +
+            `TP=${ENV.AUTO_PROFIT_EXIT_TAKE_PROFIT_PCT}% | SL=${ENV.AUTO_PROFIT_EXIT_STOP_LOSS_PCT}% | ` +
+            `TP执行阈值>=${ENV.AUTO_PROFIT_EXIT_TAKE_PROFIT_MIN_EXEC_PNL_PCT}% | ` +
+            `检查=${ENV.AUTO_PROFIT_EXIT_CHECK_INTERVAL_MS}ms | 冷却=${ENV.AUTO_PROFIT_EXIT_RETRY_COOLDOWN_MS}ms | ` +
+            `清理阈值 < ${ENV.AUTO_PROFIT_EXIT_CLEAR_WHEN_REMAINING_LT_TOKENS} tokens`
+    );
     if (ENV.POSITION_RECONCILE_INTERVAL_MS > 0) {
         console.log(
             `    仓位对账:     已启用（每 ${ENV.POSITION_RECONCILE_INTERVAL_MS}ms，与实盘同一套 POSITION_RECONCILE_*）`
@@ -1191,6 +1579,24 @@ const dryRunExecutor = async (clobClient: ClobClient) => {
     console.log('');
     console.log('  ▶️  模拟跟单监控已启动，等待交易员新交易...\n');
     Logger.separator();
+
+    // Start auto profit exit in background to avoid blocking the main dry-run loop.
+    if (ENV.AUTO_PROFIT_EXIT_ENABLED && ENV.AUTO_PROFIT_EXIT_CHECK_INTERVAL_MS > 0) {
+        const tickMs = ENV.AUTO_PROFIT_EXIT_CHECK_INTERVAL_MS;
+        autoProfitExitDryRunTimer = setInterval(() => {
+            if (!isRunning) return;
+            if (autoProfitExitDryRunInFlight) return;
+            autoProfitExitDryRunInFlight = true;
+            maybeAutoProfitExitDryRun(clobClient)
+                .catch((e) => {
+                    Logger.error(`⚠️ [AUTO EXIT DRYRUN] 自动止盈止损后台检查线程失败：${e}`);
+                })
+                .finally(() => {
+                    autoProfitExitDryRunInFlight = false;
+                });
+        }, tickMs);
+        Logger.info(`🧠 已启动自动止盈止损后台检查线程：每 ${tickMs}ms 检查一次（非阻塞）`);
+    }
 
     let lastCheck = Date.now();
     let lastPositionsSnapshotAt = 0;
@@ -1264,6 +1670,8 @@ const dryRunExecutor = async (clobClient: ClobClient) => {
                 }
             }
         }
+
+        // autoProfitExit handled by background timer
 
         await new Promise((resolve) => setTimeout(resolve, 300));
     }
