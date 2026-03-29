@@ -65,6 +65,25 @@ export const resolveMartingaleBinaryTrend = async (
     };
 };
 
+/** 与日志「趋势结果」同一句；由已解析的两侧价生成（避免重复请求 CLOB）。 */
+export const formatMartingaleTrendHintFromResolved = (t: MartingaleBinaryTrend): string => {
+    const hi = t.price0 >= t.price1 ? t.label0 : t.label1;
+    const tie = Math.abs(t.price0 - t.price1) < 0.008;
+    const bias = tie ? '两侧接近' : `偏高为 ${hi}`;
+    return `趋势结果·${t.source}: ${t.label0}:${fmtPx(t.price0)} ${t.label1}:${fmtPx(t.price1)}，${bias}`;
+};
+
+/**
+ * 偏高侧 outcome 文案；两侧过近（视为平）时返回 null，不作押边对照。
+ */
+export const leadingOutcomeLabelFromResolvedTrend = (t: MartingaleBinaryTrend): string | null => {
+    const tie = Math.abs(t.price0 - t.price1) < 0.008;
+    if (tie) {
+        return null;
+    }
+    return t.price0 >= t.price1 ? t.label0 : t.label1;
+};
+
 /**
  * 返回可插入日志的短句（不含外层括号）；失败返回 null。
  */
@@ -73,8 +92,5 @@ export const martingaleTrendHintFromOrderBook = async (m: GammaMarketLite): Prom
     if (!t) {
         return null;
     }
-    const hi = t.price0 >= t.price1 ? t.label0 : t.label1;
-    const tie = Math.abs(t.price0 - t.price1) < 0.008;
-    const bias = tie ? '两侧接近' : `偏高为 ${hi}`;
-    return `趋势结果·${t.source}: ${t.label0}:${fmtPx(t.price0)} ${t.label1}:${fmtPx(t.price1)}，${bias}`;
+    return formatMartingaleTrendHintFromResolved(t);
 };

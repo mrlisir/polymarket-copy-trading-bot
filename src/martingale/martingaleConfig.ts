@@ -114,6 +114,10 @@ export type MartingaleRuntimeConfig = {
      */
     emailOnSettle: boolean;
     /**
+     * 待收盘日志输出时：趋势跟单模式下若押边与 CLOB/Gamma 偏高侧不一致则发告警（每挂单窗去重一次）。
+     */
+    emailOnTrendMismatch: boolean;
+    /**
      * 仅 martingale-live：每隔这么多分钟尝试一次链上 redeem（0=关闭）。
      * 与 npm run redeem-resolved 相同 Data API 条件（redeemable + 价贴近 0/1）。
      */
@@ -277,6 +281,7 @@ export const martingaleConfigFromEnv = (): MartingaleRuntimeConfig => {
         ),
         emailOnOrder: process.env.MARTINGALE_EMAIL_ON_ORDER === 'true',
         emailOnSettle: process.env.MARTINGALE_EMAIL_ON_SETTLE === 'true',
+        emailOnTrendMismatch: process.env.MARTINGALE_EMAIL_ON_TREND_MISMATCH === 'true',
         redeemIntervalMinutes: Math.max(
             0,
             parseInt(process.env.MARTINGALE_REDEEM_INTERVAL_MINUTES || '0', 10)

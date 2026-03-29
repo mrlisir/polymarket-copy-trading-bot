@@ -666,6 +666,50 @@ export type MartingaleSettleNotifyContext = {
     usedBookSettle: boolean;
 };
 
+export type MartingaleTrendMismatchNotifyContext = {
+    seriesKey: string;
+    sideLabel: string;
+    leadingLabel: string;
+    trendHintLine: string;
+    slug: string;
+    stakeUsd: number;
+};
+
+const buildMartingaleTrendMismatchBody = (p: MartingaleTrendMismatchNotifyContext): string => {
+    const now = new Date().toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai', hour12: false });
+    const pm = linkPolymarketEvent(undefined, p.slug);
+    const lines: string[] = [
+        '══════════════════════════════════════════════════════════════',
+        '',
+        '【Polymarket 马丁格尔 · 告警】趋势跟单·待收盘日志',
+        '',
+        `• 时间(北京时间): ${now}`,
+        `• 序列: ${p.seriesKey}`,
+        `• 当前挂单押边: ${p.sideLabel}`,
+        `• 订单簿/Gamma 当前偏高侧: ${p.leadingLabel}`,
+        `• 日志中的趋势摘要: ${p.trendHintLine}`,
+        `• 名义(挂单): $${p.stakeUsd.toFixed(4)} USDC`,
+        `• slug: ${p.slug}`,
+        '',
+        '说明: 下单时按「本窗首次穿越」锁定一侧；盘中价变化可能导致偏高侧与押边暂时不一致，属正常波动或需人工核对。',
+        '',
+        '──────────────── 链接 ────────────────',
+    ];
+    if (pm) {
+        lines.push(`• Polymarket: ${pm}`);
+    }
+    lines.push(
+        '',
+        '开关: MARTINGALE_EMAIL_ON_TREND_MISMATCH=true；SMTP 与 MARTINGALE_EMAIL_ON_ORDER 等同依赖根目录 EMAIL_*。',
+        '',
+        '══════════════════════════════════════════════════════════════',
+        '',
+        '本邮件由系统自动发送，请勿直接回复。',
+        ''
+    );
+    return lines.join('\n');
+};
+
 const buildMartingaleOrderBody = (p: MartingaleOrderNotifyContext): string => {
     const now = new Date().toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai', hour12: false });
     const modeZh = p.execMode === 'live' ? '实盘' : 'Dry Run 模拟（无链上成交）';
@@ -799,4 +843,22 @@ export const notifyMartingaleSettled = async (
     const dryPrefix = p.execMode === 'dryrun' ? 'Dry·' : '';
     const subject = `[Polymarket·马丁] ${dryPrefix}已收盘${w} ${p.seriesKey} ${p.pnlRoundUsd >= 0 ? '+' : ''}${p.pnlRoundUsd.toFixed(2)}U`;
     await sendPlainEmail({ subject, text: buildMartingaleSettleBody(p) });
+};
+
+/** 马丁格尔：待收盘紧凑/详日志输出时，押边与盘口偏高侧不一致则告警（受 MARTINGALE_EMAIL_ON_TREND_MISMATCH 与全局 EMAIL_NOTIFY_*） */
+export const notifyMartingaleTrendSideMismatch = async (
+    p: MartingaleTrendMismatchNotifyContext,
+    martingaleMailEnabled: boolean
+): Promise<void> => {
+    if (!martingaleMailEnabled || !isEnabled()) {
+        return;
+    }
+    if (!looksLikeEmail(ENV.EMAIL_SMTP_USER)) {
+        Logger.warning(
+            `[邮件通知·马丁] EMAIL_SMTP_USER 不是有效邮箱地址：${ENV.EMAIL_SMTP_USER || '-'}`
+        );
+        return;
+    }
+    const subject = `[Polymarket·马丁·告警] 押边≠偏高 ${p.seriesKey} 押${p.sideLabel}/偏高${p.leadingLabel}`;
+    await sendPlainEmail({ subject, text: buildMartingaleTrendMismatchBody(p) });
 };
