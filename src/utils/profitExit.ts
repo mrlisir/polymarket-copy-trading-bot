@@ -1,5 +1,8 @@
+import { normalizeClobAssetId } from './clobIds';
+
+/** 与 positions / watch 的 asset 对齐，避免因 token id 格式差异导致止盈 watch 永远匹配不到持仓 */
 export const makePositionKey = (conditionId: string, asset: string): string =>
-    `${conditionId}:${asset}`.toLowerCase();
+    `${conditionId}:${normalizeClobAssetId(asset)}`.toLowerCase();
 
 /**
  * Positions API 在极低价（如 1¢）仓位上常把 avgPrice / initialValue 置为 0 或严重舍入，
@@ -44,6 +47,42 @@ export const getPercentPnlFromAvgAndPx = (avgPrice: number, pxUsed: number): num
     if (!Number.isFinite(avgPrice) || avgPrice <= 0) return null;
     if (!Number.isFinite(pxUsed) || pxUsed < 0) return null;
     return ((pxUsed - avgPrice) / avgPrice) * 100;
+};
+
+/**
+ * Positions API 未返回 percentPnl / initialValue 时，用 avgPrice+curPrice 或 currentValue/size 推算 ROI，
+ * 减少「接口字段缺失导致永远不触发止盈/止损」。
+ */
+export const resolvePercentPnlForProfitExit = (pos: any): number | null => {
+    const fromApi = getPercentPnlFromPosition(pos);
+    if (fromApi != null) return fromApi;
+
+    const avg =
+        typeof pos?.avgPrice === 'number' && Number.isFinite(pos.avgPrice) && pos.avgPrice > 0
+            ? pos.avgPrice
+            : null;
+    const cur =
+        typeof pos?.curPrice === 'number' && Number.isFinite(pos.curPrice) && pos.curPrice >= 0
+            ? pos.curPrice
+            : null;
+    if (avg != null && cur != null) {
+        return getPercentPnlFromAvgAndPx(avg, cur);
+    }
+
+    const size =
+        typeof pos?.size === 'number' && Number.isFinite(pos.size) && pos.size > 0 ? pos.size : 0;
+    const cv =
+        typeof pos?.currentValue === 'number' &&
+        Number.isFinite(pos.currentValue) &&
+        pos.currentValue >= 0
+            ? pos.currentValue
+            : null;
+    if (avg != null && size > 0 && cv != null) {
+        const impliedPx = cv / size;
+        return getPercentPnlFromAvgAndPx(avg, impliedPx);
+    }
+
+    return null;
 };
 
 export const shouldTriggerProfitExit = (opts: {

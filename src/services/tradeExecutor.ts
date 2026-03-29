@@ -11,7 +11,7 @@ import {
 } from '../config/copyStrategy';
 import { getUserActivityModel } from '../models/userHistory';
 import { resolveReverseAssetForCondition } from '../utils/conditionTokens';
-import { fetchPositionsForUser } from '../utils/dataApiCache';
+import { fetchPositionsForUserForce, refreshPositionsForCopyWatchers } from '../utils/dataApiCache';
 import getMyBalance from '../utils/getMyBalance';
 import postOrder, { marketSellTokensFOK } from '../utils/postOrder';
 import { fetchOrderBookCached } from '../utils/postOrder';
@@ -19,20 +19,36 @@ import Logger from '../utils/logger';
 import { getProxyPortfolioMarkUsd } from '../utils/tokenMark';
 import { resolveCopyOutcomeLabels } from '../utils/copyOutcomeLabels';
 import { formatBeijingDateTime } from '../utils/time';
-import { notifyCopyRiskStop } from '../utils/emailNotifier';
+import {
+    notifyAutoProfitExit,
+    notifyCopyRiskStop,
+    notifyPositionClear,
+    notifyReverseTraderSellSkipped,
+} from '../utils/emailNotifier';
+import { normalizeClobAssetId } from '../utils/clobIds';
 import { runPositionReconciliation } from './positionReconciliation';
-import { RECONCILE_MIN_SELL_TOKENS, RESOLVED_HIGH, RESOLVED_LOW } from './positionReconciliationCore';
+import {
+    RECONCILE_MIN_SELL_TOKENS,
+    RESOLVED_HIGH,
+    RESOLVED_LOW,
+    touchReconcileTraderExitGrace,
+} from './positionReconciliationCore';
 import { isRetryableTransientError, transientBackoffMs, sleep } from '../utils/transientErrors';
 import {
     estimateSellProceedsFromBids,
     estimateSellPnlPctFromBids,
     formatTpSlThresholdsZh,
-    getPercentPnlFromPosition,
     makePositionKey,
+    resolvePercentPnlForProfitExit,
     resolveRefAvgPriceForExit,
     shouldTriggerProfitExit,
 } from '../utils/profitExit';
-import { recordCopyTrackingFill } from './copyTrackingService';
+import { formatTraderDisplayName, recordCopyTrackingFill } from './copyTrackingService';
+import {
+    evaluateReverseBuyPauseSkip,
+    setReverseCopyBuyPause,
+    setReverseCopyBuyPauseAfterAutoExit,
+} from '../utils/reverseCopyBuyPause';
 
 const TRADE_AGGREGATION_MIN_TOTAL_USD = 1.0; // Polymarket minimum
 
@@ -73,18 +89,38 @@ type ProfitExitWatch = {
     lastExitAttemptAt: number;
     registeredAt: number;
     lastMissingLogAt: number;
+    /** 仅反买跟单建仓注册的 watch 在平仓后触发「暂停跟买直到交易员空仓」 */
+    copyMode?: CopyMode;
+    /** 用于自动平仓后累计亏损熔断；多交易员混同一仓位时会被清空 */
+    traderAddress?: string;
+    /** 连续无持仓（Positions 无该腿）起始时间，用于手动卖出后停止监控 */
+    positionFlatSince?: number;
 };
 
 // Keyed by "conditionId:asset" (lowercased) — once the position is exited, we remove all linked txHash watches.
 const profitExitWatchesByPositionKey: Map<string, ProfitExitWatch> = new Map();
 let lastProfitExitCheckAt = 0;
+/** 节流：positions 有仓但算不出 ROI 时的告警 */
+const profitExitRoiNullLogAt = new Map<string, number>();
+
+const removeProfitExitWatch = (positionKey: string): void => {
+    profitExitWatchesByPositionKey.delete(positionKey);
+    profitExitRoiNullLogAt.delete(positionKey);
+};
+
+const maskAddrForMail = (a?: string): string | undefined => {
+    if (!a) return undefined;
+    return a.length >= 12 ? `${a.slice(0, 6)}...${a.slice(-4)}` : a;
+};
 
 const registerProfitExitWatch = (
     txHash: string | undefined,
     conditionId: string,
     asset: string,
     marketTitle: string,
-    executedUsdc: number
+    executedUsdc: number,
+    copyMode?: CopyMode,
+    traderAddress?: string
 ): void => {
     if (!ENV.AUTO_PROFIT_EXIT_ENABLED) return;
     if (!txHash) return;
@@ -98,6 +134,19 @@ const registerProfitExitWatch = (
             existing.trackedCostBasisUsd += executedUsdc;
         }
         if (!existing.marketTitle && marketTitle) existing.marketTitle = marketTitle;
+        if (copyMode === CopyMode.REVERSE) {
+            existing.copyMode = CopyMode.REVERSE;
+        }
+        if (traderAddress) {
+            if (!existing.traderAddress) {
+                existing.traderAddress = traderAddress;
+            } else if (existing.traderAddress.toLowerCase() !== traderAddress.toLowerCase()) {
+                Logger.warning(
+                    `[AUTO EXIT] 同一 condition+asset 出现不同交易员地址，平仓后将无法归因熔断，已清空 traderAddress`
+                );
+                existing.traderAddress = undefined;
+            }
+        }
         return;
     }
 
@@ -111,6 +160,8 @@ const registerProfitExitWatch = (
         lastExitAttemptAt: 0,
         registeredAt: Date.now(),
         lastMissingLogAt: 0,
+        copyMode: copyMode === CopyMode.REVERSE ? CopyMode.REVERSE : undefined,
+        traderAddress: traderAddress || undefined,
     });
 };
 
@@ -190,58 +241,92 @@ const maybeAutoProfitExit = async (clobClient: ClobClient): Promise<void> => {
     if (now - lastProfitExitCheckAt < interval) return;
     lastProfitExitCheckAt = now;
 
-    const proxyPositions = (await fetchPositionsForUser(ENV.PROXY_WALLET)) as UserPositionInterface[];
+    const proxyPositions = (await fetchPositionsForUserForce(ENV.PROXY_WALLET)) as UserPositionInterface[];
     const byKey = new Map<string, UserPositionInterface>();
     for (const p of proxyPositions || []) {
         if (!p?.conditionId || !p?.asset) continue;
         byKey.set(makePositionKey(p.conditionId, p.asset), p);
     }
 
-        for (const [positionKey, watch] of profitExitWatchesByPositionKey.entries()) {
+    for (const [positionKey, watch] of profitExitWatchesByPositionKey.entries()) {
         const pos = byKey.get(positionKey);
         const size = pos?.size || 0;
+
+        if (pos && size > 0) {
+            watch.positionFlatSince = undefined;
+        }
 
         // If positions API hasn't reflected the new buy yet, keep the watch
         // and continue checking every AUTO_PROFIT_EXIT_CHECK_INTERVAL_MS.
         if (!pos || size <= 0) {
+            if (!watch.positionFlatSince) {
+                watch.positionFlatSince = now;
+            }
             let didLogMissing = false;
             if (now - watch.lastMissingLogAt > 5000) {
                 watch.lastMissingLogAt = now;
                 didLogMissing = true;
-                        Logger.info(
-                            `⏳ [AUTO EXIT] waiting positions reflect new buy: market=${
-                                watch.marketTitle || ''
-                            } | condition=${watch.conditionId.slice(0, 14)}... asset=${watch.asset.slice(
-                                0,
-                                12
-                            )}... watchAge=${((now - watch.registeredAt) / 1000).toFixed(1)}s`
-                        );
+                Logger.info(
+                    `⏳ [AUTO EXIT] waiting positions reflect new buy: market=${
+                        watch.marketTitle || ''
+                    } | condition=${watch.conditionId.slice(0, 14)}... asset=${watch.asset.slice(
+                        0,
+                        12
+                    )}... watchAge=${((now - watch.registeredAt) / 1000).toFixed(1)}s`
+                );
             }
 
-            // Only when we emitted the missing-position log to avoid DB spam.
-            if (didLogMissing) {
-                // Grace period: avoid a race where myBoughtSize / tracked BUY is not written yet,
-                // but positions API is temporarily behind. During this window we should keep watching,
-                // otherwise we can miss the TP/SL trigger and never try to sell.
-                const trackingGraceMs = Math.max(5000, ENV.AUTO_PROFIT_EXIT_CHECK_INTERVAL_MS * 5);
-                if (now - watch.registeredAt >= trackingGraceMs) {
-                    try {
-                        const trackedCount = await countTrackedBuys(watch.conditionId, watch.asset);
-                        const trackedStillExists = await hasAnyTrackedBuy(watch.conditionId, watch.asset);
-                        if (!trackedStillExists) {
-                            Logger.warning(
-                                `🛑 [AUTO EXIT] positions 已不在且 tracked BUY 已清零：停止跟踪 market=${
-                                    watch.marketTitle || ''
-                                } | condition=${watch.conditionId.slice(0, 10)}... asset=${watch.asset.slice(
-                                    0,
-                                    12
-                                )}... | trackedCount=${trackedCount}`
-                            );
-                            profitExitWatchesByPositionKey.delete(positionKey);
-                        }
-                    } catch {
-                        // If DB check fails, keep the watch; worst case is extra polling.
+            const trackingGraceMs = Math.max(5000, ENV.AUTO_PROFIT_EXIT_CHECK_INTERVAL_MS * 5);
+            const flatClearMs = Math.max(5000, ENV.AUTO_PROFIT_EXIT_FLAT_CLEAR_MS || 90000);
+
+            if (
+                now - watch.registeredAt >= trackingGraceMs &&
+                watch.positionFlatSince &&
+                now - watch.positionFlatSince >= flatClearMs
+            ) {
+                Logger.warning(
+                    `🛑 [AUTO EXIT] 代理钱包已无该持仓 ≥${flatClearMs}ms（含手动在 Polymarket 卖出），停止监控并清理 tracked BUY | market=${
+                        watch.marketTitle || ''
+                    } | condition=${watch.conditionId.slice(0, 10)}... asset=${watch.asset.slice(0, 12)}...`
+                );
+                await clearBuyTrackingForAsset(watch.conditionId, watch.asset, watch.marketTitle);
+                removeProfitExitWatch(positionKey);
+                await notifyPositionClear({
+                    runMode: 'LIVE',
+                    reasonCode: 'AUTO_EXIT_MANUAL_FLAT_MS',
+                    marketTitle: watch.marketTitle,
+                    conditionId: watch.conditionId,
+                    tokenId: watch.asset,
+                    detailZh: `代理钱包在 Data API 上已无该持仓 ≥${flatClearMs}ms（常见于在 Polymarket 手动卖光），已停止 AUTO EXIT 并清理 Mongo tracked BUY。`,
+                });
+                continue;
+            }
+
+            if (didLogMissing && now - watch.registeredAt >= trackingGraceMs) {
+                try {
+                    const trackedCount = await countTrackedBuys(watch.conditionId, watch.asset);
+                    const trackedStillExists = await hasAnyTrackedBuy(watch.conditionId, watch.asset);
+                    if (!trackedStillExists) {
+                        Logger.warning(
+                            `🛑 [AUTO EXIT] positions 已不在且 tracked BUY 已清零：停止跟踪 market=${
+                                watch.marketTitle || ''
+                            } | condition=${watch.conditionId.slice(0, 10)}... asset=${watch.asset.slice(
+                                0,
+                                12
+                            )}... | trackedCount=${trackedCount}`
+                        );
+                        removeProfitExitWatch(positionKey);
+                        await notifyPositionClear({
+                            runMode: 'LIVE',
+                            reasonCode: 'AUTO_EXIT_WATCH_STOP_NO_TRACKED',
+                            marketTitle: watch.marketTitle,
+                            conditionId: watch.conditionId,
+                            tokenId: watch.asset,
+                            detailZh: `positions 无该腿且 Mongo tracked BUY 已清零（trackedCount=${trackedCount}），停止 AUTO EXIT 监控。`,
+                        });
                     }
+                } catch {
+                    // If DB check fails, keep the watch; worst case is extra polling.
                 }
             }
             continue;
@@ -256,16 +341,32 @@ const maybeAutoProfitExit = async (clobClient: ClobClient): Promise<void> => {
                 )} tokens（停止跟踪该仓位）`
             );
             await clearBuyTrackingForAsset(watch.conditionId, watch.asset, watch.marketTitle);
-            profitExitWatchesByPositionKey.delete(positionKey);
+            removeProfitExitWatch(positionKey);
+            await notifyPositionClear({
+                runMode: 'LIVE',
+                reasonCode: 'AUTO_EXIT_DUST_SIZE',
+                marketTitle: watch.marketTitle,
+                conditionId: watch.conditionId,
+                tokenId: watch.asset,
+                detailZh: `持仓 size=${size.toFixed(4)} 低于清理阈值 ${ENV.AUTO_PROFIT_EXIT_CLEAR_WHEN_REMAINING_LT_TOKENS} tokens，已停止跟踪并清理 tracked BUY。`,
+                soldTokens: size,
+            });
             continue;
         }
 
-        const percentPnlFromPosition = getPercentPnlFromPosition(pos);
-        if (percentPnlFromPosition == null) continue;
-
-        // 触发口径：严格以 polymarket positions API 的 ROI（pos.percentPnl / initialValue/currentValue）
-        // 为准，不再使用 orderbook bid 做保守 min()，避免出现“看起来已到 TP/SL 但未触发”的偏差。
-        const percentPnlUsed = percentPnlFromPosition;
+        const percentPnlUsed = resolvePercentPnlForProfitExit(pos);
+        if (percentPnlUsed == null) {
+            const lastRoiLog = profitExitRoiNullLogAt.get(positionKey) || 0;
+            if (now - lastRoiLog > 20000) {
+                profitExitRoiNullLogAt.set(positionKey, now);
+                Logger.warning(
+                    `⏭️ [AUTO EXIT] 无法计算 ROI（positions 缺 percentPnl/curPrice 等），跳过本轮 | market=${
+                        watch.marketTitle || ''
+                    } | condition=${watch.conditionId.slice(0, 10)}... asset=${watch.asset.slice(0, 12)}...`
+                );
+            }
+            continue;
+        }
 
         const { triggered, reason } = shouldTriggerProfitExit({
             percentPnl: percentPnlUsed,
@@ -311,15 +412,20 @@ const maybeAutoProfitExit = async (clobClient: ClobClient): Promise<void> => {
 
                 if (watch.trackedCostBasisUsd > 0) {
                     const estimate = estimateSellProceedsFromBids({ size, bids });
-                    const requiredProceeds = watch.trackedCostBasisUsd * (1 + takeProfitPct / 100);
+                    const initialV = Number(pos?.initialValue);
+                    const basisUsd = Math.max(
+                        watch.trackedCostBasisUsd,
+                        Number.isFinite(initialV) && initialV > 0 ? initialV : 0
+                    );
+                    const requiredProceeds = basisUsd * (1 + takeProfitPct / 100);
                     if (!estimate || estimate.proceeds < requiredProceeds) {
                         Logger.warning(
                             `⏭️ [AUTO EXIT] 跳过止盈执行：预估可成交额≈$${estimate ? estimate.proceeds.toFixed(2) : 'n/a'} < 目标止盈额≈$${requiredProceeds.toFixed(
                                 2
-                            )}（投入≈$${watch.trackedCostBasisUsd.toFixed(2)}，TP=${takeProfitPct.toFixed(2)}%） | market=${watch.marketTitle || ''} | condition=${watch.conditionId.slice(
-                                0,
-                                10
-                            )}... asset=${watch.asset.slice(0, 12)}...`
+                        )}（成本基准≈$${basisUsd.toFixed(2)} = max(本地投入,API initialValue)，TP=${takeProfitPct.toFixed(2)}%） | market=${watch.marketTitle || ''} | condition=${watch.conditionId.slice(
+                            0,
+                            10
+                        )}... asset=${watch.asset.slice(0, 12)}...`
                         );
                         continue;
                     }
@@ -397,7 +503,16 @@ const maybeAutoProfitExit = async (clobClient: ClobClient): Promise<void> => {
             const isProbablyNotSellable = !!(pos?.redeemable || pos?.mergeable);
             if (isProbablyNotSellable) {
                 await clearBuyTrackingForAsset(watch.conditionId, watch.asset, watch.marketTitle);
-                profitExitWatchesByPositionKey.delete(positionKey);
+                removeProfitExitWatch(positionKey);
+                await notifyPositionClear({
+                    runMode: 'LIVE',
+                    reasonCode: 'AUTO_EXIT_REDEEMABLE_NO_BID',
+                    marketTitle: watch.marketTitle,
+                    conditionId: watch.conditionId,
+                    tokenId: watch.asset,
+                    detailZh:
+                        '自动止盈/止损触发后无法成交（无流动性），仓位为 redeemable/mergeable，已停止跟踪并清理 tracked BUY。',
+                });
             } else {
                 // Keep tracking so that after orderbook recovers we can retry selling.
                 Logger.warning(
@@ -411,28 +526,46 @@ const maybeAutoProfitExit = async (clobClient: ClobClient): Promise<void> => {
 
         if (exitOk) {
             await clearBuyTrackingForAsset(watch.conditionId, watch.asset, watch.marketTitle);
-            profitExitWatchesByPositionKey.delete(positionKey);
+            removeProfitExitWatch(positionKey);
             Logger.success(
                 `✅ [AUTO EXIT] 平仓完成：sold=${soldTokens.toFixed(4)} tokens | proceeds≈$${proceedsUsd.toFixed(
                     2
                 )} | remaining≈${remaining.toFixed(4)} | clearedTrackedBuy=true`
             );
 
+            if (watch.copyMode === CopyMode.REVERSE && ENV.COPY_REVERSE_PAUSE_NEW_BUYS_UNTIL_TRADER_FLAT) {
+                await setReverseCopyBuyPauseAfterAutoExit({
+                    conditionId: watch.conditionId,
+                    myAsset: watch.asset,
+                });
+            }
+
             // 记录一次“自动止盈止损平仓”到成交流水，方便在 copy-tracking-export 做复盘
             // 说明：本 watch 以 conditionId+asset 维度聚合多个买入 txHash，因此此处按聚合结果写一条合成记录。
-            const avgPrice = pos?.avgPrice;
+            const apiAvg =
+                typeof pos?.avgPrice === 'number' && Number.isFinite(pos.avgPrice) && pos.avgPrice > 0
+                    ? pos.avgPrice
+                    : undefined;
+            const costPxForPnl = refAvgPrice > 0 ? refAvgPrice : apiAvg;
             const realizedPnlUsd =
-                Number.isFinite(avgPrice) && avgPrice !== undefined
-                    ? proceedsUsd - soldTokens * (avgPrice as number)
+                costPxForPnl !== undefined && soldTokens > 0
+                    ? proceedsUsd - soldTokens * costPxForPnl
                     : undefined;
             const autoExitType = isTakeProfit ? 'TAKE_PROFIT' : 'STOP_LOSS';
             const traderTxHash = txHashArr[0];
+            const riskPnl =
+                realizedPnlUsd !== undefined && Number.isFinite(realizedPnlUsd) ? realizedPnlUsd : 0;
+            if (watch.traderAddress) {
+                await handleTraderRiskAfterSell(watch.traderAddress, riskPnl);
+            }
             await recordCopyTrackingFill({
                 runMode: 'live',
-                traderAddress: 'auto_profit_exit',
-                traderDisplayName: 'AUTO_PROFIT_EXIT',
+                traderAddress: watch.traderAddress || 'auto_profit_exit',
+                traderDisplayName: watch.traderAddress
+                    ? formatTraderDisplayName({}, watch.traderAddress)
+                    : 'AUTO_PROFIT_EXIT',
                 marketTitle: watch.marketTitle || '',
-                copyMode: CopyMode.FOLLOW,
+                copyMode: watch.copyMode ?? CopyMode.FOLLOW,
                 traderSide: 'BUY',
                 mySide: 'SELL',
                 traderAsset: watch.asset,
@@ -454,6 +587,62 @@ const maybeAutoProfitExit = async (clobClient: ClobClient): Promise<void> => {
                     )} (可能仍存在估值/盘口差异或部分成交导致)`
                 );
             }
+
+            await notifyAutoProfitExit({
+                runMode: 'LIVE',
+                kind: isTakeProfit ? 'TAKE_PROFIT' : 'STOP_LOSS',
+                marketTitle: watch.marketTitle || '',
+                conditionId: watch.conditionId,
+                tokenId: watch.asset,
+                soldTokens,
+                proceedsUsd,
+                plannedSize: size,
+                remainingTokens: remaining,
+                exitFull: true,
+                realizedPnlUsd,
+                percentPnlAtTrigger: percentPnlUsed,
+                triggerReason: reason,
+                copyMode:
+                    watch.copyMode === CopyMode.REVERSE
+                        ? 'REVERSE'
+                        : watch.copyMode === CopyMode.FOLLOW
+                          ? 'FOLLOW'
+                          : 'FOLLOW',
+                traderMask: maskAddrForMail(watch.traderAddress),
+            });
+        } else if (soldTokens > 0.0000001) {
+            const costPxPart =
+                refAvgPrice > 0
+                    ? refAvgPrice
+                    : typeof pos?.avgPrice === 'number' && Number.isFinite(pos.avgPrice) && pos.avgPrice > 0
+                      ? pos.avgPrice
+                      : undefined;
+            const realizedPartial =
+                costPxPart !== undefined
+                    ? proceedsUsd - soldTokens * costPxPart
+                    : undefined;
+            Logger.warning(
+                `⚠️ [AUTO EXIT] 平仓未完全成交：sold=${soldTokens.toFixed(4)} | remaining≈${remaining.toFixed(
+                    4
+                )}，将在冷却后重试`
+            );
+            await notifyAutoProfitExit({
+                runMode: 'LIVE',
+                kind: isTakeProfit ? 'TAKE_PROFIT' : 'STOP_LOSS',
+                marketTitle: watch.marketTitle || '',
+                conditionId: watch.conditionId,
+                tokenId: watch.asset,
+                soldTokens,
+                proceedsUsd,
+                plannedSize: size,
+                remainingTokens: remaining,
+                exitFull: false,
+                realizedPnlUsd: realizedPartial,
+                percentPnlAtTrigger: percentPnlUsed,
+                triggerReason: reason,
+                copyMode: watch.copyMode === CopyMode.REVERSE ? 'REVERSE' : 'FOLLOW',
+                traderMask: maskAddrForMail(watch.traderAddress),
+            });
         } else {
             Logger.warning(
                 `⚠️ [AUTO EXIT] 平仓未完全成交：sold=${soldTokens.toFixed(4)} | remaining≈${remaining.toFixed(
@@ -767,8 +956,8 @@ const doTrading = async (clobClient: ClobClient, trades: TradeWithUser[]) => {
 
         const copyMode = getCopyModeForTrader(trade.userAddress);
 
-        const my_positions = (await fetchPositionsForUser(ENV.PROXY_WALLET)) as UserPositionInterface[];
-        const user_positions = (await fetchPositionsForUser(trade.userAddress)) as UserPositionInterface[];
+        const my_positions = (await fetchPositionsForUserForce(ENV.PROXY_WALLET)) as UserPositionInterface[];
+        const user_positions = (await fetchPositionsForUserForce(trade.userAddress)) as UserPositionInterface[];
 
         // REVERSE mode safety:
         // If oppositeAsset is missing/invalid, resolve it from trader's positions we already fetched.
@@ -827,9 +1016,6 @@ const doTrading = async (clobClient: ClobClient, trades: TradeWithUser[]) => {
                 continue;
             }
         }
-
-        await UserActivity.updateOne({ _id: trade._id }, { $set: { botExcutedTime: 1 } });
-        touchRecentKey(dedupKey);
 
         const actualSide = getActualSide(trade.side || 'BUY', copyMode);
         const buyTargetAsset =
@@ -907,6 +1093,22 @@ const doTrading = async (clobClient: ClobClient, trades: TradeWithUser[]) => {
         // Execute the trade (use actualSide to determine buy/sell direction)
         if (actualSide === 'BUY') {
             const targetAsset = buyTargetAsset as string;
+            if (copyMode === CopyMode.REVERSE) {
+                const pauseSkip = evaluateReverseBuyPauseSkip({
+                    conditionId: trade.conditionId,
+                    myBuyAsset: targetAsset,
+                    traderPositions: user_positions,
+                });
+                if (pauseSkip.skip) {
+                    Logger.warning(`⏭ ${pauseSkip.detail}`);
+                    await UserActivity.updateOne(
+                        { _id: trade._id },
+                        { $set: { bot: true, botExcutedTime: 1 } }
+                    );
+                    Logger.separator();
+                    continue;
+                }
+            }
             const traderTargetPosition =
                 user_positions.find(
                     (position: UserPositionInterface) =>
@@ -920,11 +1122,16 @@ const doTrading = async (clobClient: ClobClient, trades: TradeWithUser[]) => {
                 Number.isFinite(targetCurPrice) &&
                 ((targetCurPrice as number) >= RESOLVED_HIGH ||
                     (targetCurPrice as number) <= RESOLVED_LOW);
+            // Generated By AI Start (Cursor)
             if (traderTargetPosition?.redeemable || resolvedByCurPrice) {
                 Logger.warning(
                     `⏭ 跳过跟单：目标仓位已接近结算（redeemable=${traderTargetPosition?.redeemable ? 'true' : 'false'} curPrice=${
                         Number.isFinite(targetCurPrice) ? (targetCurPrice as number).toFixed(4) : 'n/a'
                     }）| market=${trade.title || trade.slug || ''} | condition=${trade.conditionId.slice(0, 10)}...`
+                );
+                await UserActivity.updateOne(
+                    { _id: trade._id },
+                    { $set: { bot: true, botExcutedTime: 1 } }
                 );
                 Logger.separator();
                 continue;
@@ -932,26 +1139,27 @@ const doTrading = async (clobClient: ClobClient, trades: TradeWithUser[]) => {
 
             // Avoid buying when market is too close to end (liquidity often disappears).
             const skipMins = ENV.COPY_SKIP_FOLLOW_IF_ENDS_WITHIN_MINUTES;
-            if (skipMins > 0) {
-                const endTs = traderTargetPosition?.endDate
-                    ? Date.parse(traderTargetPosition.endDate)
-                    : NaN;
-                if (Number.isFinite(endTs)) {
-                    const minutesLeft = (endTs - Date.now()) / 60000;
-                    if (minutesLeft >= 0 && minutesLeft < skipMins) {
-                        Logger.warning(
-                            `⏭ 跳过跟单：市场即将结束（距离结束 ${minutesLeft.toFixed(
-                                1
-                            )} 分钟 < 阈值 ${skipMins} 分钟）| market=${trade.title || trade.slug || ''} | condition=${trade.conditionId.slice(
-                                0,
-                                10
-                            )}...`
-                        );
-                        Logger.separator();
-                        continue;
-                    }
+            const endTs = traderTargetPosition?.endDate ? Date.parse(traderTargetPosition.endDate) : NaN;
+            if (Number.isFinite(endTs)) {
+                const minutesLeft = (endTs - Date.now()) / 60000;
+                if (skipMins > 0 && minutesLeft >= 0 && minutesLeft < skipMins) {
+                    Logger.warning(
+                        `⏭ 跳过跟单：市场即将结束（距离结束 ${minutesLeft.toFixed(
+                            1
+                        )} 分钟 < 阈值 ${skipMins} 分钟）| market=${trade.title || trade.slug || ''} | condition=${trade.conditionId.slice(
+                            0,
+                            10
+                        )}...`
+                    );
+                    await UserActivity.updateOne(
+                        { _id: trade._id },
+                        { $set: { bot: true, botExcutedTime: 1 } }
+                    );
+                    Logger.separator();
+                    continue;
                 }
             }
+            // Generated By AI End (Cursor)
             const lockedAsset = getLockedAsset(trade.conditionId);
             if (
                 ENV.COPY_DOUBLE_SIDE_GUARD_MODE !== 'OFF' &&
@@ -1003,6 +1211,32 @@ const doTrading = async (clobClient: ClobClient, trades: TradeWithUser[]) => {
             }
         }
 
+        if (copyMode === CopyMode.REVERSE && actualSide === 'SELL' && !ENV.COPY_REVERSE_SYNC_TRADER_SELL) {
+            Logger.warning(
+                `⏭ 反买: COPY_REVERSE_SYNC_TRADER_SELL=false，跳过「交易员卖出 → 我方卖出」| market=${trade.title || trade.slug || ''}`
+            );
+            await UserActivity.updateOne(
+                { _id: trade._id },
+                { $set: { bot: true, botExcutedTime: 1 } }
+            );
+            await notifyReverseTraderSellSkipped({
+                trader: trade.userAddress,
+                title: trade.title || trade.slug || '',
+                conditionId: trade.conditionId,
+                traderOutcome: outcomeLabels.traderOutcome,
+                myOutcome: outcomeLabels.myOutcome,
+                modeHint: outcomeLabels.modeHint,
+                slug: trade.slug,
+                eventSlug: trade.eventSlug,
+                myTradedTokenId: normalizeClobAssetId(trade.oppositeAsset || trade.asset),
+                txHash: trade.transactionHash,
+                traderUsdcSize: trade.usdcSize,
+                traderPrice: trade.price,
+            });
+            Logger.separator();
+            continue;
+        }
+
         const executedUsdc = await postOrder(
             clobClient,
             actualSide === 'BUY' ? 'buy' : 'sell',
@@ -1022,8 +1256,33 @@ const doTrading = async (clobClient: ClobClient, trades: TradeWithUser[]) => {
             )
         );
 
-        // Track daily volume after successful trade
+        if (
+            copyMode === CopyMode.REVERSE &&
+            actualSide === 'SELL' &&
+            ENV.COPY_REVERSE_SYNC_TRADER_SELL &&
+            executedUsdc > 0 &&
+            ENV.COPY_REVERSE_PAUSE_NEW_BUYS_UNTIL_TRADER_FLAT &&
+            trade.conditionId
+        ) {
+            const myList = (await fetchPositionsForUserForce(ENV.PROXY_WALLET)) as UserPositionInterface[];
+            const still = myList.find(
+                (p) =>
+                    p.conditionId === trade.conditionId &&
+                    normalizeClobAssetId(p.asset) === normalizeClobAssetId(tradedAsset)
+            );
+            if (!still || (still.size || 0) < 1e-4) {
+                setReverseCopyBuyPause({
+                    conditionId: trade.conditionId,
+                    myAsset: tradedAsset,
+                    monitorTraderAsset: normalizeClobAssetId(trade.asset),
+                    reason: 'COPY_SELL_FLAT',
+                });
+            }
+        }
+
         if (executedUsdc > 0) {
+            touchRecentKey(dedupKey);
+            await UserActivity.updateOne({ _id: trade._id }, { $set: { bot: true, botExcutedTime: 1 } });
             addDailyVolume(executedUsdc);
             Logger.info(`📈 今日累计交易量: $${getDailyVolume().toFixed(2)}`);
             await maybeLogLivePortfolioCurPrice(clobClient);
@@ -1031,12 +1290,19 @@ const doTrading = async (clobClient: ClobClient, trades: TradeWithUser[]) => {
                 lockConditionAsset(trade.conditionId, buyTargetAsset);
             }
             if (actualSide === 'BUY') {
+                touchReconcileTraderExitGrace(
+                    trade.conditionId,
+                    tradedAsset,
+                    ENV.POSITION_RECONCILE_TRADER_EXIT_GRACE_MS
+                );
                 registerProfitExitWatch(
                     trade.transactionHash,
                     trade.conditionId,
                     tradedAsset,
                     trade.title || trade.slug || '',
-                    executedUsdc
+                    executedUsdc,
+                    copyMode,
+                    trade.userAddress
                 );
             }
             const baseUsd = Math.max(
@@ -1048,6 +1314,10 @@ const doTrading = async (clobClient: ClobClient, trades: TradeWithUser[]) => {
                 actualSide === 'BUY'
                     ? baseUsd + executedUsdc
                     : Math.max(0, baseUsd - executedUsdc)
+            );
+        } else {
+            Logger.warning(
+                `[跟单重试] 本笔成交额为 0，保持 botExcutedTime=0 以便下轮重试 | market=${trade.title || trade.slug || ''} | hash=${trade.transactionHash?.slice(0, 10)}...`
             );
         }
 
@@ -1079,8 +1349,8 @@ const doAggregatedTrading = async (clobClient: ClobClient, aggregatedTrades: Agg
         Logger.info(`总金额: $${agg.totalUsdcSize.toFixed(2)}`);
         Logger.info(`平均价格: $${agg.averagePrice.toFixed(4)}`);
 
-        const my_positions = (await fetchPositionsForUser(ENV.PROXY_WALLET)) as UserPositionInterface[];
-        const user_positions = (await fetchPositionsForUser(agg.userAddress)) as UserPositionInterface[];
+        const my_positions = (await fetchPositionsForUserForce(ENV.PROXY_WALLET)) as UserPositionInterface[];
+        const user_positions = (await fetchPositionsForUserForce(agg.userAddress)) as UserPositionInterface[];
         const copyMode = getCopyModeForTrader(agg.userAddress);
         Logger.info(
             `跟单配置: ${copyModeLabelZh(copyMode)} · .env 列 ${copyModeEnvColumnHint(copyMode)} · 交易员 ${agg.userAddress.slice(0, 6)}...${agg.userAddress.slice(-4)}`
@@ -1153,11 +1423,6 @@ const doAggregatedTrading = async (clobClient: ClobClient, aggregatedTrades: Agg
                 Logger.separator();
                 continue;
             }
-        }
-
-        for (const trade of agg.trades) {
-            const UserActivity = getUserActivityModel(trade.userAddress);
-            await UserActivity.updateOne({ _id: trade._id }, { $set: { botExcutedTime: 1 } });
         }
 
         const templateTrade = agg.trades[0];
@@ -1237,6 +1502,25 @@ const doAggregatedTrading = async (clobClient: ClobClient, aggregatedTrades: Agg
         // Execute the aggregated trade
         if (actualSide === 'BUY') {
             const targetAsset = buyTargetAsset as string;
+            if (copyMode === CopyMode.REVERSE) {
+                const pauseSkipAgg = evaluateReverseBuyPauseSkip({
+                    conditionId: agg.conditionId,
+                    myBuyAsset: targetAsset,
+                    traderPositions: user_positions,
+                });
+                if (pauseSkipAgg.skip) {
+                    Logger.warning(`⏭ ${pauseSkipAgg.detail}`);
+                    for (const tr of agg.trades) {
+                        const UA = getUserActivityModel(tr.userAddress);
+                        await UA.updateOne(
+                            { _id: tr._id },
+                            { $set: { bot: true, botExcutedTime: 1 } }
+                        );
+                    }
+                    Logger.separator();
+                    continue;
+                }
+            }
             const lockedAsset = getLockedAsset(agg.conditionId);
             if (
                 ENV.COPY_DOUBLE_SIDE_GUARD_MODE !== 'OFF' &&
@@ -1295,6 +1579,36 @@ const doAggregatedTrading = async (clobClient: ClobClient, aggregatedTrades: Agg
             }
         }
 
+        if (copyMode === CopyMode.REVERSE && actualSide === 'SELL' && !ENV.COPY_REVERSE_SYNC_TRADER_SELL) {
+            Logger.warning(
+                `⏭ 反买(聚合): COPY_REVERSE_SYNC_TRADER_SELL=false，跳过「交易员卖出 → 我方卖出」`
+            );
+            for (const tr of agg.trades) {
+                const UA = getUserActivityModel(tr.userAddress);
+                await UA.updateOne(
+                    { _id: tr._id },
+                    { $set: { bot: true, botExcutedTime: 1 } }
+                );
+            }
+            const t0 = agg.trades[0];
+            await notifyReverseTraderSellSkipped({
+                trader: agg.userAddress,
+                title: t0.title || agg.slug || '',
+                conditionId: agg.conditionId,
+                traderOutcome: aggOutcomeLabels.traderOutcome,
+                myOutcome: aggOutcomeLabels.myOutcome,
+                modeHint: aggOutcomeLabels.modeHint,
+                slug: t0.slug,
+                eventSlug: t0.eventSlug,
+                myTradedTokenId: normalizeClobAssetId(t0.oppositeAsset || agg.asset),
+                txHash: t0.transactionHash,
+                traderUsdcSize: agg.totalUsdcSize,
+                traderPrice: agg.averagePrice,
+            });
+            Logger.separator();
+            continue;
+        }
+
         const executedUsdc = await postOrder(
             clobClient,
             actualSide === 'BUY' ? 'buy' : 'sell',
@@ -1314,8 +1628,36 @@ const doAggregatedTrading = async (clobClient: ClobClient, aggregatedTrades: Agg
             )
         );
 
-        // Track daily volume after successful trade
+        if (
+            copyMode === CopyMode.REVERSE &&
+            actualSide === 'SELL' &&
+            ENV.COPY_REVERSE_SYNC_TRADER_SELL &&
+            executedUsdc > 0 &&
+            ENV.COPY_REVERSE_PAUSE_NEW_BUYS_UNTIL_TRADER_FLAT &&
+            agg.conditionId
+        ) {
+            const myListAgg = (await fetchPositionsForUserForce(ENV.PROXY_WALLET)) as UserPositionInterface[];
+            const t0 = agg.trades[0];
+            const stillAgg = myListAgg.find(
+                (p) =>
+                    p.conditionId === agg.conditionId &&
+                    normalizeClobAssetId(p.asset) === normalizeClobAssetId(tradedAsset)
+            );
+            if (!stillAgg || (stillAgg.size || 0) < 1e-4) {
+                setReverseCopyBuyPause({
+                    conditionId: agg.conditionId,
+                    myAsset: tradedAsset,
+                    monitorTraderAsset: normalizeClobAssetId(t0.asset),
+                    reason: 'COPY_SELL_FLAT',
+                });
+            }
+        }
+
         if (executedUsdc > 0) {
+            for (const tr of agg.trades) {
+                const UA = getUserActivityModel(tr.userAddress);
+                await UA.updateOne({ _id: tr._id }, { $set: { bot: true, botExcutedTime: 1 } });
+            }
             addDailyVolume(executedUsdc);
             Logger.info(`📈 今日累计交易量: $${getDailyVolume().toFixed(2)}`);
             await maybeLogLivePortfolioCurPrice(clobClient);
@@ -1323,6 +1665,11 @@ const doAggregatedTrading = async (clobClient: ClobClient, aggregatedTrades: Agg
                 lockConditionAsset(agg.conditionId, buyTargetAsset);
             }
             if (actualSide === 'BUY') {
+                touchReconcileTraderExitGrace(
+                    agg.conditionId,
+                    tradedAsset,
+                    ENV.POSITION_RECONCILE_TRADER_EXIT_GRACE_MS
+                );
                 for (const tr of agg.trades) {
                     const perTradeCost =
                         agg.totalUsdcSize > 0 ? executedUsdc * (tr.usdcSize / agg.totalUsdcSize) : 0;
@@ -1331,7 +1678,9 @@ const doAggregatedTrading = async (clobClient: ClobClient, aggregatedTrades: Agg
                         agg.conditionId,
                         tradedAsset,
                         tr.title || tr.slug || agg.slug || '',
-                        perTradeCost
+                        perTradeCost,
+                        copyMode,
+                        agg.userAddress
                     );
                 }
             }
@@ -1344,6 +1693,10 @@ const doAggregatedTrading = async (clobClient: ClobClient, aggregatedTrades: Agg
                 actualSide === 'BUY'
                     ? baseUsd + executedUsdc
                     : Math.max(0, baseUsd - executedUsdc)
+            );
+        } else {
+            Logger.warning(
+                `[跟单重试] 聚合组成交额为 0，保持 botExcutedTime=0 以便重试 | condition=${agg.conditionId.slice(0, 10)}...`
             );
         }
 
@@ -1407,6 +1760,8 @@ let isRunning = true;
 // Non-blocking auto profit exit loop (runs in background timer)
 let autoProfitExitTimer: ReturnType<typeof setInterval> | undefined;
 let autoProfitExitInFlight = false;
+let positionsBackgroundRefreshTimer: ReturnType<typeof setInterval> | undefined;
+let positionsBackgroundRefreshInFlight = false;
 
 /**
  * Stop the trade executor gracefully
@@ -1417,6 +1772,10 @@ export const stopTradeExecutor = () => {
     if (autoProfitExitTimer) {
         clearInterval(autoProfitExitTimer);
         autoProfitExitTimer = undefined;
+    }
+    if (positionsBackgroundRefreshTimer) {
+        clearInterval(positionsBackgroundRefreshTimer);
+        positionsBackgroundRefreshTimer = undefined;
     }
 };
 
@@ -1452,6 +1811,23 @@ const tradeExecutor = async (clobClient: ClobClient) => {
         }, tickMs);
         Logger.info(
             `🧠 已启动自动止盈止损后台检查线程：每 ${tickMs}ms 检查一次（非阻塞）`
+        );
+    }
+    if (ENV.POSITIONS_BACKGROUND_REFRESH_INTERVAL_MS > 0) {
+        const prMs = ENV.POSITIONS_BACKGROUND_REFRESH_INTERVAL_MS;
+        positionsBackgroundRefreshTimer = setInterval(() => {
+            if (!isRunning || positionsBackgroundRefreshInFlight) return;
+            positionsBackgroundRefreshInFlight = true;
+            refreshPositionsForCopyWatchers()
+                .catch((e) => {
+                    Logger.warning(`⚠️ 持仓后台刷新失败：${e}`);
+                })
+                .finally(() => {
+                    positionsBackgroundRefreshInFlight = false;
+                });
+        }, prMs);
+        Logger.info(
+            `📡 持仓后台异步刷新：每 ${prMs}ms 拉取代理+交易员最新 positions（Node 异步 I/O，与主循环并行；非 OS 多线程）`
         );
     }
     if (ENV.TRADE_AGGREGATION_ENABLED) {

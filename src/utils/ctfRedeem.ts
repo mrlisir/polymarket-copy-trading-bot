@@ -10,6 +10,35 @@ const CTF_ABI = [
 const ERC20_ABI = ['function balanceOf(address owner) view returns (uint256)'];
 
 /**
+ * 赎回交易由 PRIVATE_KEY 对应地址支付 Polygon gas（MATIC），与 PROXY_WALLET / USDC 余额无关。
+ * 在批量赎回前调用可避免连续 INSUFFICIENT_FUNDS 刷屏。
+ */
+export const assertPolygonGasForRedeem = async (): Promise<boolean> => {
+    const provider = new ethers.providers.JsonRpcProvider(ENV.RPC_URL);
+    const wallet = new ethers.Wallet(ENV.PRIVATE_KEY, provider);
+    const bal = await provider.getBalance(wallet.address);
+    const human = ethers.utils.formatEther(bal);
+    const proxy = (ENV.PROXY_WALLET || '').trim();
+    const proxyHint =
+        proxy && wallet.address.toLowerCase() !== proxy.toLowerCase()
+            ? ` PROXY_WALLET（${proxy.slice(0, 8)}…）为 Polymarket 交易/持仓地址，链上 redeem 的 gas 仍由 PRIVATE_KEY 地址 ${wallet.address} 支付。`
+            : '';
+    if (bal.isZero()) {
+        Logger.warning(
+            `[赎回] 无法发交易：签名地址 MATIC=0（${wallet.address}）。请向该地址转入 Polygon MATIC 作为 gas；与 USDC 多少无关。${proxyHint}`
+        );
+        return false;
+    }
+    const softMin = ethers.utils.parseEther('0.05');
+    if (bal.lt(softMin)) {
+        Logger.warning(
+            `[赎回] 签名地址 MATIC 仅 ${human}，单笔 redeem 在网络拥堵时可能仍报 gas 不足；建议保持 ≥0.1 MATIC。${proxyHint}`
+        );
+    }
+    return true;
+};
+
+/**
  * On-chain redeem for a Polymarket condition (same pattern as npm run redeem-resolved).
  * Resolves winning/losing outcome tokens into USDC after market settlement.
  */
@@ -17,6 +46,13 @@ export const redeemPolymarketCondition = async (conditionId: string): Promise<bo
     try {
         const provider = new ethers.providers.JsonRpcProvider(ENV.RPC_URL);
         const wallet = new ethers.Wallet(ENV.PRIVATE_KEY, provider);
+        const maticBal = await provider.getBalance(wallet.address);
+        if (maticBal.isZero()) {
+            Logger.warning(
+                `[赎回] 跳过 condition ${conditionId.slice(0, 12)}…：签名地址 ${wallet.address} MATIC=0，无法付 gas。`
+            );
+            return false;
+        }
         const ctfContract = new ethers.Contract(CTF_CONTRACT_ADDRESS, CTF_ABI, wallet);
         const usdcContract = new ethers.Contract(ENV.USDC_CONTRACT_ADDRESS, ERC20_ABI, provider);
 

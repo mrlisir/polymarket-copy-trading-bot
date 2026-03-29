@@ -40,3 +40,11 @@ export const fetchPositionsForUser = async (
 /** 强制拉最新持仓（例如 curPrice 强制刷新） */
 export const fetchPositionsForUserForce = (user: string): Promise<unknown[]> =>
     fetchPositionsForUser(user, { force: true });
+
+/**
+ * 后台刷新：代理钱包 + 所有跟单交易员（强制绕过 TTL），与跟单主循环并行（Node 异步 I/O，非 OS 多线程）。
+ */
+export const refreshPositionsForCopyWatchers = async (): Promise<void> => {
+    const users = [ENV.PROXY_WALLET, ...ENV.USER_ADDRESSES];
+    await Promise.all(users.map((u) => fetchPositionsForUserForce(u)));
+};

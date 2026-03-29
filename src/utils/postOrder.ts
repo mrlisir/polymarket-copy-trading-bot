@@ -10,17 +10,18 @@ import {
     outcomeLabelForAsset,
     resolveReverseAssetForCondition,
 } from './conditionTokens';
-import { notifyOrderSuccess } from './emailNotifier';
+import { notifyOrderSuccess, notifyPositionClear } from './emailNotifier';
 import { fetchPositionsForUser } from './dataApiCache';
 import { resolveCopyOutcomeLabels } from './copyOutcomeLabels';
 import { normalizeClobAssetId } from './clobIds';
 import { fetchClobLightPriceUsdCached } from './clobPublicPrice';
 import { formatTraderDisplayName, recordCopyTrackingFill } from '../services/copyTrackingService';
+import { setReverseCopyBuyPause } from './reverseCopyBuyPause';
 
 // Orderbook caching (reduce getOrderBook API load & 404 spam) — 读 ENV.* 以支持 .env 热更新
 
-/** 邮件：跟单模式 + outcome 文案（依赖交易员 positions，失败时降级） */
-const buildEmailNotifyExtras = async (
+/** 邮件：跟单模式 + outcome 文案（依赖交易员 positions，失败时降级）；dry run 与实盘共用 */
+export const buildEmailNotifyExtras = async (
     trade: UserActivityInterface,
     userAddress: string
 ): Promise<{
@@ -443,6 +444,20 @@ const postOrder = async (
             currentDailyVolume
         );
 
+        if (
+            isReverseForUser(userAddress) &&
+            ENV.COPY_REVERSE_PAUSE_NEW_BUYS_UNTIL_TRADER_FLAT &&
+            orderCalc.positionLimitReached &&
+            trade.conditionId
+        ) {
+            setReverseCopyBuyPause({
+                conditionId: trade.conditionId,
+                myAsset: tradeAsset,
+                monitorTraderAsset: normalizeClobAssetId(trade.asset),
+                reason: 'POSITION_MAX',
+            });
+        }
+
         // Log the calculation reason with daily volume detail
         if (orderCalc.dailyVolumeStatus) {
             const dvs = orderCalc.dailyVolumeStatus;
@@ -450,9 +465,12 @@ const postOrder = async (
                 Logger.warning(
                     `⛔ 每日限额已用完: $${dvs.used.toFixed(2)} / $${dvs.limit.toFixed(2)} — 跳过交易`
                 );
-            } else if (orderCalc.finalAmount === 0) {
+            } else if (
+                orderCalc.finalAmount === 0 &&
+                dvs.remaining < ENV.COPY_STRATEGY_CONFIG.minOrderSizeUSD
+            ) {
                 Logger.warning(
-                    `⛔ 每日限额即将耗尽: $${dvs.remaining.toFixed(2)} 剩余金额不足最小交易额 — 跳过`
+                    `⛔ 今日剩余额度 $${dvs.remaining.toFixed(2)} 小于最小单笔 $${ENV.COPY_STRATEGY_CONFIG.minOrderSizeUSD.toFixed(2)} — 无法下单`
                 );
             }
         }
@@ -687,14 +705,9 @@ const postOrder = async (
         return totalSpentUsdc;
     } else if (condition === 'sell') {
         //Sell strategy
-        // In REVERSE mode, 'sell' means trader bought → we sell our opposite position
+        // REVERSE: 交易员 SELL → 我卖出 oppositeAsset；FOLLOW: 与交易员同资产卖出
         Logger.info('正在执行卖出策略...');
         let remaining = 0;
-        if (!my_position) {
-            Logger.warning('无可卖出的持仓');
-            await UserActivity.updateOne({ _id: trade._id }, { bot: true });
-            return 0;
-        }
 
         if (isReverseForUser(userAddress) && trade.conditionId) {
             const resolved = await resolveReverseAssetForCondition(
@@ -724,6 +737,36 @@ const postOrder = async (
             return 0;
         }
 
+        // 卖出前刷新代理钱包持仓，避免上一笔成交后 positions API 滞后导致同方向连续超卖
+        let positionForSell: UserPositionInterface | undefined;
+        try {
+            const freshList = (await fetchPositionsForUser(ENV.PROXY_WALLET)) as UserPositionInterface[];
+            positionForSell = freshList.find(
+                (p) =>
+                    p.conditionId === trade.conditionId &&
+                    normalizeClobAssetId(p.asset) === sellAsset
+            );
+        } catch {
+            positionForSell = undefined;
+        }
+        if (!positionForSell) {
+            if (
+                my_position &&
+                my_position.conditionId === trade.conditionId &&
+                normalizeClobAssetId(my_position.asset) === sellAsset
+            ) {
+                positionForSell = my_position;
+                Logger.warning(
+                    '⚠️ 卖出前刷新持仓失败或未返回该 token，暂用调用方传入的持仓快照（可能略滞后）'
+                );
+            }
+        }
+        if (!positionForSell || positionForSell.size < MIN_ORDER_SIZE_TOKENS) {
+            Logger.warning('无可卖出的持仓（刷新后无该 token 或已低于最小可卖）');
+            await UserActivity.updateOne({ _id: trade._id }, { bot: true });
+            return 0;
+        }
+
         // Get all previous BUY trades for this asset to calculate total bought
         // In REVERSE mode: query by sellAsset (the opposite token we bought)
         // In FOLLOW mode: query by trade.asset (the same token as trader)
@@ -748,7 +791,10 @@ const postOrder = async (
 
         if (!user_position) {
             // Trader sold entire position - we sell entire position too
-            remaining = my_position.size;
+            remaining = positionForSell.size;
+            if (totalBoughtTokens > 0) {
+                remaining = Math.min(remaining, totalBoughtTokens);
+            }
             Logger.info(
                 `Trader closed entire position → Selling all your ${remaining.toFixed(2)} tokens`
             );
@@ -758,7 +804,7 @@ const postOrder = async (
             const trader_position_before = user_position.size + trade.size;
 
             Logger.info(
-                `持仓对比: 交易员有 ${trader_position_before.toFixed(2)} 个代币，您有 ${my_position.size.toFixed(2)} 个代币`
+                `持仓对比: 交易员有 ${trader_position_before.toFixed(2)} 个代币，您有 ${positionForSell.size.toFixed(2)} 个代币`
             );
             Logger.info(
                 `交易员卖出: ${trade.size.toFixed(2)} 个代币 (占其仓位的 ${(trader_sell_percent * 100).toFixed(2)}%)`
@@ -772,9 +818,9 @@ const postOrder = async (
                     `Calculating from tracked purchases: ${totalBoughtTokens.toFixed(2)} × ${(trader_sell_percent * 100).toFixed(2)}% = ${baseSellSize.toFixed(2)} tokens`
                 );
             } else {
-                baseSellSize = my_position.size * trader_sell_percent;
+                baseSellSize = positionForSell.size * trader_sell_percent;
                 Logger.warning(
-                    `未找到追踪购买记录，使用当前持仓: ${my_position.size.toFixed(2)} × ${(trader_sell_percent * 100).toFixed(2)}% = ${baseSellSize.toFixed(2)} 个代币`
+                    `未找到追踪购买记录，使用当前持仓: ${positionForSell.size.toFixed(2)} × ${(trader_sell_percent * 100).toFixed(2)}% = ${baseSellSize.toFixed(2)} 个代币`
                 );
             }
 
@@ -785,6 +831,16 @@ const postOrder = async (
             if (multiplier !== 1.0) {
                 Logger.info(
                     `应用 ${multiplier}x 乘数 (基于交易员 $${trade.usdcSize.toFixed(2)} 订单): ${baseSellSize.toFixed(2)} → ${remaining.toFixed(2)} 个代币`
+                );
+            }
+        }
+
+        if (totalBoughtTokens > 0) {
+            const beforeCap = remaining;
+            remaining = Math.min(remaining, totalBoughtTokens);
+            if (beforeCap > remaining + 1e-9) {
+                Logger.info(
+                    `📎 卖出数量已限制为剩余追踪持仓 ${remaining.toFixed(2)} tokens（避免超过 myBoughtSize 合计）`
                 );
             }
         }
@@ -800,12 +856,12 @@ const postOrder = async (
         }
 
         // Cap sell amount to available position size
-        if (remaining > my_position.size) {
+        if (remaining > positionForSell.size) {
             Logger.warning(
-                `⚠️  计算卖出数量 ${remaining.toFixed(2)} 个代币 > 您的持仓 ${my_position.size.toFixed(2)} 个代币`
+                `⚠️  计算卖出数量 ${remaining.toFixed(2)} 个代币 > 您的持仓 ${positionForSell.size.toFixed(2)} 个代币`
             );
-            Logger.warning(`已限制为最大可用数量: ${my_position.size.toFixed(2)} 个代币`);
-            remaining = my_position.size;
+            Logger.warning(`已限制为最大可用数量: ${positionForSell.size.toFixed(2)} 个代币`);
+            remaining = positionForSell.size;
         }
 
         let retry = 0;
@@ -946,6 +1002,16 @@ const postOrder = async (
                 Logger.info(
                     `🧹 已清除购买追踪记录 (卖出持仓的 ${(sellPercentage * 100).toFixed(1)}%)`
                 );
+                await notifyPositionClear({
+                    runMode: 'LIVE',
+                    reasonCode: 'COPY_SELL_TRACKED_CLEARED',
+                    marketTitle: trade.title || trade.slug,
+                    conditionId: trade.conditionId,
+                    tokenId: sellAsset,
+                    detailZh: `跟单卖出后已卖出追踪持仓的 ${(sellPercentage * 100).toFixed(1)}%，Mongo 中该 condition 的 myBoughtSize 已清零。`,
+                    soldTokens: totalSoldTokens,
+                    proceedsUsd: totalSoldUsdc,
+                });
             } else {
                 // Partial sell - reduce tracked purchases proportionally
                 for (const buy of previousBuys) {
@@ -974,7 +1040,7 @@ const postOrder = async (
             await UserActivity.updateOne({ _id: trade._id }, { bot: true });
         }
         if (totalSoldTokens > 0 && onSellSummary) {
-            const realizedPnlUsd = totalSoldUsdc - totalSoldTokens * my_position.avgPrice;
+            const realizedPnlUsd = totalSoldUsdc - totalSoldTokens * positionForSell.avgPrice;
             await onSellSummary({
                 soldTokens: totalSoldTokens,
                 proceedsUsd: totalSoldUsdc,
@@ -984,7 +1050,7 @@ const postOrder = async (
         if (ENV.COPY_TRACKING_ENABLED && totalSoldUsdc > 0) {
             const extras = await buildEmailNotifyExtras(trade, userAddress);
             const realizedPnlUsd =
-                totalSoldTokens > 0 ? totalSoldUsdc - totalSoldTokens * my_position.avgPrice : undefined;
+                totalSoldTokens > 0 ? totalSoldUsdc - totalSoldTokens * positionForSell.avgPrice : undefined;
             await recordCopyTrackingFill({
                 runMode: 'live',
                 traderAddress: userAddress,

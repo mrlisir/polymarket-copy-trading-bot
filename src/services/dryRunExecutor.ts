@@ -11,11 +11,15 @@ import {
     copyModeEnvColumnHint,
 } from '../config/copyStrategy';
 import { UserPositionInterface } from '../interfaces/User';
-import { fetchPositionsForUser, fetchPositionsForUserForce } from '../utils/dataApiCache';
+import {
+    fetchPositionsForUser,
+    fetchPositionsForUserForce,
+    refreshPositionsForCopyWatchers,
+} from '../utils/dataApiCache';
 import fetchData from '../utils/fetchData';
 import Logger from '../utils/logger';
 import { getCurPriceForAsset, refreshCurPriceMap } from '../utils/positionValuation';
-import { fetchOrderBookCached } from '../utils/postOrder';
+import { buildEmailNotifyExtras, fetchOrderBookCached } from '../utils/postOrder';
 import { resolveTokenMarkUsd } from '../utils/tokenMark';
 import {
     RECONCILE_MIN_SELL_TOKENS,
@@ -25,28 +29,46 @@ import {
     copyModeForReconcileTraders,
     getMirrorAssetForReconcile,
     isMarketResolved,
+    isReconcileTraderExitInGrace,
     loadCopiedConditionTraders,
     positionKey,
+    touchReconcileTraderExitGrace,
 } from './positionReconciliationCore';
 import { fetchGammaSettlementInfoCached, gammaTokenLooksSettled } from '../utils/gammaSettlement';
 import { resolveCopyOutcomeLabels } from '../utils/copyOutcomeLabels';
 import { normalizeClobAssetId } from '../utils/clobIds';
 import { formatTraderDisplayName, recordCopyTrackingFill } from './copyTrackingService';
 import { formatBeijingDateTime } from '../utils/time';
-import { notifyCopyRiskStop } from '../utils/emailNotifier';
+import {
+    notifyAutoProfitExit,
+    notifyCopyRiskStop,
+    notifyOrderSuccess,
+    notifyPositionClear,
+    notifyReverseTraderSellSkipped,
+} from '../utils/emailNotifier';
+import {
+    evaluateReverseBuyPauseSkip,
+    setReverseCopyBuyPause,
+    setReverseCopyBuyPauseAfterAutoExit,
+} from '../utils/reverseCopyBuyPause';
 import { isRetryableTransientError, transientBackoffMs, sleep } from '../utils/transientErrors';
 import {
     estimateSellProceedsFromBids,
     estimateSellPnlPctFromBids,
     formatTpSlThresholdsZh,
-    getPercentPnlFromAvgAndPx,
     makePositionKey,
+    resolvePercentPnlForProfitExit,
     resolveRefAvgPriceForExit,
     shouldTriggerProfitExit,
 } from '../utils/profitExit';
 
 // Match postOrder.ts: minimum sell size in outcome tokens
 const MIN_ORDER_SIZE_TOKENS = 1.0;
+
+const maskAddrForMailDry = (a?: string): string | undefined => {
+    if (!a) return undefined;
+    return a.length >= 12 ? `${a.slice(0, 6)}...${a.slice(-4)}` : a;
+};
 
 /**
  * Fetch the opposite asset ID for a given conditionId and current asset.
@@ -219,8 +241,8 @@ interface SimulatedPosition {
     mergeable?: boolean;
 }
 
-// Simulated position key: "conditionId:asset" to handle YES + NO sides independently
-const posKey = (conditionId: string, asset: string) => `${conditionId}:${asset}`;
+// 与 makePositionKey 一致（含 normalizeClobAssetId），否则 AUTO EXIT 的 watch 与模拟持仓 key 对不上
+const posKey = (conditionId: string, asset: string) => makePositionKey(conditionId, asset);
 
 interface OrderBookEntry {
     price: string;
@@ -247,17 +269,26 @@ type DryProfitExitWatch = {
     registeredAt: number;
     lastMissingLogAt: number;
     lastExitAttemptAt: number;
+    copyMode?: CopyMode;
+    traderAddress?: string;
+    positionFlatSince?: number;
 };
 
 const dryProfitExitWatchesByPositionKey: Map<string, DryProfitExitWatch> = new Map();
 let lastDryProfitExitCheckAt = 0;
+
+const removeDryProfitExitWatch = (positionKey: string): void => {
+    dryProfitExitWatchesByPositionKey.delete(positionKey);
+};
 
 const registerDryProfitExitWatch = (
     txHash: string | undefined,
     conditionId: string,
     asset: string,
     marketTitle: string,
-    executedUsdc: number
+    executedUsdc: number,
+    copyMode?: CopyMode,
+    traderAddress?: string
 ): void => {
     if (!ENV.AUTO_PROFIT_EXIT_ENABLED) return;
     if (!txHash) return;
@@ -271,6 +302,19 @@ const registerDryProfitExitWatch = (
             existing.trackedCostBasisUsd += executedUsdc;
         }
         if (!existing.marketTitle && marketTitle) existing.marketTitle = marketTitle;
+        if (copyMode === CopyMode.REVERSE) {
+            existing.copyMode = CopyMode.REVERSE;
+        }
+        if (traderAddress) {
+            if (!existing.traderAddress) {
+                existing.traderAddress = traderAddress;
+            } else if (existing.traderAddress.toLowerCase() !== traderAddress.toLowerCase()) {
+                Logger.warning(
+                    `[AUTO EXIT DRYRUN] 同一 condition+asset 出现不同交易员地址，平仓后将无法归因熔断，已清空 traderAddress`
+                );
+                existing.traderAddress = undefined;
+            }
+        }
         return;
     }
 
@@ -290,6 +334,8 @@ const registerDryProfitExitWatch = (
         registeredAt: Date.now(),
         lastMissingLogAt: 0,
         lastExitAttemptAt: 0,
+        copyMode: copyMode === CopyMode.REVERSE ? CopyMode.REVERSE : undefined,
+        traderAddress: traderAddress || undefined,
     });
 };
 
@@ -332,7 +378,14 @@ const maybeAutoProfitExitDryRun = async (clobClient: ClobClient): Promise<void> 
         const pos = simulatedByKey.get(positionKey);
         const size = pos?.size || 0;
 
+        if (pos && size > 0) {
+            watch.positionFlatSince = undefined;
+        }
+
         if (!pos || size <= 0) {
+            if (!watch.positionFlatSince) {
+                watch.positionFlatSince = now;
+            }
             if (now - watch.lastMissingLogAt > 5000) {
                 watch.lastMissingLogAt = now;
                 Logger.info(
@@ -345,8 +398,43 @@ const maybeAutoProfitExitDryRun = async (clobClient: ClobClient): Promise<void> 
                 );
             }
 
-            // Grace period: avoid race where tracked BUY isn't written yet.
             const trackingGraceMs = Math.max(5000, ENV.AUTO_PROFIT_EXIT_CHECK_INTERVAL_MS * 5);
+            const flatClearMs = Math.max(5000, ENV.AUTO_PROFIT_EXIT_FLAT_CLEAR_MS || 90000);
+            if (
+                now - watch.registeredAt >= trackingGraceMs &&
+                watch.positionFlatSince &&
+                now - watch.positionFlatSince >= flatClearMs
+            ) {
+                Logger.warning(
+                    `🛑 [AUTO EXIT DRYRUN] 模拟仓已无该持仓 ≥${flatClearMs}ms，停止 AUTO EXIT 监控并清理 tracked BUY | market=${
+                        watch.marketTitle || ''
+                    } | condition=${watch.conditionId.slice(0, 10)}... asset=${watch.asset.slice(0, 12)}...`
+                );
+                for (const traderAddr of ENV.USER_ADDRESSES) {
+                    const Model = getUserActivityModel(traderAddr);
+                    await Model.updateMany(
+                        {
+                            conditionId: watch.conditionId,
+                            $or: [{ asset: watch.asset }, { oppositeAsset: watch.asset }],
+                            side: 'BUY',
+                            bot: true,
+                            myBoughtSize: { $exists: true, $gt: 0 },
+                        },
+                        { $set: { myBoughtSize: 0 } }
+                    );
+                }
+                removeDryProfitExitWatch(positionKey);
+                await notifyPositionClear({
+                    runMode: 'DRYRUN',
+                    reasonCode: 'DRYRUN_AUTO_EXIT_FLAT',
+                    marketTitle: watch.marketTitle,
+                    conditionId: watch.conditionId,
+                    tokenId: watch.asset,
+                    detailZh: `模拟仓已无该持仓 ≥${flatClearMs}ms，已停止 AUTO EXIT 并清理 Mongo tracked BUY。`,
+                });
+                continue;
+            }
+
             if (now - watch.registeredAt >= trackingGraceMs) {
                 try {
                     const trackedStillExists = await hasAnyTrackedBuy(watch.conditionId, watch.asset);
@@ -359,7 +447,15 @@ const maybeAutoProfitExitDryRun = async (clobClient: ClobClient): Promise<void> 
                                 12
                             )}...`
                         );
-                        dryProfitExitWatchesByPositionKey.delete(positionKey);
+                        removeDryProfitExitWatch(positionKey);
+                        await notifyPositionClear({
+                            runMode: 'DRYRUN',
+                            reasonCode: 'AUTO_EXIT_WATCH_STOP_NO_TRACKED',
+                            marketTitle: watch.marketTitle,
+                            conditionId: watch.conditionId,
+                            tokenId: watch.asset,
+                            detailZh: '模拟侧无持仓且 tracked BUY 已清零，停止 AUTO EXIT 监控。',
+                        });
                     }
                 } catch {
                     // keep watch
@@ -370,7 +466,7 @@ const maybeAutoProfitExitDryRun = async (clobClient: ClobClient): Promise<void> 
 
         const pxUsedRaw = await getValuationPriceUsd(pos.asset, clobClient, pos.conditionId);
         const pxUsed = pxUsedRaw > 0 ? pxUsedRaw : pos.avgPrice;
-        const percentPnl = getPercentPnlFromAvgAndPx(pos.avgPrice, pxUsed);
+        const percentPnl = resolvePercentPnlForProfitExit({ ...pos, curPrice: pxUsed });
         if (percentPnl == null) continue;
 
         const { triggered, reason } = shouldTriggerProfitExit({
@@ -415,12 +511,20 @@ const maybeAutoProfitExitDryRun = async (clobClient: ClobClient): Promise<void> 
             const bids = preloadedOrderBook?.bids || [];
             if (watch.trackedCostBasisUsd > 0) {
                 const estimate = estimateSellProceedsFromBids({ size, bids });
-                const requiredProceeds = watch.trackedCostBasisUsd * (1 + takeProfitPct / 100);
+                const notion =
+                    Number.isFinite(pos.size) &&
+                    Number.isFinite(pos.avgPrice) &&
+                    pos.size > 0 &&
+                    pos.avgPrice > 0
+                        ? pos.size * pos.avgPrice
+                        : 0;
+                const basisUsd = Math.max(watch.trackedCostBasisUsd, notion);
+                const requiredProceeds = basisUsd * (1 + takeProfitPct / 100);
                 if (!estimate || estimate.proceeds < requiredProceeds) {
                     Logger.warning(
                         `⏭️ [AUTO EXIT DRYRUN] 跳过止盈执行：预估可成交额≈$${estimate ? estimate.proceeds.toFixed(2) : 'n/a'} < 目标止盈额≈$${requiredProceeds.toFixed(
                             2
-                        )}（投入≈$${watch.trackedCostBasisUsd.toFixed(2)}，TP=${takeProfitPct.toFixed(2)}%） | market=${watch.marketTitle || ''} | condition=${watch.conditionId.slice(
+                        )}（成本基准≈$${basisUsd.toFixed(2)} = max(本地投入,size×均价)，TP=${takeProfitPct.toFixed(2)}%） | market=${watch.marketTitle || ''} | condition=${watch.conditionId.slice(
                             0,
                             10
                         )}... asset=${watch.asset.slice(0, 12)}...`
@@ -481,22 +585,31 @@ const maybeAutoProfitExitDryRun = async (clobClient: ClobClient): Promise<void> 
                 sold >= pos.size * 0.95
             ) {
                 // 记录一次“自动止盈止损平仓”到成交流水，方便在 copy-tracking-export 做复盘
-                const avgPrice = pos.avgPrice;
-                const realizedPnlUsd =
-                    Number.isFinite(avgPrice) && avgPrice !== undefined
-                        ? proceeds - sold * (avgPrice as number)
+                const apiAvg =
+                    typeof pos.avgPrice === 'number' && Number.isFinite(pos.avgPrice) && pos.avgPrice > 0
+                        ? pos.avgPrice
                         : undefined;
+                const costPxForPnl = refAvgPrice > 0 ? refAvgPrice : apiAvg;
+                const realizedPnlUsd =
+                    costPxForPnl !== undefined && sold > 0 ? proceeds - sold * costPxForPnl : undefined;
                 const autoExitType =
                     percentPnl >= ENV.AUTO_PROFIT_EXIT_TAKE_PROFIT_PCT ? 'TAKE_PROFIT' : 'STOP_LOSS';
                 const traderTxHash = Array.from(watch.txHashes)[0];
+                const riskPnl =
+                    realizedPnlUsd !== undefined && Number.isFinite(realizedPnlUsd) ? realizedPnlUsd : 0;
+                if (watch.traderAddress) {
+                    await handleDryRiskAfterSell(watch.traderAddress, riskPnl);
+                }
                 await recordCopyTrackingFill({
                     runMode: 'dryrun',
-                    traderAddress: 'auto_profit_exit',
-                    traderDisplayName: 'AUTO_PROFIT_EXIT',
+                    traderAddress: watch.traderAddress || 'auto_profit_exit',
+                    traderDisplayName: watch.traderAddress
+                        ? formatTraderDisplayName({}, watch.traderAddress)
+                        : 'AUTO_PROFIT_EXIT',
                     marketTitle: watch.marketTitle || '',
                     slug: '',
                     conditionId: watch.conditionId,
-                    copyMode: CopyMode.FOLLOW,
+                    copyMode: watch.copyMode ?? CopyMode.FOLLOW,
                     traderSide: 'BUY',
                     mySide: 'SELL',
                     traderAsset: watch.asset,
@@ -510,12 +623,63 @@ const maybeAutoProfitExitDryRun = async (clobClient: ClobClient): Promise<void> 
                     autoExitPercentPnl: percentPnl,
                 });
                 simulatedPositions.delete(posKey(pos.conditionId, pos.asset));
-                dryProfitExitWatchesByPositionKey.delete(positionKey);
+                removeDryProfitExitWatch(positionKey);
+                if (watch.copyMode === CopyMode.REVERSE && ENV.COPY_REVERSE_PAUSE_NEW_BUYS_UNTIL_TRADER_FLAT) {
+                    await setReverseCopyBuyPauseAfterAutoExit({
+                        conditionId: watch.conditionId,
+                        myAsset: watch.asset,
+                    });
+                }
+                const exitFullDry =
+                    remaining < ENV.AUTO_PROFIT_EXIT_CLEAR_WHEN_REMAINING_LT_TOKENS ||
+                    sold >= pos.size * 0.95;
+                await notifyAutoProfitExit({
+                    runMode: 'DRYRUN',
+                    kind: isTakeProfit ? 'TAKE_PROFIT' : 'STOP_LOSS',
+                    marketTitle: watch.marketTitle || '',
+                    conditionId: watch.conditionId,
+                    tokenId: watch.asset,
+                    soldTokens: sold,
+                    proceedsUsd: proceeds,
+                    plannedSize: size,
+                    remainingTokens: remaining,
+                    exitFull: exitFullDry,
+                    realizedPnlUsd,
+                    percentPnlAtTrigger: percentPnl,
+                    triggerReason: reason,
+                    copyMode: watch.copyMode === CopyMode.REVERSE ? 'REVERSE' : 'FOLLOW',
+                    traderMask: maskAddrForMailDry(watch.traderAddress),
+                });
             } else {
                 const updated = simulatedPositions.get(posKey(pos.conditionId, pos.asset));
                 if (updated) {
                     updated.size = updated.size - sold;
                 }
+                const costPxPart =
+                    refAvgPrice > 0
+                        ? refAvgPrice
+                        : typeof pos.avgPrice === 'number' && Number.isFinite(pos.avgPrice) && pos.avgPrice > 0
+                          ? pos.avgPrice
+                          : undefined;
+                const realizedPartial =
+                    costPxPart !== undefined ? proceeds - sold * costPxPart : undefined;
+                await notifyAutoProfitExit({
+                    runMode: 'DRYRUN',
+                    kind: isTakeProfit ? 'TAKE_PROFIT' : 'STOP_LOSS',
+                    marketTitle: watch.marketTitle || '',
+                    conditionId: watch.conditionId,
+                    tokenId: watch.asset,
+                    soldTokens: sold,
+                    proceedsUsd: proceeds,
+                    plannedSize: size,
+                    remainingTokens: remaining,
+                    exitFull: false,
+                    realizedPnlUsd: realizedPartial,
+                    percentPnlAtTrigger: percentPnl,
+                    triggerReason: reason,
+                    copyMode: watch.copyMode === CopyMode.REVERSE ? 'REVERSE' : 'FOLLOW',
+                    traderMask: maskAddrForMailDry(watch.traderAddress),
+                });
             }
         } else {
             // No orderbook/bids: mimic live behavior.
@@ -526,7 +690,24 @@ const maybeAutoProfitExitDryRun = async (clobClient: ClobClient): Promise<void> 
                 const proceeds = pos.size * pxUsed;
                 simulatedBalance += proceeds;
                 simulatedPositions.delete(posKey(pos.conditionId, pos.asset));
-                dryProfitExitWatchesByPositionKey.delete(positionKey);
+                removeDryProfitExitWatch(positionKey);
+                if (watch.copyMode === CopyMode.REVERSE && ENV.COPY_REVERSE_PAUSE_NEW_BUYS_UNTIL_TRADER_FLAT) {
+                    await setReverseCopyBuyPauseAfterAutoExit({
+                        conditionId: watch.conditionId,
+                        myAsset: watch.asset,
+                    });
+                }
+                await notifyPositionClear({
+                    runMode: 'DRYRUN',
+                    reasonCode: 'AUTO_EXIT_REDEEMABLE_NO_BID',
+                    marketTitle: watch.marketTitle,
+                    conditionId: watch.conditionId,
+                    tokenId: watch.asset,
+                    detailZh:
+                        'Dry Run：AUTO EXIT 触发但无买盘，按可赎回/合并处理并删除模拟仓与 watch。',
+                    proceedsUsd: proceeds,
+                    soldTokens: pos.size,
+                });
             } else {
                 Logger.warning(
                     `🔁 [AUTO EXIT DRYRUN] 订单簿短暂缺失，保留跟踪以便冷却后重试：market=${watch.marketTitle || ''} | condition=${watch.conditionId.slice(
@@ -806,7 +987,7 @@ const doDryTrading = async (
         console.log(`  → 跟单方向: ${actualSide} (${trade.asset.slice(0, 12)}...)`);
     }
 
-    const user_positions = (await fetchPositionsForUser(trade.userAddress)) as UserPositionInterface[];
+    const user_positions = (await fetchPositionsForUserForce(trade.userAddress)) as UserPositionInterface[];
     const userPosList = Array.isArray(user_positions) ? user_positions : [];
     const outcomeLabels = resolveCopyOutcomeLabels(copyMode, trade, userPosList);
     console.log(`  📌 交易员 Outcome: ${outcomeLabels.traderOutcome}`);
@@ -835,24 +1016,22 @@ const doDryTrading = async (
             return;
         }
 
-        // 避免临近结束（endDate）买入：市场快结算后流动性经常消失
+        // 避免临近结束（endDate）买入：市场快结算后流动性经常消失（与实盘 tradeExecutor 一致）
         const skipMins = ENV.COPY_SKIP_FOLLOW_IF_ENDS_WITHIN_MINUTES;
-        if (skipMins > 0) {
-            const endTs = traderTargetPosition?.endDate ? Date.parse(traderTargetPosition.endDate) : NaN;
-            if (Number.isFinite(endTs)) {
-                const minutesLeft = (endTs - Date.now()) / 60000;
-                if (minutesLeft >= 0 && minutesLeft < skipMins) {
-                    console.log(
-                        `  ⏭ 跳过跟单：市场即将结束（距离结束 ${minutesLeft.toFixed(
-                            1
-                        )} 分钟 < 阈值 ${skipMins} 分钟）| market=${trade.title || trade.slug || ''} | condition=${trade.conditionId.slice(
-                            0,
-                            10
-                        )}...`
-                    );
-                    console.log('─'.repeat(70));
-                    return;
-                }
+        const endTsDry = traderTargetPosition?.endDate ? Date.parse(traderTargetPosition.endDate) : NaN;
+        if (Number.isFinite(endTsDry)) {
+            const minutesLeft = (endTsDry - Date.now()) / 60000;
+            if (skipMins > 0 && minutesLeft >= 0 && minutesLeft < skipMins) {
+                console.log(
+                    `  ⏭ 跳过跟单：市场即将结束（距离结束 ${minutesLeft.toFixed(
+                        1
+                    )} 分钟 < 阈值 ${skipMins} 分钟）| market=${trade.title || trade.slug || ''} | condition=${trade.conditionId.slice(
+                        0,
+                        10
+                    )}...`
+                );
+                console.log('─'.repeat(70));
+                return;
             }
         }
 
@@ -888,6 +1067,41 @@ const doDryTrading = async (
         }
     }
 
+    if (isReversed && actualSide === 'SELL' && !ENV.COPY_REVERSE_SYNC_TRADER_SELL) {
+        console.log(
+            `  ⏭  反买: COPY_REVERSE_SYNC_TRADER_SELL=false，跳过「交易员卖出 → 我方同步卖出」（与实盘 tradeExecutor 一致）`
+        );
+        await notifyReverseTraderSellSkipped({
+            trader: trade.userAddress,
+            title: trade.title || trade.slug || '',
+            conditionId: trade.conditionId,
+            traderOutcome: outcomeLabels.traderOutcome,
+            myOutcome: outcomeLabels.myOutcome,
+            modeHint: outcomeLabels.modeHint,
+            slug: trade.slug,
+            eventSlug: trade.eventSlug,
+            myTradedTokenId: normalizeClobAssetId(tradeAsset),
+            txHash: trade.transactionHash,
+            traderUsdcSize: trade.usdcSize,
+            traderPrice: trade.price,
+        });
+        console.log('─'.repeat(70));
+        return;
+    }
+
+    if (actualSide === 'BUY' && isReversed) {
+        const pauseDry = evaluateReverseBuyPauseSkip({
+            conditionId: trade.conditionId,
+            myBuyAsset: tradeAsset,
+            traderPositions: userPosList,
+        });
+        if (pauseDry.skip) {
+            console.log(`  ⏭  ${pauseDry.detail}`);
+            console.log('─'.repeat(70));
+            return;
+        }
+    }
+
     // BUY: dollar sizing via calculateOrderSize. SELL: token sizing like live postOrder (do NOT use cash min $1 gate).
     let orderCalc: ReturnType<typeof calculateOrderSize> | null = null;
 
@@ -907,6 +1121,18 @@ const doDryTrading = async (
             currentPositionUsd,
             0
         );
+        if (
+            isReversed &&
+            ENV.COPY_REVERSE_PAUSE_NEW_BUYS_UNTIL_TRADER_FLAT &&
+            orderCalc.positionLimitReached
+        ) {
+            setReverseCopyBuyPause({
+                conditionId: trade.conditionId,
+                myAsset: tradeAsset,
+                monitorTraderAsset: normalizeClobAssetId(trade.asset),
+                reason: 'POSITION_MAX',
+            });
+        }
         console.log(`  计算跟单: $${orderCalc.finalAmount.toFixed(2)} | ${orderCalc.reason}`);
         if (orderCalc.finalAmount === 0) {
             console.log(`  ⏭  跳过: ${orderCalc.reason}`);
@@ -1004,6 +1230,11 @@ const doDryTrading = async (
             );
         }
         setDryConditionBuyLock(trade.conditionId, tradeAsset);
+        touchReconcileTraderExitGrace(
+            trade.conditionId,
+            tradeAsset,
+            ENV.POSITION_RECONCILE_TRADER_EXIT_GRACE_MS
+        );
 
         if (ENV.AUTO_PROFIT_EXIT_ENABLED) {
             registerDryProfitExitWatch(
@@ -1011,7 +1242,9 @@ const doDryTrading = async (
                 trade.conditionId,
                 tradeAsset,
                 trade.title || trade.slug || '',
-                result.spent
+                result.spent,
+                copyMode,
+                trade.userAddress
             );
         }
 
@@ -1034,6 +1267,22 @@ const doDryTrading = async (
                 myTokenDelta: result.tokens,
                 traderTxHash: trade.transactionHash,
                 activityObjectId: trade._id ? String(trade._id) : undefined,
+            });
+        }
+        if (result.spent > 0) {
+            const emailExtrasBuy = await buildEmailNotifyExtras(trade, trade.userAddress);
+            await notifyOrderSuccess({
+                side: 'BUY',
+                dryRun: true,
+                amountUsd: result.spent,
+                tokens: result.tokens,
+                price: result.avgPrice,
+                tokenId: normalizeClobAssetId(tradeAsset),
+                conditionId: trade.conditionId,
+                trader: trade.userAddress,
+                title: trade.title,
+                txHash: trade.transactionHash,
+                ...emailExtrasBuy,
             });
         }
     } else {
@@ -1059,19 +1308,51 @@ const doDryTrading = async (
                 p.conditionId === trade.conditionId && p.asset === trade.asset
         );
 
+        const sellAssetKey = normalizeClobAssetId(tradeAsset);
+        const UADry = getUserActivityModel(trade.userAddress);
+        const previousBuysDry = await UADry.find({
+            conditionId: trade.conditionId,
+            $or: [{ asset: sellAssetKey }, { oppositeAsset: sellAssetKey }],
+            side: 'BUY',
+            bot: true,
+            myBoughtSize: { $exists: true, $gt: 0 },
+        }).exec();
+        const totalBoughtTokensDry = previousBuysDry.reduce(
+            (sum, buy) => sum + (buy.myBoughtSize || 0),
+            0
+        );
+
         let sellTokens: number;
         if (!user_position) {
             sellTokens = existing.size;
+            if (totalBoughtTokensDry > 0) {
+                sellTokens = Math.min(sellTokens, totalBoughtTokensDry);
+            }
             console.log(`  📉 交易员已清仓该方向 → 模拟卖出全部持仓 ${sellTokens.toFixed(4)} tokens`);
         } else {
             const trader_position_before = user_position.size + trade.size;
             const trader_sell_percent = trade.size / trader_position_before;
-            const baseSellSize = existing.size * trader_sell_percent;
+            let baseSellSize: number;
+            if (totalBoughtTokensDry > 0) {
+                baseSellSize = totalBoughtTokensDry * trader_sell_percent;
+                console.log(
+                    `  📉 跟单卖出(与实盘一致，按 myBoughtSize 追踪): 合计 ${totalBoughtTokensDry.toFixed(4)} × ${(trader_sell_percent * 100).toFixed(2)}% → 基准 ${baseSellSize.toFixed(4)} tokens`
+                );
+            } else {
+                baseSellSize = existing.size * trader_sell_percent;
+                console.log(
+                    `  📉 跟单卖出: 我方持仓 ${existing.size.toFixed(4)} × ${(trader_sell_percent * 100).toFixed(2)}% → 基准 ${baseSellSize.toFixed(4)} tokens（无 myBoughtSize 追踪，与 postOrder 无追踪分支一致）`
+                );
+            }
             const multiplier = getTradeMultiplier(ENV.COPY_STRATEGY_CONFIG, trade.usdcSize);
             sellTokens = baseSellSize * multiplier;
             console.log(
-                `  📉 跟单卖出: 我方持仓 ${existing.size.toFixed(4)} × ${(trader_sell_percent * 100).toFixed(2)}% × ${multiplier}x → ${sellTokens.toFixed(4)} tokens`
+                `  📉 乘数 ${multiplier}x → ${sellTokens.toFixed(4)} tokens`
             );
+        }
+
+        if (totalBoughtTokensDry > 0) {
+            sellTokens = Math.min(sellTokens, totalBoughtTokensDry);
         }
 
         if (sellTokens > existing.size) {
@@ -1126,10 +1407,34 @@ const doDryTrading = async (
                 realizedPnlUsd: pnl,
             });
         }
+        if (result.proceeds > 0) {
+            const emailExtrasSell = await buildEmailNotifyExtras(trade, trade.userAddress);
+            await notifyOrderSuccess({
+                side: 'SELL',
+                dryRun: true,
+                amountUsd: result.proceeds,
+                tokens: result.tokens,
+                price: result.avgPrice,
+                tokenId: normalizeClobAssetId(tradeAsset),
+                conditionId: trade.conditionId,
+                trader: trade.userAddress,
+                title: trade.title,
+                txHash: trade.transactionHash,
+                ...emailExtrasSell,
+            });
+        }
 
-            existing.size -= result.tokens;
-            if (existing.size <= 0.0001) {
-                simulatedPositions.delete(myHoldingKey);
+        existing.size -= result.tokens;
+        if (existing.size <= 0.0001) {
+            simulatedPositions.delete(myHoldingKey);
+            if (isReversed && ENV.COPY_REVERSE_PAUSE_NEW_BUYS_UNTIL_TRADER_FLAT) {
+                setReverseCopyBuyPause({
+                    conditionId: trade.conditionId,
+                    myAsset: normalizeClobAssetId(tradeAsset),
+                    monitorTraderAsset: normalizeClobAssetId(trade.asset),
+                    reason: 'COPY_SELL_FLAT',
+                });
+            }
         } else {
             const mark = await getValuationPriceUsd(existing.asset, clobClient, existing.conditionId);
             const pxUsed = mark > 0 ? mark : existing.avgPrice;
@@ -1428,6 +1733,15 @@ const runDryRunPositionReconciliation = async (clobClient: ClobClient): Promise<
         if (pos.size < RECONCILE_MIN_SELL_TOKENS) continue;
 
         if (onTraderExit) {
+            if (
+                ENV.POSITION_RECONCILE_TRADER_EXIT_GRACE_MS > 0 &&
+                isReconcileTraderExitInGrace(pos.conditionId, pos.asset)
+            ) {
+                Logger.info(
+                    `[模拟对账] 跳过「交易员镜像腿已平」（建仓后宽限 ${ENV.POSITION_RECONCILE_TRADER_EXIT_GRACE_MS}ms 内）| ${(pos.title || pos.slug || pos.conditionId).slice(0, 48)}...`
+                );
+                continue;
+            }
             const stillIn = await anyTraderStillInMirror(
                 involved,
                 pos.conditionId,
@@ -1502,6 +1816,8 @@ let isRunning = true;
 // Non-blocking auto profit exit loop (runs in background timer)
 let autoProfitExitDryRunTimer: ReturnType<typeof setInterval> | undefined;
 let autoProfitExitDryRunInFlight = false;
+let positionsBackgroundRefreshDryRunTimer: ReturnType<typeof setInterval> | undefined;
+let positionsBackgroundRefreshDryRunInFlight = false;
 
 export const stopDryRunExecutor = () => {
     isRunning = false;
@@ -1509,6 +1825,10 @@ export const stopDryRunExecutor = () => {
     if (autoProfitExitDryRunTimer) {
         clearInterval(autoProfitExitDryRunTimer);
         autoProfitExitDryRunTimer = undefined;
+    }
+    if (positionsBackgroundRefreshDryRunTimer) {
+        clearInterval(positionsBackgroundRefreshDryRunTimer);
+        positionsBackgroundRefreshDryRunTimer = undefined;
     }
 };
 
@@ -1596,6 +1916,23 @@ const dryRunExecutor = async (clobClient: ClobClient) => {
                 });
         }, tickMs);
         Logger.info(`🧠 已启动自动止盈止损后台检查线程：每 ${tickMs}ms 检查一次（非阻塞）`);
+    }
+    if (ENV.POSITIONS_BACKGROUND_REFRESH_INTERVAL_MS > 0) {
+        const prMs = ENV.POSITIONS_BACKGROUND_REFRESH_INTERVAL_MS;
+        positionsBackgroundRefreshDryRunTimer = setInterval(() => {
+            if (!isRunning || positionsBackgroundRefreshDryRunInFlight) return;
+            positionsBackgroundRefreshDryRunInFlight = true;
+            refreshPositionsForCopyWatchers()
+                .catch((e) => {
+                    Logger.warning(`⚠️ [dryrun] 持仓后台刷新失败：${e}`);
+                })
+                .finally(() => {
+                    positionsBackgroundRefreshDryRunInFlight = false;
+                });
+        }, prMs);
+        Logger.info(
+            `📡 [dryrun] 持仓后台异步刷新：每 ${prMs}ms 拉取代理+交易员最新 positions（与实盘 POSITIONS_BACKGROUND_REFRESH_INTERVAL_MS 一致）`
+        );
     }
 
     let lastCheck = Date.now();

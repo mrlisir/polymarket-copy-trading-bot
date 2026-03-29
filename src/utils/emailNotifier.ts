@@ -5,6 +5,8 @@ import Logger from './logger';
 
 export type NotifyParams = {
     side: 'BUY' | 'SELL';
+    /** 为 true 时主题与正文标注为 Dry Run 模拟（与实盘成交通知区分） */
+    dryRun?: boolean;
     amountUsd?: number;
     tokens?: number;
     price?: number;
@@ -205,6 +207,7 @@ const sendPlainEmail = async ({ subject, text }: PlainMail): Promise<void> => {
 const buildOrderSuccessBody = (params: NotifyParams): string => {
     const now = new Date().toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai', hour12: false });
     const sideZh = params.side === 'BUY' ? '买入' : '卖出';
+    const dryTag = params.dryRun ? '（Dry Run 模拟）' : '';
     const modeEnum = params.copyMode === 'REVERSE' ? CopyMode.REVERSE : CopyMode.FOLLOW;
     const envColumn = copyModeEnvColumnHint(modeEnum);
     const modeZh = params.copyMode === 'REVERSE' ? '反买 (REVERSE)' : '跟方向 (FOLLOW)';
@@ -216,13 +219,19 @@ const buildOrderSuccessBody = (params: NotifyParams): string => {
     const lines: string[] = [
         '══════════════════════════════════════════════════════════════',
         '',
-        `【Polymarket 跟单成交通知】${sideZh} · ${modeZh}`,
+        `【Polymarket 跟单成交通知】${sideZh} · ${modeZh}${dryTag}`,
         '',
         '──────────────── 摘要 ────────────────',
         `• 时间(北京时间): ${now}`,
+        ...(params.dryRun ? ['• 运行模式: Dry Run 模拟（未发送真实链上/CLOB 订单）', ''] : []),
         `• 本笔订单方向: ${params.side}（${sideZh}）`,
         `• 跟单模式: ${modeZh}`,
         `• 对应 .env 配置列: ${envColumn}（该地址只应出现在此列）`,
+        ...(params.side === 'SELL' && params.copyMode === 'REVERSE'
+            ? [
+                  `• 反买卖出: 本笔已同步执行我方卖出（oppositeAsset）；若仅需跟买不跟卖，可设 COPY_REVERSE_SYNC_TRADER_SELL=false。`,
+              ]
+            : []),
         ...(params.modeHint ? [`• 说明: ${params.modeHint}`] : []),
         `• 市场: ${params.title || '-'}`,
         `• 跟单交易员: ${mask(params.trader)}`,
@@ -288,6 +297,108 @@ const buildOrderSuccessBody = (params: NotifyParams): string => {
     return lines.join('\n');
 };
 
+/** 反买模式下因 COPY_REVERSE_SYNC_TRADER_SELL=false 未执行「交易员卖出→我方卖出」时的通知参数 */
+export type ReverseSellSkipParams = {
+    trader: string;
+    title?: string;
+    conditionId?: string;
+    traderOutcome?: string;
+    myOutcome?: string;
+    modeHint?: string;
+    slug?: string;
+    eventSlug?: string;
+    /** 我方本会卖出的 CLOB token（通常为 oppositeAsset） */
+    myTradedTokenId?: string;
+    txHash?: string;
+    traderUsdcSize?: number;
+    traderPrice?: number;
+};
+
+const buildReverseSellSkippedBody = (params: ReverseSellSkipParams): string => {
+    const now = new Date().toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai', hour12: false });
+    const envColumn = copyModeEnvColumnHint(CopyMode.REVERSE);
+    const lines: string[] = [
+        '══════════════════════════════════════════════════════════════',
+        '',
+        '【Polymarket 跟单】反买 · 未同步卖出（配置关闭）',
+        '',
+        '──────────────── 摘要 ────────────────',
+        `• 时间(北京时间): ${now}`,
+        `• 本笔处理: 已跳过执行「卖出」跟单（未向 CLOB 提交卖单）`,
+        `• 跟单模式: 反买 (REVERSE)`,
+        `• 对应 .env 配置列: ${envColumn}`,
+        `• 控制项: COPY_REVERSE_SYNC_TRADER_SELL = false（为 true 时才会在交易员卖出时同步卖出我方 oppositeAsset 腿）`,
+        ...(params.modeHint ? [`• 说明: ${params.modeHint}`] : []),
+        `• 市场: ${params.title || '-'}`,
+        `• 跟单交易员: ${mask(params.trader)}`,
+        '',
+        '──────────────── 交易员本笔（卖出）───────────────',
+        `• 交易员订单名义(约): $${params.traderUsdcSize != null ? params.traderUsdcSize.toFixed(4) : '-'} USDC`,
+        `• 交易员成交价(概率价): ${params.traderPrice != null ? `$${Number(params.traderPrice).toFixed(4)}` : '-'}`,
+        '',
+        '──────────────── 方向与结果腿（与成交通知一致）───────────────',
+        `• 交易员本笔 outcome（Data/活动）: ${params.traderOutcome ?? '—'}`,
+        `• 若已同步卖出，我方本会卖出的结果方向: ${params.myOutcome ?? '—'}`,
+        `• 说明: 反买模式下我方持有与交易员相反一侧 outcome token；交易员卖 UP 时，同步卖出对应为我方卖 DOWN（以 tokenId / outcome 为准）。`,
+        '',
+        '──────────────── 链上标识（用于核对） ────────────────',
+        `• 我方本会卖出的 tokenId (CLOB outcome token，未下单):`,
+        `  ${fullOrMask(params.myTradedTokenId, 120)}`,
+        `• conditionId (条件 ID):`,
+        `  ${fullOrMask(params.conditionId, 120)}`,
+        `• 关联交易员活动 txHash (Polygon):`,
+        `  ${params.txHash || '-'}`,
+        '',
+        '──────────────── 快捷查询链接 ────────────────',
+    ];
+
+    if (params.conditionId) {
+        lines.push(`• Gamma 市场元数据 API: ${linkGammaMarkets(params.conditionId)}`);
+    }
+    if (params.myTradedTokenId) {
+        lines.push(`• CLOB 订单簿(本会卖出的 token): ${linkClobBook(params.myTradedTokenId)}`);
+    }
+    const poly = params.txHash ? linkPolygonTx(params.txHash) : null;
+    if (poly) {
+        lines.push(`• Polygonscan 交易: ${poly}`);
+    } else if (params.txHash) {
+        lines.push(`• Polygonscan: （txHash 非标准 0x64 位格式，请手动在浏览器搜索）`);
+    }
+    const pm = linkPolymarketEvent(params.eventSlug, params.slug);
+    if (pm) {
+        lines.push(`• Polymarket 前端(事件页): ${pm}`);
+    }
+
+    lines.push(
+        '',
+        '──────────────── 说明 ────────────────',
+        '• 本邮件在「反买 + 交易员卖出」且 COPY_REVERSE_SYNC_TRADER_SELL=false 时发送；与「卖出成交通知」互斥（未成交故无成交邮件）。',
+        '• 若需恢复同步卖出，请将 .env 中 COPY_REVERSE_SYNC_TRADER_SELL 设为 true 并重启进程。',
+        '',
+        '══════════════════════════════════════════════════════════════',
+        '',
+        '本邮件由系统自动发送，请勿直接回复。',
+        ''
+    );
+
+    return lines.join('\n');
+};
+
+export const notifyReverseTraderSellSkipped = async (params: ReverseSellSkipParams): Promise<void> => {
+    if (!isEnabled()) return;
+    if (!looksLikeEmail(ENV.EMAIL_SMTP_USER)) {
+        Logger.warning(
+            `[邮件通知] EMAIL_SMTP_USER 不是有效邮箱地址：${ENV.EMAIL_SMTP_USER || '-'}`
+        );
+        return;
+    }
+
+    const subject = `[Polymarket] 反买·未同步卖出（COPY_REVERSE_SYNC_TRADER_SELL=false）· ${params.title || 'market'}`;
+    const text = buildReverseSellSkippedBody(params);
+
+    await sendPlainEmail({ subject, text });
+};
+
 export const notifyOrderSuccess = async (params: NotifyParams): Promise<void> => {
     if (!isEnabled()) return;
     if (!looksLikeEmail(ENV.EMAIL_SMTP_USER)) {
@@ -299,7 +410,8 @@ export const notifyOrderSuccess = async (params: NotifyParams): Promise<void> =>
 
     const sideZh = params.side === 'BUY' ? '买入' : '卖出';
     const modeShort = params.copyMode === 'REVERSE' ? '反买' : '跟单';
-    const subject = `[Polymarket] ${sideZh}成交通知 · ${modeShort} · $${params.amountUsd?.toFixed(2) ?? '--'} USDC`;
+    const dryPrefix = params.dryRun ? 'Dry Run·' : '';
+    const subject = `[Polymarket] ${dryPrefix}${sideZh}成交通知 · ${modeShort} · $${params.amountUsd?.toFixed(2) ?? '--'} USDC`;
     const text = buildOrderSuccessBody(params);
 
     await sendPlainEmail({ subject, text });
@@ -342,4 +454,349 @@ export const notifyCopyRiskStop = async (params: {
     ].join('\n');
 
     await sendPlainEmail({ subject, text });
+};
+
+export type AutoProfitExitMailKind = 'TAKE_PROFIT' | 'STOP_LOSS';
+
+export type NotifyAutoProfitExitParams = {
+    runMode: 'LIVE' | 'DRYRUN';
+    kind: AutoProfitExitMailKind;
+    marketTitle: string;
+    conditionId: string;
+    tokenId: string;
+    soldTokens: number;
+    proceedsUsd: number;
+    plannedSize: number;
+    remainingTokens: number;
+    exitFull: boolean;
+    realizedPnlUsd?: number;
+    percentPnlAtTrigger?: number;
+    triggerReason: string;
+    copyMode?: 'FOLLOW' | 'REVERSE';
+    traderMask?: string;
+};
+
+export const notifyAutoProfitExit = async (p: NotifyAutoProfitExitParams): Promise<void> => {
+    if (!isEnabled()) return;
+    if (!looksLikeEmail(ENV.EMAIL_SMTP_USER)) return;
+
+    const now = new Date().toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai', hour12: false });
+    const kindZh = p.kind === 'TAKE_PROFIT' ? '止盈' : '止损';
+    const modeZh = p.runMode === 'LIVE' ? '实盘' : 'Dry Run 模拟';
+    const exitZh = p.exitFull ? '已基本全平' : '部分成交（后续可能继续重试）';
+    const modeEnum = p.copyMode === 'REVERSE' ? CopyMode.REVERSE : CopyMode.FOLLOW;
+    const envCol = copyModeEnvColumnHint(modeEnum);
+    const modeLine =
+        p.copyMode === 'REVERSE'
+            ? '反买 (REVERSE)'
+            : p.copyMode === 'FOLLOW'
+              ? '跟方向 (FOLLOW)'
+              : '—';
+
+    const subject = `[Polymarket] 自动${kindZh}·${modeZh}·${(p.marketTitle || 'market').slice(0, 48)}`;
+    const lines: string[] = [
+        '══════════════════════════════════════════════════════════════',
+        '',
+        `【Polymarket 自动${kindZh}（AUTO EXIT）】`,
+        '',
+        `• 时间(北京时间): ${now}`,
+        `• 运行模式: ${modeZh}`,
+        `• 类型: ${kindZh}（${p.kind}）`,
+        `• 平仓结果: ${exitZh}`,
+        `• 触发原因: ${p.triggerReason}`,
+        `• 市场: ${p.marketTitle || '-'}`,
+        `• 计划卖出份额: ${p.plannedSize.toFixed(4)} tokens`,
+        `• 实际卖出份额: ${p.soldTokens.toFixed(4)} tokens`,
+        `• 剩余份额(约): ${p.remainingTokens.toFixed(4)} tokens`,
+        `• 回收 USDC(约): $${p.proceedsUsd.toFixed(4)}`,
+        ...(p.percentPnlAtTrigger != null && Number.isFinite(p.percentPnlAtTrigger)
+            ? [`• 触发时 ROI(约): ${p.percentPnlAtTrigger.toFixed(2)}%`]
+            : []),
+        ...(p.realizedPnlUsd != null && Number.isFinite(p.realizedPnlUsd)
+            ? [`• 本次已实现盈亏(估算): $${p.realizedPnlUsd.toFixed(4)}`]
+            : []),
+        ...(p.copyMode
+            ? [`• 跟单模式: ${modeLine}`, `• 对应 .env 列: ${envCol}`]
+            : []),
+        ...(p.traderMask ? [`• 关联交易员: ${p.traderMask}`] : []),
+        '',
+        '──────────────── 链上标识 ────────────────',
+        `• tokenId: ${fullOrMask(p.tokenId, 120)}`,
+        `• conditionId: ${fullOrMask(p.conditionId, 120)}`,
+        '',
+        '──────────────── 快捷链接 ────────────────',
+    ];
+    if (p.conditionId) {
+        lines.push(`• Gamma: ${linkGammaMarkets(p.conditionId)}`);
+    }
+    if (p.tokenId) {
+        lines.push(`• CLOB 订单簿: ${linkClobBook(p.tokenId)}`);
+    }
+    lines.push(
+        '',
+        '说明: 本邮件在自动止盈/止损尝试卖出后发送；全平时已清理 Mongo tracked BUY。',
+        '',
+        '══════════════════════════════════════════════════════════════',
+        '',
+        '本邮件由系统自动发送，请勿直接回复。',
+        ''
+    );
+
+    await sendPlainEmail({ subject, text: lines.join('\n') });
+};
+
+export type PositionClearReasonCode =
+    | 'COPY_SELL_TRACKED_CLEARED'
+    | 'AUTO_EXIT_MANUAL_FLAT_MS'
+    | 'AUTO_EXIT_DUST_SIZE'
+    | 'AUTO_EXIT_REDEEMABLE_NO_BID'
+    | 'AUTO_EXIT_WATCH_STOP_NO_TRACKED'
+    | 'RECONCILE_FLATTEN'
+    | 'RECONCILE_NO_LIQUIDITY_CLEAR'
+    | 'DRYRUN_AUTO_EXIT_FLAT'
+    | 'DRYRUN_AUTO_EXIT_DUST';
+
+export type NotifyPositionClearParams = {
+    runMode: 'LIVE' | 'DRYRUN';
+    reasonCode: PositionClearReasonCode;
+    marketTitle?: string;
+    conditionId?: string;
+    tokenId?: string;
+    /** 人类可读说明（可含数据） */
+    detailZh: string;
+    soldTokens?: number;
+    proceedsUsd?: number;
+};
+
+const reasonCodeTitle = (code: PositionClearReasonCode): string => {
+    const map: Record<PositionClearReasonCode, string> = {
+        COPY_SELL_TRACKED_CLEARED: '跟单卖出·追踪已清仓',
+        AUTO_EXIT_MANUAL_FLAT_MS: 'AUTO EXIT·手动卖光后停监控',
+        AUTO_EXIT_DUST_SIZE: 'AUTO EXIT·碎仓清理',
+        AUTO_EXIT_REDEEMABLE_NO_BID: 'AUTO EXIT·可赎回/无买盘停跟踪',
+        AUTO_EXIT_WATCH_STOP_NO_TRACKED: 'AUTO EXIT·无持仓且 tracked 已空',
+        RECONCILE_FLATTEN: '仓位对账·平仓',
+        RECONCILE_NO_LIQUIDITY_CLEAR: '对账·无流动性·清 tracked',
+        DRYRUN_AUTO_EXIT_FLAT: 'Dry Run·模拟仓清空停监控',
+        DRYRUN_AUTO_EXIT_DUST: 'Dry Run·碎仓清理',
+    };
+    return map[code] || code;
+};
+
+export const notifyPositionClear = async (p: NotifyPositionClearParams): Promise<void> => {
+    if (!isEnabled()) return;
+    if (!looksLikeEmail(ENV.EMAIL_SMTP_USER)) return;
+
+    const now = new Date().toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai', hour12: false });
+    const modeZh = p.runMode === 'LIVE' ? '实盘' : 'Dry Run 模拟';
+    const title = reasonCodeTitle(p.reasonCode);
+    const subject = `[Polymarket] 清仓/停跟踪·${title}·${modeZh}`;
+
+    const lines: string[] = [
+        '══════════════════════════════════════════════════════════════',
+        '',
+        '【Polymarket 持仓追踪清理 / 停跟踪通知】',
+        '',
+        `• 时间(北京时间): ${now}`,
+        `• 运行模式: ${modeZh}`,
+        `• 场景: ${title}`,
+        `• 说明: ${p.detailZh}`,
+        `• 市场: ${p.marketTitle || '-'}`,
+        ...(p.soldTokens != null && Number.isFinite(p.soldTokens)
+            ? [`• 涉及卖出份额(如有): ${p.soldTokens.toFixed(4)} tokens`]
+            : []),
+        ...(p.proceedsUsd != null && Number.isFinite(p.proceedsUsd)
+            ? [`• 涉及回收 USDC(如有): $${p.proceedsUsd.toFixed(4)}`]
+            : []),
+        '',
+        '──────────────── 链上标识 ────────────────',
+        `• conditionId: ${p.conditionId ? fullOrMask(p.conditionId, 120) : '-'}`,
+        `• tokenId: ${p.tokenId ? fullOrMask(p.tokenId, 120) : '-'}`,
+        '',
+    ];
+    if (p.conditionId) {
+        lines.push(`• Gamma: ${linkGammaMarkets(p.conditionId)}`);
+    }
+    if (p.tokenId) {
+        lines.push(`• CLOB 订单簿: ${linkClobBook(p.tokenId)}`);
+    }
+    lines.push(
+        '',
+        '══════════════════════════════════════════════════════════════',
+        '',
+        '本邮件由系统自动发送，请勿直接回复。',
+        ''
+    );
+
+    await sendPlainEmail({ subject, text: lines.join('\n') });
+};
+
+export type MartingaleOrderNotifyContext = {
+    seriesKey: string;
+    execMode: 'live' | 'dryrun';
+    sideLabel: string;
+    stakeUsd: number;
+    entryPrice: number;
+    shares: number;
+    slug: string;
+    question: string;
+    conditionId: string;
+    tokenId: string;
+    stepTierZh: string;
+    sessionRealizedPnlUsd: number;
+    theoryWindowUtc: string;
+};
+
+export type MartingaleSettleNotifyContext = {
+    seriesKey: string;
+    execMode: 'live' | 'dryrun';
+    sideLabel: string;
+    winningOutcome: string;
+    won: boolean;
+    pnlRoundUsd: number;
+    sessionRealizedPnlUsd: number;
+    entryPrice: number;
+    slug: string;
+    question: string;
+    theoryWindowUtc: string;
+    stepAfter: number;
+    maxSteps: number;
+    nextStakeZh: string;
+    usedForceSettle: boolean;
+    usedBookSettle: boolean;
+};
+
+const buildMartingaleOrderBody = (p: MartingaleOrderNotifyContext): string => {
+    const now = new Date().toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai', hour12: false });
+    const modeZh = p.execMode === 'live' ? '实盘' : 'Dry Run 模拟（无链上成交）';
+    const pm = linkPolymarketEvent(undefined, p.slug);
+    const lines: string[] = [
+        '══════════════════════════════════════════════════════════════',
+        '',
+        '【Polymarket 马丁格尔 · 下单通知】',
+        '',
+        `• 时间(北京时间): ${now}`,
+        `• 运行模式: ${modeZh}`,
+        `• 序列: ${p.seriesKey}`,
+        `• 本笔押边: ${p.sideLabel}`,
+        `• 名义/花费: $${p.stakeUsd.toFixed(4)} USDC`,
+        `• 入场价(概率价): ${p.entryPrice.toFixed(4)}`,
+        `• 份额(约): ${p.shares.toFixed(4)}`,
+        `• 档位说明: ${p.stepTierZh}`,
+        `• 会话累计已实现(不含本笔浮动): ${p.sessionRealizedPnlUsd >= 0 ? '+' : ''}${p.sessionRealizedPnlUsd.toFixed(2)} USD`,
+        `• 理论窗(UTC): ${p.theoryWindowUtc}`,
+        `• 题目: ${p.question || '-'}`,
+        `• slug: ${p.slug}`,
+        '',
+        '──────────────── 链上标识 ────────────────',
+        `• conditionId: ${p.conditionId ? fullOrMask(p.conditionId, 120) : '-'}`,
+        `• tokenId: ${p.tokenId ? fullOrMask(p.tokenId, 120) : '-'}`,
+        '',
+        '──────────────── 链接 ────────────────',
+    ];
+    if (p.conditionId) {
+        lines.push(`• Gamma: ${linkGammaMarkets(p.conditionId)}`);
+    }
+    if (p.tokenId) {
+        lines.push(`• CLOB 订单簿: ${linkClobBook(p.tokenId)}`);
+    }
+    if (pm) {
+        lines.push(`• Polymarket: ${pm}`);
+    }
+    lines.push(
+        '',
+        '说明: 请在根 `.env` 配置 EMAIL_* SMTP；马丁开关为 MARTINGALE_EMAIL_ON_ORDER。',
+        '',
+        '══════════════════════════════════════════════════════════════',
+        '',
+        '本邮件由系统自动发送，请勿直接回复。',
+        ''
+    );
+    return lines.join('\n');
+};
+
+const buildMartingaleSettleBody = (p: MartingaleSettleNotifyContext): string => {
+    const now = new Date().toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai', hour12: false });
+    const modeZh = p.execMode === 'live' ? '实盘' : 'Dry Run 模拟';
+    const pm = linkPolymarketEvent(undefined, p.slug);
+    const pnlSign = p.pnlRoundUsd >= 0 ? '+' : '';
+    const lines: string[] = [
+        '══════════════════════════════════════════════════════════════',
+        '',
+        '【Polymarket 马丁格尔 · 收盘结算】',
+        '',
+        `• 时间(北京时间): ${now}`,
+        `• 运行模式: ${modeZh}`,
+        `• 序列: ${p.seriesKey}`,
+        ...(p.usedBookSettle
+            ? [
+                  '• ⚠ 本笔为「CLOB 两侧价谁高谁赢」快速推断结算，可能与官方 closed 不一致。',
+              ]
+            : []),
+        ...(p.usedForceSettle && !p.usedBookSettle
+            ? [
+                  '• ⚠ 本笔为 Gamma 滞后下的「逾期推断」结算，请以链上/官方结果为准。',
+              ]
+            : []),
+        `• 曾押边: ${p.sideLabel} | 胜出结果: ${p.winningOutcome}`,
+        `• 本局盈亏: ${pnlSign}${p.pnlRoundUsd.toFixed(2)} USD（${p.won ? '赢' : '输'}）`,
+        `• 会话累计已实现: ${p.sessionRealizedPnlUsd >= 0 ? '+' : ''}${p.sessionRealizedPnlUsd.toFixed(2)} USD`,
+        `• 参考入场价: ${p.entryPrice.toFixed(4)}`,
+        `• 理论窗(UTC): ${p.theoryWindowUtc}`,
+        `• 下一档: ${p.stepAfter + 1}/${p.maxSteps}（内部 stepIndex=${p.stepAfter}）`,
+        `• 下一笔名义策略: ${p.nextStakeZh}`,
+        `• 题目: ${p.question || '-'}`,
+        `• slug: ${p.slug}`,
+        '',
+        '──────────────── 链接 ────────────────',
+    ];
+    if (pm) {
+        lines.push(`• Polymarket: ${pm}`);
+    }
+    lines.push(
+        '',
+        '说明: 马丁开关为 MARTINGALE_EMAIL_ON_SETTLE；SMTP 与跟单共用。',
+        '',
+        '══════════════════════════════════════════════════════════════',
+        '',
+        '本邮件由系统自动发送，请勿直接回复。',
+        ''
+    );
+    return lines.join('\n');
+};
+
+/** 马丁格尔：下单/挂单成功后发信（受 MARTINGALE_EMAIL_ON_ORDER 与全局 EMAIL_NOTIFY_* 控制） */
+export const notifyMartingaleOrderFilled = async (
+    p: MartingaleOrderNotifyContext,
+    martingaleMailEnabled: boolean
+): Promise<void> => {
+    if (!martingaleMailEnabled || !isEnabled()) {
+        return;
+    }
+    if (!looksLikeEmail(ENV.EMAIL_SMTP_USER)) {
+        Logger.warning(
+            `[邮件通知·马丁] EMAIL_SMTP_USER 不是有效邮箱地址：${ENV.EMAIL_SMTP_USER || '-'}`
+        );
+        return;
+    }
+    const dryPrefix = p.execMode === 'dryrun' ? 'Dry·' : '';
+    const subject = `[Polymarket·马丁] ${dryPrefix}已下单 ${p.seriesKey} ${p.sideLabel} $${p.stakeUsd.toFixed(2)}`;
+    await sendPlainEmail({ subject, text: buildMartingaleOrderBody(p) });
+};
+
+/** 马丁格尔：窗口结算后发信（受 MARTINGALE_EMAIL_ON_SETTLE 与全局 EMAIL_NOTIFY_* 控制） */
+export const notifyMartingaleSettled = async (
+    p: MartingaleSettleNotifyContext,
+    martingaleMailEnabled: boolean
+): Promise<void> => {
+    if (!martingaleMailEnabled || !isEnabled()) {
+        return;
+    }
+    if (!looksLikeEmail(ENV.EMAIL_SMTP_USER)) {
+        return;
+    }
+    const w = p.won ? '赢' : '输';
+    const dryPrefix = p.execMode === 'dryrun' ? 'Dry·' : '';
+    const subject = `[Polymarket·马丁] ${dryPrefix}已收盘${w} ${p.seriesKey} ${p.pnlRoundUsd >= 0 ? '+' : ''}${p.pnlRoundUsd.toFixed(2)}U`;
+    await sendPlainEmail({ subject, text: buildMartingaleSettleBody(p) });
 };

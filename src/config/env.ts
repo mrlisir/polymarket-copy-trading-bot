@@ -1,7 +1,22 @@
 import * as dotenv from 'dotenv';
 import * as path from 'path';
+import { ensureMartingaleDotenv } from '../martingale/martingaleDotenv';
 import { CopyStrategy, CopyStrategyConfig, CopyMode, parseTieredMultipliers } from './copyStrategy';
-dotenv.config();
+
+/**
+ * 先合并根目录 `.env` 再合并 `.env.martingale`（后者覆盖同名键）。
+ * 避免仅 `dotenv.config()` 时根 `.env` 里残留的 MARTINGALE_* 在实盘入口（先 import env）覆盖不了 `.env.martingale`，
+ * 而 dryrun 因未 import env 只吃到 preamble 合并结果，造成「模拟 5m、实盘变 15m」等不一致。
+ */
+ensureMartingaleDotenv();
+
+/** 马丁实盘：仅用 `.env.martingale` 中 MARTINGALE_LIVE_* 提供链/CLOB/库等，不依赖根 `.env` 的同项（须与 MARTINGALE_SUPPRESS_COPY_LOG 同用于 martingale-live） */
+const isMartingaleLiveConfigIsolated = (): boolean => {
+    return (
+        process.env.MARTINGALE_SUPPRESS_COPY_LOG === 'true' &&
+        process.env.MARTINGALE_LIVE_CONFIG_ISOLATED === 'true'
+    );
+};
 
 /**
  * Validate Ethereum address format
@@ -14,6 +29,31 @@ const isValidEthereumAddress = (address: string): boolean => {
  * Validate required environment variables
  */
 const validateRequiredEnv = (): void => {
+    if (isMartingaleLiveConfigIsolated()) {
+        const requiredMartingale = [
+            'MARTINGALE_LIVE_RPC_URL',
+            'MARTINGALE_LIVE_CLOB_HTTP_URL',
+            'MARTINGALE_LIVE_PRIVATE_KEY',
+            'MARTINGALE_LIVE_PROXY_WALLET',
+            'MARTINGALE_LIVE_USDC_CONTRACT_ADDRESS',
+        ];
+        const missing: string[] = [];
+        for (const key of requiredMartingale) {
+            if (!(process.env[key] || '').trim()) {
+                missing.push(key);
+            }
+        }
+        if (missing.length > 0) {
+            console.error('\n❌ 马丁实盘隔离模式：请在 .env.martingale 填写下列变量（与根 .env 脱钩）\n');
+            console.error(`缺失: ${missing.join(', ')}\n`);
+            console.error(
+                '说明: 设置 MARTINGALE_LIVE_CONFIG_ISOLATED=true 后，RPC/CLOB/钱包/USDC 须从 MARTINGALE_LIVE_* 读取；Mongo 可选（不填则马丁实盘不连库）。\n'
+            );
+            throw new Error(`马丁隔离模式缺少: ${missing.join(', ')}`);
+        }
+        return;
+    }
+
     const required = [
         'PROXY_WALLET',
         'PRIVATE_KEY',
@@ -55,6 +95,18 @@ const validateRequiredEnv = (): void => {
  * Validate Ethereum addresses
  */
 const validateAddresses = (): void => {
+    if (isMartingaleLiveConfigIsolated()) {
+        const pw = (process.env.MARTINGALE_LIVE_PROXY_WALLET || '').trim();
+        if (pw && !isValidEthereumAddress(pw)) {
+            throw new Error(`无效的 MARTINGALE_LIVE_PROXY_WALLET: ${pw}`);
+        }
+        const usdc = (process.env.MARTINGALE_LIVE_USDC_CONTRACT_ADDRESS || '').trim();
+        if (usdc && !isValidEthereumAddress(usdc)) {
+            throw new Error(`无效的 MARTINGALE_LIVE_USDC_CONTRACT_ADDRESS: ${usdc}`);
+        }
+        return;
+    }
+
     if (process.env.PROXY_WALLET && !isValidEthereumAddress(process.env.PROXY_WALLET)) {
         console.error('\n❌ 无效的钱包地址\n');
         console.error(`您的 PROXY_WALLET: ${process.env.PROXY_WALLET}`);
@@ -203,6 +255,26 @@ const validateNumericConfig = (): void => {
  * Validate URL formats
  */
 const validateUrls = (): void => {
+    if (isMartingaleLiveConfigIsolated()) {
+        const ch = (process.env.MARTINGALE_LIVE_CLOB_HTTP_URL || '').trim();
+        if (ch && !ch.startsWith('http')) {
+            throw new Error(`无效的 MARTINGALE_LIVE_CLOB_HTTP_URL: ${ch}`);
+        }
+        const ws = (process.env.MARTINGALE_LIVE_CLOB_WS_URL || '').trim();
+        if (ws && !ws.startsWith('ws')) {
+            throw new Error(`无效的 MARTINGALE_LIVE_CLOB_WS_URL: ${ws}`);
+        }
+        const rpc = (process.env.MARTINGALE_LIVE_RPC_URL || '').trim();
+        if (rpc && !rpc.startsWith('http')) {
+            throw new Error(`无效的 MARTINGALE_LIVE_RPC_URL: ${rpc}`);
+        }
+        const mongo = (process.env.MARTINGALE_LIVE_MONGO_URI || '').trim();
+        if (mongo && !mongo.startsWith('mongodb')) {
+            throw new Error('无效的 MARTINGALE_LIVE_MONGO_URI');
+        }
+        return;
+    }
+
     if (process.env.CLOB_HTTP_URL && !process.env.CLOB_HTTP_URL.startsWith('http')) {
         console.error('\n❌ 无效的 CLOB_HTTP_URL\n');
         console.error(`当前值: ${process.env.CLOB_HTTP_URL}`);
@@ -348,16 +420,22 @@ export const parseCurrentTraderListsFromEnv = (): {
 };
 
 const initialTraderLists = parseCurrentTraderListsFromEnv();
-if (initialTraderLists.merged.length === 0) {
+if (initialTraderLists.merged.length === 0 && !isMartingaleLiveConfigIsolated()) {
     throw new Error(
         '请在 USER_ADDRESSES_FOLLOW（正买）或 USER_ADDRESSES_REVERSE（反买）中至少配置一个有效地址'
     );
 }
 
 const MERGED_USER_ADDRESSES: string[] = [];
-MERGED_USER_ADDRESSES.push(...initialTraderLists.merged);
 const TRADER_COPY_MODE_BY_ADDRESS: Record<string, CopyMode> = {};
-Object.assign(TRADER_COPY_MODE_BY_ADDRESS, initialTraderLists.modeByAddress);
+if (isMartingaleLiveConfigIsolated()) {
+    const ph = '0x0000000000000000000000000000000000000001';
+    MERGED_USER_ADDRESSES.push(ph);
+    TRADER_COPY_MODE_BY_ADDRESS[ph] = CopyMode.FOLLOW;
+} else {
+    MERGED_USER_ADDRESSES.push(...initialTraderLists.merged);
+    Object.assign(TRADER_COPY_MODE_BY_ADDRESS, initialTraderLists.modeByAddress);
+}
 
 const traderListCountsForLog = (): { nf: number; nr: number } => ({
     nf: parseTraderAddressesOptional(process.env.USER_ADDRESSES_FOLLOW, 'USER_ADDRESSES_FOLLOW').length,
@@ -386,6 +464,7 @@ const parseCopyStrategy = (opts?: { silent?: boolean }): CopyStrategyConfig => {
             copySize: effectivePercentage,
             maxOrderSizeUSD: parseFloat(process.env.MAX_ORDER_SIZE_USD || '100.0'),
             minOrderSizeUSD: parseFloat(process.env.MIN_ORDER_SIZE_USD || '1.0'),
+            bumpSubminOrderToMin: process.env.COPY_BUMP_SUBMIN_ORDER_TO_MIN === 'true',
             maxPositionSizeUSD: process.env.MAX_POSITION_SIZE_USD
                 ? parseFloat(process.env.MAX_POSITION_SIZE_USD)
                 : undefined,
@@ -426,6 +505,7 @@ const parseCopyStrategy = (opts?: { silent?: boolean }): CopyStrategyConfig => {
         copySize: parseFloat(process.env.COPY_SIZE || '10.0'),
         maxOrderSizeUSD: parseFloat(process.env.MAX_ORDER_SIZE_USD || '100.0'),
         minOrderSizeUSD: parseFloat(process.env.MIN_ORDER_SIZE_USD || '1.0'),
+        bumpSubminOrderToMin: process.env.COPY_BUMP_SUBMIN_ORDER_TO_MIN === 'true',
         maxPositionSizeUSD: process.env.MAX_POSITION_SIZE_USD
             ? parseFloat(process.env.MAX_POSITION_SIZE_USD)
             : undefined,
@@ -488,7 +568,9 @@ export const ENV = {
     TRADE_MULTIPLIER: parseFloat(process.env.TRADE_MULTIPLIER || '1.0'),
     COPY_PERCENTAGE: parseFloat(process.env.COPY_PERCENTAGE || '10.0'),
     // New copy strategy configuration
-    COPY_STRATEGY_CONFIG: parseCopyStrategy(),
+    COPY_STRATEGY_CONFIG: parseCopyStrategy({
+        silent: process.env.MARTINGALE_SUPPRESS_COPY_LOG === 'true',
+    }),
     // Network settings
     REQUEST_TIMEOUT_MS: parseInt(process.env.REQUEST_TIMEOUT_MS || '10000', 10),
     NETWORK_RETRY_LIMIT: parseInt(process.env.NETWORK_RETRY_LIMIT || '3', 10),
@@ -535,6 +617,16 @@ export const ENV = {
 
     /** Data API positions?user= 共享缓存 TTL（tradeMonitor / 对账 / curPrice 等多处复用） */
     DATA_API_POSITIONS_CACHE_TTL_MS: parseInt(process.env.DATA_API_POSITIONS_CACHE_TTL_MS || '10000', 10),
+
+    /**
+     * 后台异步刷新 Data API positions（毫秒，0=关闭）。
+     * 实盘与 dryrun 的 executor 内用 setInterval 与主循环并行，定期对 PROXY + 所有交易员 force 拉取，
+     * 降低共享 TTL 缓存导致跟单决策用过旧 curPrice / redeemable / endDate 的概率。
+     */
+    POSITIONS_BACKGROUND_REFRESH_INTERVAL_MS: Math.max(
+        0,
+        parseInt(process.env.POSITIONS_BACKGROUND_REFRESH_INTERVAL_MS || '0', 10) || 0
+    ),
 
     /** CLOB /midpoint、/last-trade-price 缓存 TTL（估值优先于整本 orderbook） */
     CLOB_LIGHT_PRICE_CACHE_TTL_MS: parseInt(process.env.CLOB_LIGHT_PRICE_CACHE_TTL_MS || '15000', 10),
@@ -592,6 +684,20 @@ export const ENV = {
     ),
 
     /**
+     * 反买(REVERSE)：交易员「卖出」时是否同步执行我方卖出（卖出 oppositeAsset / 对侧腿）。
+     * 默认 true（与历史行为一致）；设为 false 则跳过「交易员 SELL → 我方 SELL」下单（仍会发邮件说明未同步卖出）。
+     */
+    COPY_REVERSE_SYNC_TRADER_SELL: process.env.COPY_REVERSE_SYNC_TRADER_SELL !== 'false',
+
+    /**
+     * 反买：我方因止盈/止损、跟单卖出至空仓、或触达 MAX_POSITION_SIZE_USD 无法再加仓后，
+     * 暂停跟随新的「交易员 BUY → 我方 BUY」，直到 Data API 显示交易员在对应 outcome 上持仓接近 0。
+     * 默认 true；设为 false 关闭（恢复旧行为：平仓后交易员继续买仍会跟买）。
+     */
+    COPY_REVERSE_PAUSE_NEW_BUYS_UNTIL_TRADER_FLAT:
+        process.env.COPY_REVERSE_PAUSE_NEW_BUYS_UNTIL_TRADER_FLAT !== 'false',
+
+    /**
      * Mongo/CLOB/网络临时故障时的指数退避（实盘、dryrun、tradeMonitor/Executor 共用）。
      * delay = min(BASE * 2^min(streak-1, MAX_EXPONENT), MAX_MS)
      */
@@ -623,6 +729,14 @@ export const ENV = {
     POSITION_RECONCILE_ON_RESOLVED: process.env.POSITION_RECONCILE_ON_RESOLVED !== 'false',
     /** If true, after CLOB sell attempt, call on-chain redeemPositions for redeemable conditions (Polygon gas). */
     POSITION_RECONCILE_AUTO_REDEEM: process.env.POSITION_RECONCILE_AUTO_REDEEM === 'true',
+    /**
+     * 跟单 BUY 成交后，在此毫秒数内不因「交易员镜像腿已平」自动平仓（0=关闭）。
+     * 缓解 Data API positions 缓存/延迟导致误判交易员无仓、刚买即被对账卖掉。
+     */
+    POSITION_RECONCILE_TRADER_EXIT_GRACE_MS: Math.max(
+        0,
+        parseInt(process.env.POSITION_RECONCILE_TRADER_EXIT_GRACE_MS || '180000', 10) || 0
+    ),
 
     /**
      * 自动止盈/止损退出（对「机器人买入后的同一 condition+asset 仓位」执行全仓平仓）
@@ -655,6 +769,11 @@ export const ENV = {
     AUTO_PROFIT_EXIT_CLEAR_WHEN_REMAINING_LT_TOKENS: parseFloat(
         process.env.AUTO_PROFIT_EXIT_CLEAR_WHEN_REMAINING_LT_TOKENS || '1.0'
     ),
+    /**
+     * 代理钱包在 Data API 上已无该 condition+asset 持仓（含手动在 Polymarket 卖出）持续达该毫秒数后，
+     * 停止 AUTO EXIT 监控并清理 tracked BUY，避免空跑。
+     */
+    AUTO_PROFIT_EXIT_FLAT_CLEAR_MS: parseInt(process.env.AUTO_PROFIT_EXIT_FLAT_CLEAR_MS || '90000', 10),
 
     /**
      * 邮件通知（QQ 邮箱 SMTP）：
@@ -695,6 +814,7 @@ const mergeCopyStrategyConfig = (target: CopyStrategyConfig, next: CopyStrategyC
     target.copySize = next.copySize;
     target.maxOrderSizeUSD = next.maxOrderSizeUSD;
     target.minOrderSizeUSD = next.minOrderSizeUSD;
+    target.bumpSubminOrderToMin = next.bumpSubminOrderToMin;
     target.maxPositionSizeUSD = next.maxPositionSizeUSD;
     target.maxDailyVolumeUSD = next.maxDailyVolumeUSD;
     if (next.adaptiveMinPercent !== undefined) {
@@ -766,6 +886,10 @@ const applyReloadableProcessEnvToRuntimeEnv = (): void => {
         process.env.DATA_API_POSITIONS_CACHE_TTL_MS || '10000',
         10
     );
+    ENV.POSITIONS_BACKGROUND_REFRESH_INTERVAL_MS = Math.max(
+        0,
+        parseInt(process.env.POSITIONS_BACKGROUND_REFRESH_INTERVAL_MS || '0', 10) || 0
+    );
     ENV.CLOB_LIGHT_PRICE_CACHE_TTL_MS = parseInt(
         process.env.CLOB_LIGHT_PRICE_CACHE_TTL_MS || '15000',
         10
@@ -795,6 +919,9 @@ const applyReloadableProcessEnvToRuntimeEnv = (): void => {
         process.env.COPY_SKIP_FOLLOW_IF_ENDS_WITHIN_MINUTES || '5',
         10
     );
+    ENV.COPY_REVERSE_SYNC_TRADER_SELL = process.env.COPY_REVERSE_SYNC_TRADER_SELL !== 'false';
+    ENV.COPY_REVERSE_PAUSE_NEW_BUYS_UNTIL_TRADER_FLAT =
+        process.env.COPY_REVERSE_PAUSE_NEW_BUYS_UNTIL_TRADER_FLAT !== 'false';
     ENV.TRANSIENT_RETRY_BASE_MS = parseInt(process.env.TRANSIENT_RETRY_BASE_MS || '2000', 10);
     ENV.TRANSIENT_RETRY_MAX_MS = parseInt(process.env.TRANSIENT_RETRY_MAX_MS || '120000', 10);
     ENV.TRANSIENT_BACKOFF_MAX_EXPONENT = parseInt(
@@ -812,6 +939,28 @@ const applyReloadableProcessEnvToRuntimeEnv = (): void => {
     ENV.POSITION_RECONCILE_ON_TRADER_EXIT = process.env.POSITION_RECONCILE_ON_TRADER_EXIT !== 'false';
     ENV.POSITION_RECONCILE_ON_RESOLVED = process.env.POSITION_RECONCILE_ON_RESOLVED !== 'false';
     ENV.POSITION_RECONCILE_AUTO_REDEEM = process.env.POSITION_RECONCILE_AUTO_REDEEM === 'true';
+    ENV.POSITION_RECONCILE_TRADER_EXIT_GRACE_MS = Math.max(
+        0,
+        parseInt(process.env.POSITION_RECONCILE_TRADER_EXIT_GRACE_MS || '180000', 10) || 0
+    );
+    ENV.AUTO_PROFIT_EXIT_ENABLED = process.env.AUTO_PROFIT_EXIT_ENABLED === 'true';
+    ENV.AUTO_PROFIT_EXIT_TAKE_PROFIT_PCT = parseFloat(process.env.AUTO_PROFIT_EXIT_TAKE_PROFIT_PCT || '80');
+    ENV.AUTO_PROFIT_EXIT_TAKE_PROFIT_MIN_EXEC_PNL_PCT = parseFloat(
+        process.env.AUTO_PROFIT_EXIT_TAKE_PROFIT_MIN_EXEC_PNL_PCT || '0'
+    );
+    ENV.AUTO_PROFIT_EXIT_STOP_LOSS_PCT = parseFloat(process.env.AUTO_PROFIT_EXIT_STOP_LOSS_PCT || '25');
+    ENV.AUTO_PROFIT_EXIT_CHECK_INTERVAL_MS = parseInt(
+        process.env.AUTO_PROFIT_EXIT_CHECK_INTERVAL_MS || '3000',
+        10
+    );
+    ENV.AUTO_PROFIT_EXIT_RETRY_COOLDOWN_MS = parseInt(
+        process.env.AUTO_PROFIT_EXIT_RETRY_COOLDOWN_MS || '30000',
+        10
+    );
+    ENV.AUTO_PROFIT_EXIT_CLEAR_WHEN_REMAINING_LT_TOKENS = parseFloat(
+        process.env.AUTO_PROFIT_EXIT_CLEAR_WHEN_REMAINING_LT_TOKENS || '1.0'
+    );
+    ENV.AUTO_PROFIT_EXIT_FLAT_CLEAR_MS = parseInt(process.env.AUTO_PROFIT_EXIT_FLAT_CLEAR_MS || '90000', 10);
     ENV.EMAIL_NOTIFY_ENABLED = process.env.EMAIL_NOTIFY_ENABLED === 'true';
     ENV.EMAIL_SMTP_HOST = (process.env.EMAIL_SMTP_HOST || 'smtp.qq.com').trim();
     ENV.EMAIL_SMTP_PORT = parseInt(process.env.EMAIL_SMTP_PORT || '465', 10);
@@ -829,7 +978,7 @@ const applyReloadableProcessEnvToRuntimeEnv = (): void => {
     ENV.POLY_BUILDER_PASSPHRASE = (process.env.POLY_BUILDER_PASSPHRASE || '').trim();
 };
 
-const syncHttpProxySideEffects = (): void => {
+export function syncHttpProxySideEffects(): void {
     if (ENV.HTTP_PROXY_ENABLED && ENV.HTTP_PROXY_HOST) {
         const proxyUrl = `http://${ENV.HTTP_PROXY_HOST}:${ENV.HTTP_PROXY_PORT}`;
         process.env.HTTP_PROXY = proxyUrl;
@@ -858,7 +1007,7 @@ const syncHttpProxySideEffects = (): void => {
         delete process.env.HTTP_PROXY;
         delete process.env.HTTPS_PROXY;
     }
-};
+}
 
 export type EnvReloadResult =
     | { ok: true; message: string }
@@ -868,6 +1017,7 @@ export type EnvReloadResult =
 export const reloadEnvFromDisk = (): EnvReloadResult => {
     try {
         dotenv.config({ path: path.join(process.cwd(), '.env'), override: true });
+        dotenv.config({ path: path.join(process.cwd(), '.env.martingale'), override: true });
     } catch (e) {
         return { ok: false, error: e instanceof Error ? e.message : String(e) };
     }
@@ -927,13 +1077,17 @@ export const buildCopyModeStartupSummary = (): string => {
             nFollow += 1;
         }
     }
+    const revSellHint =
+        nReverse > 0
+            ? ` | COPY_REVERSE_SYNC_TRADER_SELL=${ENV.COPY_REVERSE_SYNC_TRADER_SELL} | COPY_REVERSE_PAUSE_NEW_BUYS_UNTIL_TRADER_FLAT=${ENV.COPY_REVERSE_PAUSE_NEW_BUYS_UNTIL_TRADER_FLAT}`
+            : '';
     if (nReverse === 0) {
         return `跟单模式: 均为正买列（USER_ADDRESSES_FOLLOW），共 ${nFollow} 位`;
     }
     if (nFollow === 0) {
-        return `跟单模式: 均为反买列（USER_ADDRESSES_REVERSE），共 ${nReverse} 位`;
+        return `跟单模式: 均为反买列（USER_ADDRESSES_REVERSE），共 ${nReverse} 位${revSellHint}`;
     }
-    return `跟单模式: 混合 — 正买 ${nFollow} 位（FOLLOW 列）· 反买 ${nReverse} 位（REVERSE 列）；每笔成交以日志/邮件中的「跟单配置」为准`;
+    return `跟单模式: 混合 — 正买 ${nFollow} 位（FOLLOW 列）· 反买 ${nReverse} 位（REVERSE 列）；每笔成交以日志/邮件中的「跟单配置」为准${revSellHint}`;
 };
 
 syncHttpProxySideEffects();

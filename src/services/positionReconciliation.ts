@@ -2,9 +2,10 @@ import { ClobClient } from '@polymarket/clob-client';
 import { ENV } from '../config/env';
 import { UserPositionInterface } from '../interfaces/User';
 import { getUserActivityModel } from '../models/userHistory';
-import { fetchPositionsForUser } from '../utils/dataApiCache';
+import { fetchPositionsForUserForce } from '../utils/dataApiCache';
 import Logger from '../utils/logger';
 import { marketSellTokensFOK } from '../utils/postOrder';
+import { notifyPositionClear } from '../utils/emailNotifier';
 import { redeemPolymarketCondition } from '../utils/ctfRedeem';
 import {
     RECONCILE_MIN_SELL_TOKENS,
@@ -12,6 +13,7 @@ import {
     copyModeForReconcileTraders,
     getMirrorAssetForReconcile,
     isMarketResolved,
+    isReconcileTraderExitInGrace,
     loadCopiedConditionTraders,
     positionKey,
 } from './positionReconciliationCore';
@@ -66,8 +68,25 @@ const flattenLivePosition = async (
         Logger.warning('⚠️ CLOB 未成交或订单簿不可用（可稍后重试或检查 404）');
     }
 
-    if (soldTokens >= initial * 0.95) {
+    const clearedTracked = soldTokens >= initial * 0.95;
+    if (clearedTracked) {
         await clearBuyTrackingForAsset(pos.conditionId, pos.asset);
+    }
+    const shouldNotifyFlatten =
+        soldTokens > 0.0000001 || proceedsUsd > 0.0000001 || clearedTracked;
+    if (shouldNotifyFlatten) {
+        await notifyPositionClear({
+            runMode: 'LIVE',
+            reasonCode: 'RECONCILE_FLATTEN',
+            marketTitle: pos.title || pos.slug,
+            conditionId: pos.conditionId,
+            tokenId: pos.asset,
+            detailZh: `对账触发：${reason}。初始 ${initial.toFixed(4)} tokens → 卖出 ${soldTokens.toFixed(4)} tokens，回收约 $${proceedsUsd.toFixed(4)} USDC。${
+                clearedTracked ? '已清空 Mongo tracked BUY。' : '未达 95% 清仓阈值，tracked 可能仍保留。'
+            }`,
+            soldTokens,
+            proceedsUsd,
+        });
     }
     return { initialTokens: initial, soldTokens, proceedsUsd };
 };
@@ -95,7 +114,7 @@ export const runPositionReconciliation = async (
         return;
     }
 
-    const rawMine = await fetchPositionsForUser(ENV.PROXY_WALLET);
+    const rawMine = await fetchPositionsForUserForce(ENV.PROXY_WALLET);
     const myPositions = rawMine as UserPositionInterface[];
 
     const traderPosCache = new Map<string, UserPositionInterface[]>();
@@ -176,6 +195,15 @@ export const runPositionReconciliation = async (
                         2
                     )}）：停止后续对账平仓 condition=${pos.conditionId.slice(0, 10)}...`
                 );
+                await notifyPositionClear({
+                    runMode: 'LIVE',
+                    reasonCode: 'RECONCILE_NO_LIQUIDITY_CLEAR',
+                    marketTitle: pos.title || pos.slug,
+                    conditionId: pos.conditionId,
+                    tokenId: pos.asset,
+                    detailZh:
+                        '对账平仓时 CLOB 无成交且订单簿不可用，已停止该仓位后续对账尝试并清理 Mongo tracked BUY。',
+                });
             }
 
             if (
@@ -195,6 +223,15 @@ export const runPositionReconciliation = async (
         if (handled) continue;
 
         if (onTraderExit) {
+            if (
+                ENV.POSITION_RECONCILE_TRADER_EXIT_GRACE_MS > 0 &&
+                isReconcileTraderExitInGrace(pos.conditionId, pos.asset)
+            ) {
+                Logger.info(
+                    `[对账] 跳过「交易员镜像腿已平」判定（建仓后宽限 ${ENV.POSITION_RECONCILE_TRADER_EXIT_GRACE_MS}ms 内，防 API 延迟误判）| ${(pos.title || pos.slug || pos.conditionId).slice(0, 48)}...`
+                );
+                continue;
+            }
             const stillIn = await anyTraderStillInMirror(
                 involved,
                 pos.conditionId,

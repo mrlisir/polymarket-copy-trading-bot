@@ -28,26 +28,32 @@ export const performHealthCheck = async (): Promise<HealthCheckResult> => {
     };
 
     // Check MongoDB connection
-    try {
-        if (mongoose.connection.readyState === 1) {
-            // Ping the database
-            if (mongoose.connection.db) {
-                await mongoose.connection.db.admin().ping();
-                checks.database = { status: 'ok', message: 'Connected' };
+    if (process.env.MARTINGALE_LIVE_SKIP_MONGO === 'true') {
+        checks.database = {
+            status: 'ok',
+            message: 'Skipped（马丁实盘未配置 MARTINGALE_LIVE_MONGO_URI）',
+        };
+    } else {
+        try {
+            if (mongoose.connection.readyState === 1) {
+                if (mongoose.connection.db) {
+                    await mongoose.connection.db.admin().ping();
+                    checks.database = { status: 'ok', message: 'Connected' };
+                } else {
+                    checks.database = { status: 'error', message: 'Database object not available' };
+                }
             } else {
-                checks.database = { status: 'error', message: 'Database object not available' };
+                checks.database = {
+                    status: 'error',
+                    message: `Connection state: ${mongoose.connection.readyState}`,
+                };
             }
-        } else {
+        } catch (error) {
             checks.database = {
                 status: 'error',
-                message: `Connection state: ${mongoose.connection.readyState}`,
+                message: `Connection failed: ${error instanceof Error ? error.message : String(error)}`,
             };
         }
-    } catch (error) {
-        checks.database = {
-            status: 'error',
-            message: `Connection failed: ${error instanceof Error ? error.message : String(error)}`,
-        };
     }
 
     // Check RPC endpoint

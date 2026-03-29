@@ -77,6 +77,11 @@ export interface CopyStrategyConfig {
     minOrderSizeUSD: number; // Minimum size for a single order
     maxPositionSizeUSD?: number; // Maximum total size for a position (optional)
     maxDailyVolumeUSD?: number; // Maximum total volume per day (optional)
+    /**
+     * 当按比例/自适应算出金额大于 0 但小于 minOrderSizeUSD 时，抬升至 minOrderSizeUSD（再受余额/日限额/仓位上限约束）。
+     * 用于小比例跟单仍希望满足 CLOB 最小约 $1 的场景。
+     */
+    bumpSubminOrderToMin?: boolean;
 }
 
 export interface OrderSizeCalculation {
@@ -87,6 +92,8 @@ export interface OrderSizeCalculation {
     cappedByMax: boolean; // Whether capped by MAX_ORDER_SIZE
     reducedByBalance: boolean; // Whether reduced due to balance
     belowMinimum: boolean; // Whether below minimum threshold
+    /** true when finalAmount 因已达 MAX_POSITION_SIZE_USD 无法再增加 */
+    positionLimitReached?: boolean;
     reason: string; // Human-readable explanation
     dailyVolumeStatus?: {
         limit: number;
@@ -141,6 +148,7 @@ export function calculateOrderSize(
     let cappedByMax = false;
     let reducedByBalance = false;
     let belowMinimum = false;
+    let positionLimitReached = false;
 
     // Step 2: Apply maximum order size limit
     if (finalAmount > config.maxOrderSizeUSD) {
@@ -156,6 +164,7 @@ export function calculateOrderSize(
             const allowedAmount = Math.max(0, config.maxPositionSizeUSD - currentPositionSize);
             if (allowedAmount < config.minOrderSizeUSD) {
                 finalAmount = 0;
+                positionLimitReached = true;
                 reason += ` → Position limit reached`;
             } else {
                 finalAmount = allowedAmount;
@@ -206,11 +215,64 @@ export function calculateOrderSize(
         reason += ` → Reduced to fit balance ($${maxAffordable.toFixed(2)})`;
     }
 
-    // Step 6: Check minimum order size
-    if (finalAmount < config.minOrderSizeUSD) {
-        belowMinimum = true;
-        reason += ` → Below minimum $${config.minOrderSizeUSD}`;
-        finalAmount = 0; // Don't execute
+    // Step 6: Check minimum order size (optional bump to min when proportional size is positive but sub-min)
+    if (finalAmount > 0 && finalAmount < config.minOrderSizeUSD) {
+        if (config.bumpSubminOrderToMin && !positionLimitReached) {
+            const minUsd = config.minOrderSizeUSD;
+            let bumped = minUsd;
+            if (bumped > config.maxOrderSizeUSD) {
+                bumped = config.maxOrderSizeUSD;
+            }
+            if (config.maxDailyVolumeUSD) {
+                const dailyRemaining = config.maxDailyVolumeUSD - currentDailyVolume;
+                if (bumped > dailyRemaining) {
+                    bumped = Math.max(0, dailyRemaining);
+                }
+            }
+            if (bumped > maxAffordable) {
+                bumped = maxAffordable;
+            }
+            if (config.maxPositionSizeUSD) {
+                const newTotal = currentPositionSize + bumped;
+                if (newTotal > config.maxPositionSizeUSD) {
+                    const allowed = Math.max(0, config.maxPositionSizeUSD - currentPositionSize);
+                    bumped = Math.min(bumped, allowed);
+                }
+            }
+            if (bumped >= minUsd) {
+                finalAmount = bumped;
+                belowMinimum = false;
+                reason += ` → 抬升至最小单笔 $${minUsd.toFixed(2)} (COPY_BUMP_SUBMIN_ORDER_TO_MIN)`;
+            } else {
+                belowMinimum = true;
+                const capOrder = config.maxOrderSizeUSD;
+                const capDaily = config.maxDailyVolumeUSD
+                    ? config.maxDailyVolumeUSD - currentDailyVolume
+                    : Number.POSITIVE_INFINITY;
+                const capBal = maxAffordable;
+                const capPos = config.maxPositionSizeUSD
+                    ? Math.max(0, config.maxPositionSizeUSD - currentPositionSize)
+                    : Number.POSITIVE_INFINITY;
+                const effectiveCap = Math.min(capOrder, capDaily, capBal, capPos);
+                const eps = 1e-6;
+                let tight = 'UNKNOWN';
+                if (Math.abs(effectiveCap - capOrder) < eps) {
+                    tight = 'MAX_ORDER_SIZE_USD';
+                } else if (config.maxDailyVolumeUSD && Math.abs(effectiveCap - capDaily) < eps) {
+                    tight = 'MAX_DAILY_VOLUME_USD(今日剩余)';
+                } else if (Math.abs(effectiveCap - capBal) < eps) {
+                    tight = '钱包余额(99%)';
+                } else if (config.maxPositionSizeUSD && Math.abs(effectiveCap - capPos) < eps) {
+                    tight = 'MAX_POSITION_SIZE_USD(单市场仓位剩余)';
+                }
+                reason += ` → Below minimum $${minUsd} (抬升后有效上限≈$${effectiveCap.toFixed(2)} < $${minUsd.toFixed(2)}；最紧约束: ${tight})`;
+                finalAmount = 0;
+            }
+        } else {
+            belowMinimum = true;
+            reason += ` → Below minimum $${config.minOrderSizeUSD}`;
+            finalAmount = 0;
+        }
     }
 
     return {
@@ -221,6 +283,7 @@ export function calculateOrderSize(
         cappedByMax,
         reducedByBalance,
         belowMinimum,
+        positionLimitReached,
         reason,
         dailyVolumeStatus,
     };

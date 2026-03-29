@@ -23,7 +23,8 @@ class Logger {
             this.ensureLogsDir();
             const logFile = this.getLogFileName();
             const timestamp = formatBeijingDateTime(new Date());
-            const logEntry = `[${timestamp}] ${message}\n`;
+            const plain = this.stripAnsi(this.stripOsc8Hyperlinks(message));
+            const logEntry = `[${timestamp}] ${plain}\n`;
             fs.appendFileSync(logFile, logEntry, 'utf8');
         } catch {
             // Silently fail to avoid infinite loops
@@ -31,7 +32,11 @@ class Logger {
     }
 
     private static stripAnsi(str: string): string {
-        return str.replace(/\u001b\[\d+m/g, '');
+        return str.replace(/\u001b\[[0-9;]*m/g, '');
+    }
+
+    private static stripOsc8Hyperlinks(str: string): string {
+        return str.replace(/\u001b]8;;[^\u001b]+\u001b\\([\s\S]*?)\u001b]8;;\u001b\\/g, '$1');
     }
 
     private static formatAddress(address: string): string {

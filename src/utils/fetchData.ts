@@ -3,25 +3,30 @@ import { ENV } from '../config/env';
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
+export type FetchDataOptions = {
+    timeoutMs?: number;
+    retries?: number;
+};
+
 const isNetworkError = (error: unknown): boolean => {
     if (axios.isAxiosError(error)) {
         const axiosError = error as AxiosError;
         const code = axiosError.code;
-        // Network timeout/connection errors
         return (
             code === 'ETIMEDOUT' ||
+            code === 'ECONNABORTED' ||
             code === 'ENETUNREACH' ||
             code === 'ECONNRESET' ||
             code === 'ECONNREFUSED' ||
             !axiosError.response
-        ); // No response = network issue
+        );
     }
     return false;
 };
 
-const fetchData = async (url: string) => {
-    const retries = ENV.NETWORK_RETRY_LIMIT;
-    const timeout = ENV.REQUEST_TIMEOUT_MS;
+const fetchData = async (url: string, options?: FetchDataOptions) => {
+    const retries = options?.retries ?? ENV.NETWORK_RETRY_LIMIT;
+    const timeout = options?.timeoutMs ?? ENV.REQUEST_TIMEOUT_MS;
     const retryDelay = 1000; // 1 second base delay
 
     for (let attempt = 1; attempt <= retries; attempt++) {

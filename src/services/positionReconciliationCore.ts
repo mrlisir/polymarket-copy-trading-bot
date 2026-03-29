@@ -3,6 +3,7 @@ import { ENV, getCopyModeForTrader } from '../config/env';
 import { UserPositionInterface } from '../interfaces/User';
 import { getUserActivityModel } from '../models/userHistory';
 import { fetchPositionsForUser } from '../utils/dataApiCache';
+import { normalizeClobAssetId } from '../utils/clobIds';
 
 /** 与 postOrder / dryRun 卖出最小代币数对齐 */
 export const RECONCILE_MIN_SELL_TOKENS = 1.0;
@@ -13,6 +14,35 @@ export const TRADER_MIRROR_MIN = 0.25;
 
 export const positionKey = (conditionId: string, asset: string): string =>
     `${conditionId}:${asset}`;
+
+/** 跟单 BUY 成交后宽限期内不对「交易员镜像腿已平」做平仓，减轻 Data API 延迟误判 */
+const reconcileTraderExitGraceUntilMs = new Map<string, number>();
+
+const reconcileTraderExitGraceKey = (conditionId: string, asset: string): string =>
+    positionKey(conditionId.toLowerCase(), normalizeClobAssetId(asset));
+
+export const touchReconcileTraderExitGrace = (
+    conditionId: string,
+    asset: string,
+    graceMs: number
+): void => {
+    if (!graceMs || graceMs <= 0) return;
+    reconcileTraderExitGraceUntilMs.set(
+        reconcileTraderExitGraceKey(conditionId, asset),
+        Date.now() + graceMs
+    );
+};
+
+export const isReconcileTraderExitInGrace = (conditionId: string, asset: string): boolean => {
+    const k = reconcileTraderExitGraceKey(conditionId, asset);
+    const until = reconcileTraderExitGraceUntilMs.get(k);
+    if (until === undefined) return false;
+    if (Date.now() >= until) {
+        reconcileTraderExitGraceUntilMs.delete(k);
+        return false;
+    }
+    return true;
+};
 
 /**
  * 同一 condition 上多个跟单交易员时的镜像腿模式：
@@ -74,7 +104,7 @@ export const anyTraderStillInMirror = async (
     for (const addr of involved) {
         let list = cache.get(addr);
         if (!list) {
-            const raw = await fetchPositionsForUser(addr);
+            const raw = await fetchPositionsForUser(addr, { force: true });
             list = raw as UserPositionInterface[];
             cache.set(addr, list);
         }
